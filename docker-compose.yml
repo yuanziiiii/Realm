@@ -1,0 +1,28 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    restart: unless-stopped
+    depends_on:
+      - web
+    environment:
+      RELAY_LISTEN: ":8080"
+      RELAY_DB_PATH: /data/relay-panel.db
+      RELAY_WEB_URL: http://web:3000
+      RELAY_ADMIN_PASSWORD: ${RELAY_ADMIN_PASSWORD:?请在 .env 中设置 RELAY_ADMIN_PASSWORD}
+      RELAY_SESSION_SECRET: ${RELAY_SESSION_SECRET:?请在 .env 中设置至少 32 字符的 RELAY_SESSION_SECRET}
+      RELAY_SECURE_COOKIES: ${RELAY_SECURE_COOKIES:-false}
+    volumes:
+      - relay-data:/data
+    ports:
+      - "${RELAY_HTTP_PORT:-8080}:8080"
+
+volumes:
+  relay-data:

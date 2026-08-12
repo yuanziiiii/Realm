@@ -1,0 +1,8 @@
+.git
+.next
+.vinext
+.wrangler
+bin
+dist
+node_modules
+relay-panel.db*

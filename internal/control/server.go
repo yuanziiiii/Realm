@@ -1,0 +1,553 @@
+package control
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"relaypanel/internal/domain"
+	"relaypanel/internal/store"
+)
+
+type Server struct {
+	store         *store.Store
+	log           *slog.Logger
+	sessionSecret []byte
+	secureCookies bool
+	webProxy      *httputil.ReverseProxy
+}
+
+type Options struct {
+	AdminPassword string
+	SessionSecret string
+	SecureCookies bool
+	WebURL        string
+	Logger        *slog.Logger
+}
+
+func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if err := ensureAdmin(ctx, st, opts.AdminPassword); err != nil {
+		return nil, err
+	}
+	secret := []byte(opts.SessionSecret)
+	if len(secret) < 32 {
+		stored, err := st.GetSetting(ctx, "session_secret")
+		if err == nil {
+			secret, err = base64.RawURLEncoding.DecodeString(stored)
+			if err != nil {
+				return nil, fmt.Errorf("decode session secret: %w", err)
+			}
+		} else {
+			secret = make([]byte, 32)
+			if _, err = rand.Read(secret); err != nil {
+				return nil, err
+			}
+			if err = st.SetSetting(ctx, "session_secret", base64.RawURLEncoding.EncodeToString(secret)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	s := &Server{store: st, log: opts.Logger, sessionSecret: secret, secureCookies: opts.SecureCookies}
+	if opts.WebURL != "" {
+		target, err := url.Parse(opts.WebURL)
+		if err != nil {
+			return nil, err
+		}
+		s.webProxy = httputil.NewSingleHostReverseProxy(target)
+	}
+	return s, nil
+}
+
+func ensureAdmin(ctx context.Context, st *store.Store, password string) error {
+	_, err := st.GetSetting(ctx, "admin_password_hash")
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if len(password) < 10 {
+		return errors.New("RELAY_ADMIN_PASSWORD must contain at least 10 characters on first start")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		return err
+	}
+	return st.SetSetting(ctx, "admin_password_hash", string(hash))
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /api/v1/login", s.login)
+	mux.HandleFunc("POST /api/v1/logout", s.requireAdmin(s.logout))
+	mux.HandleFunc("GET /api/v1/me", s.requireAdmin(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"name": "管理员"})
+	}))
+	mux.HandleFunc("GET /api/v1/dashboard", s.requireAdmin(s.dashboard))
+	mux.HandleFunc("GET /api/v1/nodes", s.requireAdmin(s.listNodes))
+	mux.HandleFunc("POST /api/v1/nodes", s.requireAdmin(s.createNode))
+	mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.requireAdmin(s.deleteNode))
+	mux.HandleFunc("GET /api/v1/rules", s.requireAdmin(s.listRules))
+	mux.HandleFunc("POST /api/v1/rules", s.requireAdmin(s.saveRule))
+	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
+	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
+	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
+	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if s.webProxy != nil {
+			s.webProxy.ServeHTTP(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	return requestLog(s.log, mux)
+}
+
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	hash, err := s.store.GetSetting(r.Context(), "admin_password_hash")
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)) != nil {
+		writeError(w, http.StatusUnauthorized, errors.New("密码错误"))
+		return
+	}
+	expires := time.Now().Add(12 * time.Hour)
+	token := s.signSession(expires)
+	http.SetCookie(w, &http.Cookie{Name: "relay_session", Value: token, Path: "/", Expires: expires, HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteStrictMode})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "expires_at": expires})
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: "relay_session", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteStrictMode})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) signSession(expires time.Time) string {
+	payload := strconv.FormatInt(expires.Unix(), 10)
+	mac := hmac.New(sha256.New, s.sessionSecret)
+	_, _ = mac.Write([]byte(payload))
+	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) validSession(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	expires, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || time.Now().Unix() > expires {
+		return false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, s.sessionSecret)
+	_, _ = mac.Write([]byte(parts[0]))
+	return hmac.Equal(sig, mac.Sum(nil))
+}
+
+func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("relay_session")
+		if err != nil || !s.validSession(cookie.Value) {
+			writeError(w, http.StatusUnauthorized, errors.New("请先登录"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	d, err := s.store.Summary(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, d)
+}
+func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
+	v, err := s.store.ListNodes(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(v))
+}
+
+func (s *Server) createNode(w http.ResponseWriter, r *http.Request) {
+	var n domain.Node
+	if err := decodeJSON(r, &n); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	if err := validateNode(n); err != nil {
+		writeError(w, 422, err)
+		return
+	}
+	n.ID = randomID("node")
+	n.CreatedAt = time.Now().UTC()
+	token := randomToken()
+	hash := sha256.Sum256([]byte(token))
+	if err := s.store.CreateNode(r.Context(), n, hex.EncodeToString(hash[:])); err != nil {
+		writeError(w, 409, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"node": n, "agent_token": token})
+}
+
+func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteNode(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, 404, err)
+		return
+	}
+	if err != nil {
+		writeError(w, 409, errors.New("节点仍被规则引用，不能删除"))
+		return
+	}
+	w.WriteHeader(204)
+}
+func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
+	v, err := s.store.ListRules(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(v))
+}
+
+func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
+	var rule domain.ForwardRule
+	if err := decodeJSON(r, &rule); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	isCreate := r.PathValue("id") == ""
+	if id := r.PathValue("id"); id != "" {
+		rule.ID = id
+	} else {
+		rule.ID = randomID("rule")
+	}
+	if isCreate {
+		rule.Enabled = true
+	}
+	if rule.Mode == "" {
+		rule.Mode = domain.ForwardModeDualManaged
+	}
+	if rule.Protocol == "" {
+		rule.Protocol = "both"
+	}
+	if rule.Engine == "" {
+		rule.Engine = "nftables"
+	}
+	if rule.BurstKBytes == 0 {
+		rule.BurstKBytes = 512
+	}
+	if rule.TargetPort == 0 {
+		rule.TargetPort = rule.ListenPort
+	}
+	if rule.Name == "" && rule.TargetHost != "" {
+		rule.Name = fmt.Sprintf("%s:%d", rule.TargetHost, rule.TargetPort)
+	}
+	if err := s.completeSimpleRule(r.Context(), &rule); err != nil {
+		writeError(w, 422, err)
+		return
+	}
+	if err := validateRule(rule); err != nil {
+		writeError(w, 422, err)
+		return
+	}
+	if _, _, err := s.store.GetNode(r.Context(), rule.IngressNodeID); err != nil {
+		writeError(w, 422, errors.New("入口节点不存在"))
+		return
+	}
+	if _, _, err := s.store.GetNode(r.Context(), rule.EgressNodeID); err != nil {
+		writeError(w, 422, errors.New("出口节点不存在"))
+		return
+	}
+	if existing, err := s.store.GetRule(r.Context(), rule.ID); err == nil {
+		rule.CreatedAt = existing.CreatedAt
+	}
+	saved, err := s.store.SaveRule(r.Context(), rule)
+	if err != nil {
+		writeError(w, 409, err)
+		return
+	}
+	writeJSON(w, 200, saved)
+}
+
+func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRule) error {
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		return err
+	}
+	if rule.Mode == domain.ForwardModeExitOnly {
+		if rule.EgressNodeID == "" {
+			for _, node := range nodes {
+				if node.Role == domain.NodeRoleEgress || node.Role == domain.NodeRoleBoth {
+					rule.EgressNodeID = node.ID
+					break
+				}
+			}
+		}
+		if rule.EgressNodeID == "" {
+			return errors.New("请选择安装了 Agent 的香港出口服务器")
+		}
+		var egress domain.Node
+		for _, node := range nodes {
+			if node.ID == rule.EgressNodeID {
+				egress = node
+				break
+			}
+		}
+		if egress.ID == "" || (egress.Role != domain.NodeRoleEgress && egress.Role != domain.NodeRoleBoth) {
+			return errors.New("仅出口接管模式必须选择出口服务器")
+		}
+		if rule.ListenAddress == "" || rule.ListenAddress == "0.0.0.0" {
+			rule.ListenAddress = egress.PrivateAddress
+		}
+		rule.IngressNodeID = rule.EgressNodeID
+		rule.RelayPort = rule.ListenPort
+		return nil
+	}
+	if rule.ListenAddress == "" {
+		rule.ListenAddress = "0.0.0.0"
+	}
+	if rule.IngressNodeID == "" {
+		for _, node := range nodes {
+			if node.Role == domain.NodeRoleIngress || node.Role == domain.NodeRoleBoth {
+				rule.IngressNodeID = node.ID
+				break
+			}
+		}
+	}
+	if rule.EgressNodeID == "" {
+		for _, node := range nodes {
+			if node.ID != rule.IngressNodeID && (node.Role == domain.NodeRoleEgress || node.Role == domain.NodeRoleBoth) {
+				rule.EgressNodeID = node.ID
+				break
+			}
+		}
+	}
+	if rule.IngressNodeID == "" || rule.EgressNodeID == "" {
+		return errors.New("请先让一台入口节点和一台出口节点上线")
+	}
+	if rule.RelayPort == 0 {
+		rules, err := s.store.ListRules(ctx)
+		if err != nil {
+			return err
+		}
+		used := make(map[int]bool, len(rules))
+		for _, existing := range rules {
+			if existing.EgressNodeID == rule.EgressNodeID && existing.Protocol == rule.Protocol {
+				used[existing.RelayPort] = true
+			}
+		}
+		start := 30000 + rule.ListenPort%30000
+		for offset := 0; offset < 30000; offset++ {
+			candidate := 30000 + (start-30000+offset)%30000
+			if !used[candidate] {
+				rule.RelayPort = candidate
+				break
+			}
+		}
+		if rule.RelayPort == 0 {
+			return errors.New("没有可用的内网中继端口")
+		}
+	}
+	return nil
+}
+
+func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteRule(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, 404, err)
+		return
+	}
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	w.WriteHeader(204)
+}
+func (s *Server) traffic(w http.ResponseWriter, r *http.Request) {
+	hours, _ := strconv.Atoi(r.URL.Query().Get("hours"))
+	if hours <= 0 || hours > 24*90 {
+		hours = 24
+	}
+	points, err := s.store.Traffic(r.Context(), r.URL.Query().Get("rule_id"), time.Now().UTC().Add(-time.Duration(hours)*time.Hour))
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(points))
+}
+
+func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
+	var req domain.SyncRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	node, hash, err := s.store.GetNode(r.Context(), req.NodeID)
+	if err != nil {
+		writeError(w, 401, errors.New("未知节点"))
+		return
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	sum := sha256.Sum256([]byte(token))
+	expected, err := hex.DecodeString(hash)
+	if err != nil || !hmac.Equal(sum[:], expected) {
+		writeError(w, 401, errors.New("Agent 凭据无效"))
+		return
+	}
+	if req.ApplyStatus == "" {
+		req.ApplyStatus = "normal"
+	}
+	if err := s.store.UpdateHeartbeat(r.Context(), req.NodeID, req.AgentVersion, req.ApplyStatus, req.ApplyError, req.AppliedRevision); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	if len(req.Traffic) > 0 {
+		if err := s.store.AddTraffic(r.Context(), req.NodeID, req.Traffic); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	revision, err := s.store.Revision(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	deployments, err := s.store.DeploymentsForNode(r.Context(), req.NodeID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	peerIDs := map[string]bool{}
+	for _, d := range deployments {
+		peerIDs[d.Rule.IngressNodeID] = true
+		peerIDs[d.Rule.EgressNodeID] = true
+	}
+	delete(peerIDs, req.NodeID)
+	peers := make([]domain.Node, 0, len(peerIDs))
+	for id := range peerIDs {
+		peer, _, err := s.store.GetNode(r.Context(), id)
+		if err == nil {
+			peers = append(peers, peer)
+		}
+	}
+	node.Status = "online"
+	node.LastSeenAt = time.Now().UTC()
+	writeJSON(w, 200, domain.SyncResponse{Revision: revision, GeneratedAt: time.Now().UTC(), Node: node, Peers: peers, Deployments: deployments})
+}
+
+func validateNode(n domain.Node) error {
+	if strings.TrimSpace(n.Name) == "" {
+		return errors.New("节点名称不能为空")
+	}
+	if n.Role != domain.NodeRoleIngress && n.Role != domain.NodeRoleEgress && n.Role != domain.NodeRoleBoth {
+		return errors.New("节点角色无效")
+	}
+	if n.PrivateAddress == "" {
+		return errors.New("内网地址不能为空")
+	}
+	return nil
+}
+func validateRule(r domain.ForwardRule) error {
+	if r.Mode != domain.ForwardModeDualManaged && r.Mode != domain.ForwardModeExitOnly {
+		return errors.New("转发模式无效")
+	}
+	if strings.TrimSpace(r.Name) == "" {
+		return errors.New("规则名称不能为空")
+	}
+	if r.IngressNodeID == "" || r.EgressNodeID == "" {
+		return errors.New("必须选择入口和出口节点")
+	}
+	if r.Mode == domain.ForwardModeDualManaged && r.IngressNodeID == r.EgressNodeID {
+		return errors.New("当前版本要求入口和出口为不同节点")
+	}
+	if r.Protocol != "tcp" && r.Protocol != "udp" && r.Protocol != "both" {
+		return errors.New("协议必须为 tcp、udp 或 both")
+	}
+	if r.Engine != "nftables" && r.Engine != "realm" {
+		return errors.New("引擎必须为 nftables 或 realm")
+	}
+	for _, port := range []int{r.ListenPort, r.RelayPort, r.TargetPort} {
+		if port < 1 || port > 65535 {
+			return errors.New("端口必须在 1-65535 之间")
+		}
+	}
+	if r.TargetHost == "" {
+		return errors.New("目标地址不能为空")
+	}
+	if r.UploadMbps < 0 || r.DownloadMbps < 0 {
+		return errors.New("限速不能为负数")
+	}
+	return nil
+}
+
+func randomID(prefix string) string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return prefix + "_" + hex.EncodeToString(b)
+}
+func randomToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+func decodeJSON(r *http.Request, v any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+func nonNil[T any](v []T) []T {
+	if v == nil {
+		return []T{}
+	}
+	return v
+}
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+func requestLog(log *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Info("request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
+	})
+}

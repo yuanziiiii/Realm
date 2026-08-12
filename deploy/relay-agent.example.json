@@ -1,0 +1,10 @@
+{
+  "controller_url": "https://panel.example.com",
+  "node_id": "node_replace_me",
+  "token": "replace-with-token-shown-by-panel",
+  "apply": true,
+  "allow_qdisc_replace": false,
+  "sync_interval": "10s",
+  "state_dir": "/var/lib/relay-agent",
+  "realm_binary": "/usr/local/bin/realm"
+}
