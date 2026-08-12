@@ -1,0 +1,102 @@
+package domain
+
+import "time"
+
+type NodeRole string
+type ForwardMode string
+
+const (
+	NodeRoleIngress NodeRole = "ingress"
+	NodeRoleEgress  NodeRole = "egress"
+	NodeRoleBoth    NodeRole = "both"
+
+	ForwardModeDualManaged ForwardMode = "dual_managed"
+	ForwardModeExitOnly    ForwardMode = "exit_only"
+)
+
+type Node struct {
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	Role             NodeRole  `json:"role"`
+	PublicAddress    string    `json:"public_address"`
+	PrivateAddress   string    `json:"private_address"`
+	PublicInterface  string    `json:"public_interface"`
+	PrivateInterface string    `json:"private_interface"`
+	Status           string    `json:"status"`
+	AgentVersion     string    `json:"agent_version,omitempty"`
+	AppliedRevision  int64     `json:"applied_revision"`
+	LastSeenAt       time.Time `json:"last_seen_at,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+type ForwardRule struct {
+	ID            string      `json:"id"`
+	Mode          ForwardMode `json:"mode"`
+	Name          string      `json:"name"`
+	Protocol      string      `json:"protocol"`
+	IngressNodeID string      `json:"ingress_node_id"`
+	EgressNodeID  string      `json:"egress_node_id"`
+	ListenAddress string      `json:"listen_address"`
+	ListenPort    int         `json:"listen_port"`
+	RelayPort     int         `json:"relay_port"`
+	TargetHost    string      `json:"target_host"`
+	TargetPort    int         `json:"target_port"`
+	Engine        string      `json:"engine"`
+	UploadMbps    int         `json:"upload_mbps"`
+	DownloadMbps  int         `json:"download_mbps"`
+	BurstKBytes   int         `json:"burst_kbytes"`
+	Enabled       bool        `json:"enabled"`
+	Revision      int64       `json:"revision"`
+	CreatedAt     time.Time   `json:"created_at"`
+	UpdatedAt     time.Time   `json:"updated_at"`
+}
+
+type Deployment struct {
+	Rule ForwardRule `json:"rule"`
+	Role NodeRole    `json:"role"`
+}
+
+type TrafficDelta struct {
+	RuleID          string    `json:"rule_id"`
+	CapturedAt      time.Time `json:"captured_at"`
+	Cumulative      bool      `json:"cumulative,omitempty"`
+	UploadBytes     int64     `json:"upload_bytes"`
+	DownloadBytes   int64     `json:"download_bytes"`
+	UploadPackets   int64     `json:"upload_packets"`
+	DownloadPackets int64     `json:"download_packets"`
+}
+
+type TrafficPoint struct {
+	Bucket          time.Time `json:"bucket"`
+	UploadBytes     int64     `json:"upload_bytes"`
+	DownloadBytes   int64     `json:"download_bytes"`
+	UploadPackets   int64     `json:"upload_packets"`
+	DownloadPackets int64     `json:"download_packets"`
+}
+
+type SyncRequest struct {
+	NodeID          string         `json:"node_id"`
+	AgentVersion    string         `json:"agent_version"`
+	AppliedRevision int64          `json:"applied_revision"`
+	ApplyStatus     string         `json:"apply_status"`
+	ApplyError      string         `json:"apply_error,omitempty"`
+	Traffic         []TrafficDelta `json:"traffic,omitempty"`
+}
+
+type SyncResponse struct {
+	Revision    int64        `json:"revision"`
+	GeneratedAt time.Time    `json:"generated_at"`
+	Node        Node         `json:"node"`
+	Peers       []Node       `json:"peers"`
+	Deployments []Deployment `json:"deployments"`
+}
+
+type DashboardSummary struct {
+	OnlineNodes   int64          `json:"online_nodes"`
+	TotalNodes    int64          `json:"total_nodes"`
+	EnabledRules  int64          `json:"enabled_rules"`
+	TotalRules    int64          `json:"total_rules"`
+	TodayUpload   int64          `json:"today_upload"`
+	TodayDownload int64          `json:"today_download"`
+	RecentTraffic []TrafficPoint `json:"recent_traffic"`
+}
