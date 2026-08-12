@@ -83,3 +83,42 @@ func TestExitOnlyRuleCreatesOnlyEgressDeployment(t *testing.T) {
 		t.Fatalf("exit-only rule must produce one egress deployment, got %+v", deployments)
 	}
 }
+
+func TestLineGroupsRulesAndCannotBeDeletedWhileReferenced(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "广州入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.24.0.2", CreatedAt: now},
+		{ID: "out", Name: "香港出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.24.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "广港专线", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.SaveRule(ctx, domain.ForwardRule{ID: "rule", LineID: line.ID, Mode: line.Mode, Name: "网站", Protocol: "tcp", IngressNodeID: line.IngressNodeID, EgressNodeID: line.EgressNodeID, ListenAddress: line.ListenAddress, ListenPort: 24444, RelayPort: 54444, TargetHost: "192.0.2.88", TargetPort: 443, Engine: line.Engine, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := st.ListRules(ctx)
+	if err != nil || len(rules) != 1 || rules[0].LineID != line.ID {
+		t.Fatalf("rule was not grouped under its line: %+v, %v", rules, err)
+	}
+	if err := st.DeleteLine(ctx, line.ID); err == nil {
+		t.Fatal("expected referenced line deletion to fail")
+	}
+	if err := st.DeleteRule(ctx, "rule"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteLine(ctx, line.ID); err != nil {
+		t.Fatal(err)
+	}
+}

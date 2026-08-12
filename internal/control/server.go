@@ -107,7 +107,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/dashboard", s.requireAdmin(s.dashboard))
 	mux.HandleFunc("GET /api/v1/nodes", s.requireAdmin(s.listNodes))
 	mux.HandleFunc("POST /api/v1/nodes", s.requireAdmin(s.createNode))
+	mux.HandleFunc("PUT /api/v1/nodes/{id}", s.requireAdmin(s.updateNode))
 	mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.requireAdmin(s.deleteNode))
+	mux.HandleFunc("GET /api/v1/lines", s.requireAdmin(s.listLines))
+	mux.HandleFunc("POST /api/v1/lines", s.requireAdmin(s.saveLine))
+	mux.HandleFunc("PUT /api/v1/lines/{id}", s.requireAdmin(s.saveLine))
+	mux.HandleFunc("DELETE /api/v1/lines/{id}", s.requireAdmin(s.deleteLine))
 	mux.HandleFunc("GET /api/v1/rules", s.requireAdmin(s.listRules))
 	mux.HandleFunc("POST /api/v1/rules", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
@@ -212,6 +217,12 @@ func (s *Server) createNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.ID = randomID("node")
+	if n.PublicInterface == "" {
+		n.PublicInterface = "eth0"
+	}
+	if n.PrivateInterface == "" {
+		n.PrivateInterface = "wg0"
+	}
 	n.CreatedAt = time.Now().UTC()
 	token := randomToken()
 	hash := sha256.Sum256([]byte(token))
@@ -220,6 +231,25 @@ func (s *Server) createNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"node": n, "agent_token": token})
+}
+
+func (s *Server) updateNode(w http.ResponseWriter, r *http.Request) {
+	var n domain.Node
+	if err := decodeJSON(r, &n); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	n.ID = r.PathValue("id")
+	if err := validateNode(n); err != nil {
+		writeError(w, 422, err)
+		return
+	}
+	if err := s.store.UpdateNode(r.Context(), n); err != nil {
+		writeError(w, 404, err)
+		return
+	}
+	updated, _, _ := s.store.GetNode(r.Context(), n.ID)
+	writeJSON(w, 200, updated)
 }
 
 func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +263,97 @@ func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+func (s *Server) listLines(w http.ResponseWriter, r *http.Request) {
+	lines, err := s.store.ListLines(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(lines))
+}
+
+func (s *Server) saveLine(w http.ResponseWriter, r *http.Request) {
+	var line domain.Line
+	if err := decodeJSON(r, &line); err != nil {
+		writeError(w, 400, err)
+		return
+	}
+	isCreate := r.PathValue("id") == ""
+	if isCreate {
+		line.ID = randomID("line")
+		line.Enabled = true
+	} else {
+		line.ID = r.PathValue("id")
+		if existing, err := s.store.GetLine(r.Context(), line.ID); err == nil {
+			line.CreatedAt = existing.CreatedAt
+		}
+	}
+	if line.Mode == "" {
+		line.Mode = domain.ForwardModeDualManaged
+	}
+	if line.Engine == "" {
+		line.Engine = "nftables"
+	}
+	if err := s.completeLine(r.Context(), &line); err != nil {
+		writeError(w, 422, err)
+		return
+	}
+	if err := validateLine(line); err != nil {
+		writeError(w, 422, err)
+		return
+	}
+	saved, err := s.store.SaveLine(r.Context(), line)
+	if err != nil {
+		writeError(w, 409, err)
+		return
+	}
+	writeJSON(w, 200, saved)
+}
+
+func (s *Server) deleteLine(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteLine(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, 404, err)
+		return
+	}
+	if err != nil {
+		writeError(w, 409, errors.New("线路下仍有转发规则，请先删除规则"))
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (s *Server) completeLine(ctx context.Context, line *domain.Line) error {
+	egress, _, err := s.store.GetNode(ctx, line.EgressNodeID)
+	if err != nil || (egress.Role != domain.NodeRoleEgress && egress.Role != domain.NodeRoleBoth) {
+		return errors.New("请选择有效的出口服务器")
+	}
+	if line.Mode == domain.ForwardModeExitOnly {
+		line.IngressNodeID = line.EgressNodeID
+		if line.ListenAddress == "" {
+			line.ListenAddress = egress.PrivateAddress
+		}
+		if line.ListenAddress == "" {
+			return errors.New("出口服务器还没有配置内网 IP")
+		}
+		return nil
+	}
+	ingress, _, err := s.store.GetNode(ctx, line.IngressNodeID)
+	if err != nil || (ingress.Role != domain.NodeRoleIngress && ingress.Role != domain.NodeRoleBoth) {
+		return errors.New("请选择有效的入口服务器")
+	}
+	if ingress.ID == egress.ID {
+		return errors.New("双端托管需要不同的入口和出口服务器")
+	}
+	if egress.PrivateAddress == "" {
+		return errors.New("出口服务器还没有配置内网 IP")
+	}
+	if line.ListenAddress == "" {
+		line.ListenAddress = "0.0.0.0"
+	}
+	return nil
 }
 func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
 	v, err := s.store.ListRules(r.Context())
@@ -275,6 +396,18 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if rule.Name == "" && rule.TargetHost != "" {
 		rule.Name = fmt.Sprintf("%s:%d", rule.TargetHost, rule.TargetPort)
+	}
+	if rule.LineID != "" {
+		line, err := s.store.GetLine(r.Context(), rule.LineID)
+		if err != nil || !line.Enabled {
+			writeError(w, 422, errors.New("请选择可用线路"))
+			return
+		}
+		rule.Mode = line.Mode
+		rule.IngressNodeID = line.IngressNodeID
+		rule.EgressNodeID = line.EgressNodeID
+		rule.ListenAddress = line.ListenAddress
+		rule.Engine = line.Engine
 	}
 	if err := s.completeSimpleRule(r.Context(), &rule); err != nil {
 		writeError(w, 422, err)
@@ -476,8 +609,23 @@ func validateNode(n domain.Node) error {
 	if n.Role != domain.NodeRoleIngress && n.Role != domain.NodeRoleEgress && n.Role != domain.NodeRoleBoth {
 		return errors.New("节点角色无效")
 	}
-	if n.PrivateAddress == "" {
-		return errors.New("内网地址不能为空")
+	return nil
+}
+func validateLine(line domain.Line) error {
+	if strings.TrimSpace(line.Name) == "" {
+		return errors.New("线路名称不能为空")
+	}
+	if line.Mode != domain.ForwardModeDualManaged && line.Mode != domain.ForwardModeExitOnly {
+		return errors.New("线路模式无效")
+	}
+	if line.IngressNodeID == "" || line.EgressNodeID == "" {
+		return errors.New("请选择线路服务器")
+	}
+	if line.Mode == domain.ForwardModeDualManaged && line.IngressNodeID == line.EgressNodeID {
+		return errors.New("双端托管需要不同的入口和出口服务器")
+	}
+	if line.Engine != "nftables" && line.Engine != "realm" {
+		return errors.New("线路引擎必须为 nftables 或 realm")
 	}
 	return nil
 }

@@ -1,6 +1,14 @@
 # Relay Panel
 
-面向个人自用的多服务器端口转发面板。控制端支持两种接管模式：
+面向个人自用的多服务器端口转发面板。控制端采用“服务器 → 线路 → 转发规则”三层模型：
+
+```text
+服务器：接入 Agent、显示状态和网络参数
+线路：固定入口、出口、接管模式和 nftables / Realm 引擎
+转发规则：选择线路后，只填写协议、监听端口、落地地址和限速
+```
+
+线路支持两种接管模式：
 
 ```text
 双端托管：本机 → 广州公网入口（Agent）→ 内网/专线 → 香港出口（Agent）→ 落地
@@ -12,8 +20,9 @@
 ## 当前能力
 
 - 单管理员登录，SQLite 本地持久化
-- 广州入口、香港出口服务器和 Agent 在线状态
-- 双端托管、仅出口接管两种规则模式
+- 服务器一键接入、Agent 在线状态和网络参数维护
+- 可复用线路，支持双端托管、仅出口接管两种拓扑
+- 转发规则按线路分组，日常添加不再重复选择服务器和引擎
 - TCP、UDP、TCP+UDP 规则
 - nftables 内核转发和 Realm 进程转发
 - 每条规则独立上传、下载限速，使用 `nftables mark + tc HTB + fq_codel`
@@ -67,11 +76,11 @@ curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/insta
    docker compose up -d --build
    ```
 
-3. 打开 `http://控制端IP:8080`。在“服务器”页创建需要被面板接管的服务器，创建结果会显示 Server ID 与一次性 Agent Token。
+3. 打开 `http://控制端IP:8080`，按页面顺序完成“接入服务器 → 创建线路 → 新建转发”。
 
 ## 安装节点 Agent
 
-先在面板“服务器”页添加广州入口或香港出口，复制只显示一次的 Server ID 和 Agent Token，然后在该服务器运行：
+先在面板“服务器”页添加广州入口或香港出口。面板会直接生成一键安装命令和只显示一次的 Agent Token；在对应服务器执行命令并按提示粘贴 Token：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/install-agent-online.sh \
@@ -101,7 +110,9 @@ sudo ./scripts/install-agent.sh ./relay-agent ./node.json
 
 Realm 模式还需将 Realm 二进制安装到 `/usr/local/bin/realm`，或者修改 Agent 配置中的 `realm_binary`。
 
-## 两种转发模式
+## 线路与两种接管模式
+
+服务器 Agent 上线后，先创建一条线路。服务器关系和引擎只在线路中配置一次；以后新增转发只选择线路并填写端口、落地 IP、落地端口和可选限速。
 
 ### 1. 双端托管
 
@@ -113,18 +124,16 @@ Realm 模式还需将 Realm 二进制安装到 `/usr/local/bin/realm`，或者�
        → 香港公网出口 → 落地 IP:端口
 ```
 
-在面板选择：
+创建线路时选择：
 
 ```text
 模式：双端托管
 广州入口服务器：已安装 Agent 的广州机器
 香港出口服务器：已安装 Agent 的香港机器
 转发引擎：nftables / Realm
-广州公网端口：24444
-落地 IP 和端口
 ```
 
-面板自动分配内网中继端口。你不需要再登录广州或香港机器手工创建该条转发规则。
+随后在这条线路中新增转发，填写广州公网端口和落地 IP/端口。面板自动分配内网中继端口，你不需要再登录广州或香港机器手工创建规则。
 
 ### 2. 仅出口接管
 
@@ -136,18 +145,16 @@ Realm 模式还需将 Realm 二进制安装到 `/usr/local/bin/realm`，或者�
        → 香港公网出口 → 落地 IP:端口
 ```
 
-在面板选择：
+创建线路时选择：
 
 ```text
 模式：仅出口接管
 香港出口服务器：已安装 Agent 的香港机器
 香港内网接入 IP：通常自动使用该机器的内网 IP
-香港内网接入端口：必须与广州已有规则的目标端口一致
 转发引擎：nftables / Realm
-落地 IP 和端口
 ```
 
-此模式下广州入口不需要安装 Agent，也不会收到任何面板配置。
+随后在这条线路中新增转发，监听端口必须与广州已有规则的目标端口一致，再填写落地 IP/端口。此模式下广州入口不需要安装 Agent，也不会收到任何面板配置。
 
 ## 速率控制和流量统计
 

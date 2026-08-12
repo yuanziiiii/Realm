@@ -40,4 +40,5 @@ yarn-error.log*
 /outputs/
 /work/
 /bin/
+/audit/
 relay-panel.db*

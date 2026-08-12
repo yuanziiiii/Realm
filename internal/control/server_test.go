@@ -57,3 +57,43 @@ func TestCompleteExitOnlyRuleUsesEgressPrivateListener(t *testing.T) {
 		t.Fatalf("unexpected exit-only route: %+v", rule)
 	}
 }
+
+func TestCompleteLineValidatesRolesAndFillsListener(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "ingress", Name: "广州入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.24.0.2", CreatedAt: now},
+		{ID: "egress", Name: "香港出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.24.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &Server{store: st}
+
+	dual := domain.Line{Mode: domain.ForwardModeDualManaged, IngressNodeID: "ingress", EgressNodeID: "egress"}
+	if err := s.completeLine(ctx, &dual); err != nil {
+		t.Fatal(err)
+	}
+	if dual.ListenAddress != "0.0.0.0" {
+		t.Fatalf("unexpected dual listener: %q", dual.ListenAddress)
+	}
+
+	exitOnly := domain.Line{Mode: domain.ForwardModeExitOnly, EgressNodeID: "egress"}
+	if err := s.completeLine(ctx, &exitOnly); err != nil {
+		t.Fatal(err)
+	}
+	if exitOnly.IngressNodeID != "egress" || exitOnly.ListenAddress != "10.24.0.3" {
+		t.Fatalf("unexpected exit-only line: %+v", exitOnly)
+	}
+
+	invalid := domain.Line{Mode: domain.ForwardModeDualManaged, IngressNodeID: "egress", EgressNodeID: "ingress"}
+	if err := s.completeLine(ctx, &invalid); err == nil {
+		t.Fatal("expected invalid node roles to be rejected")
+	}
+}

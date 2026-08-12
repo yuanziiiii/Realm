@@ -44,8 +44,15 @@ func (s *Store) migrate(ctx context.Context) error {
 			apply_error TEXT NOT NULL DEFAULT '', last_seen_at INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS lines (
+			id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'dual_managed',
+			ingress_node_id TEXT NOT NULL REFERENCES nodes(id),
+			egress_node_id TEXT NOT NULL REFERENCES nodes(id),
+			listen_address TEXT NOT NULL DEFAULT '', engine TEXT NOT NULL DEFAULT 'nftables',
+			enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS forward_rules (
-			id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'dual_managed', name TEXT NOT NULL, protocol TEXT NOT NULL,
+			id TEXT PRIMARY KEY, line_id TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL DEFAULT 'dual_managed', name TEXT NOT NULL, protocol TEXT NOT NULL,
 			ingress_node_id TEXT NOT NULL REFERENCES nodes(id),
 			egress_node_id TEXT NOT NULL REFERENCES nodes(id),
 			listen_address TEXT NOT NULL DEFAULT '0.0.0.0', listen_port INTEGER NOT NULL,
@@ -79,6 +86,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen_at ON nodes(last_seen_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_rules_nodes ON forward_rules(ingress_node_id, egress_node_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_lines_nodes ON lines(ingress_node_id, egress_node_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rules_line ON forward_rules(line_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic_minute(bucket)`,
 	}
 	for _, statement := range statements {
@@ -87,6 +96,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "mode", `ALTER TABLE forward_rules ADD COLUMN mode TEXT NOT NULL DEFAULT 'dual_managed'`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "forward_rules", "line_id", `ALTER TABLE forward_rules ADD COLUMN line_id TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key, value) VALUES ('revision', '1')`)
@@ -219,6 +231,19 @@ func (s *Store) GetNode(ctx context.Context, id string) (domain.Node, string, er
 	return n, hash, err
 }
 
+func (s *Store) UpdateNode(ctx context.Context, n domain.Node) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.ID)
+	if err != nil {
+		return err
+	}
+	count, _ := res.RowsAffected()
+	if count == 0 {
+		return ErrNotFound
+	}
+	s.audit(ctx, "update", "node", n.ID, n.Name)
+	return nil
+}
+
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id=?`, id)
 	if err != nil {
@@ -244,18 +269,89 @@ func (s *Store) UpdateHeartbeat(ctx context.Context, id, version, status, applyE
 	return nil
 }
 
+func scanLine(scanner interface{ Scan(...any) error }) (domain.Line, error) {
+	var line domain.Line
+	var enabled int
+	var created, updated int64
+	err := scanner.Scan(&line.ID, &line.Name, &line.Mode, &line.IngressNodeID, &line.EgressNodeID, &line.ListenAddress, &line.Engine, &enabled, &created, &updated)
+	line.Enabled = enabled == 1
+	line.CreatedAt = fromUnix(created)
+	line.UpdatedAt = fromUnix(updated)
+	return line, err
+}
+
+const lineColumns = `id,name,mode,ingress_node_id,egress_node_id,listen_address,engine,enabled,created_at,updated_at`
+
+func (s *Store) ListLines(ctx context.Context) ([]domain.Line, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+lineColumns+` FROM lines ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var lines []domain.Line
+	for rows.Next() {
+		line, err := scanLine(rows)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, line)
+	}
+	return lines, rows.Err()
+}
+
+func (s *Store) GetLine(ctx context.Context, id string) (domain.Line, error) {
+	line, err := scanLine(s.db.QueryRowContext(ctx, `SELECT `+lineColumns+` FROM lines WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		err = ErrNotFound
+	}
+	return line, err
+}
+
+func (s *Store) SaveLine(ctx context.Context, line domain.Line) (domain.Line, error) {
+	now := time.Now().UTC()
+	line.UpdatedAt = now
+	if line.CreatedAt.IsZero() {
+		line.CreatedAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,engine=excluded.engine,enabled=excluded.enabled,updated_at=excluded.updated_at`, line.ID, line.Name, line.Mode, line.IngressNodeID, line.EgressNodeID, line.ListenAddress, line.Engine, boolInt(line.Enabled), unix(line.CreatedAt), unix(line.UpdatedAt))
+	if err == nil {
+		s.audit(ctx, "save", "line", line.ID, line.Name)
+	}
+	return line, err
+}
+
+func (s *Store) DeleteLine(ctx context.Context, id string) error {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM forward_rules WHERE line_id=?`, id).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return errors.New("line still has rules")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM lines WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	s.audit(ctx, "delete", "line", id, "")
+	return nil
+}
+
 func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, error) {
 	var r domain.ForwardRule
 	var enabled int
 	var created, updated int64
-	err := scanner.Scan(&r.ID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &r.TargetHost, &r.TargetPort, &r.Engine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &enabled, &r.Revision, &created, &updated)
+	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &r.TargetHost, &r.TargetPort, &r.Engine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &enabled, &r.Revision, &created, &updated)
 	r.Enabled = enabled == 1
 	r.CreatedAt = fromUnix(created)
 	r.UpdatedAt = fromUnix(updated)
 	return r, err
 }
 
-const ruleColumns = `id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,target_host,target_port,engine,upload_mbps,download_mbps,burst_kbytes,enabled,revision,created_at,updated_at`
+const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,target_host,target_port,engine,upload_mbps,download_mbps,burst_kbytes,enabled,revision,created_at,updated_at`
 
 func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+ruleColumns+` FROM forward_rules ORDER BY created_at DESC`)
@@ -298,7 +394,7 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = now
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, r.ID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, r.TargetHost, r.TargetPort, r.Engine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt))
+	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, r.TargetHost, r.TargetPort, r.Engine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt))
 	if err != nil {
 		return r, err
 	}

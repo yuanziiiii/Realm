@@ -31,6 +31,7 @@ type Node struct {
 
 type ForwardRule struct {
 	ID            string      `json:"id"`
+	LineID        string      `json:"line_id"`
 	Mode          ForwardMode `json:"mode"`
 	Name          string      `json:"name"`
 	Protocol      string      `json:"protocol"`
@@ -47,6 +48,22 @@ type ForwardRule struct {
 	BurstKBytes   int         `json:"burst_kbytes"`
 	Enabled       bool        `json:"enabled"`
 	Revision      int64       `json:"revision"`
+	CreatedAt     time.Time   `json:"created_at"`
+	UpdatedAt     time.Time   `json:"updated_at"`
+}
+
+// Line keeps the stable network topology separate from individual port rules.
+// A user chooses the servers and forwarding engine once on a line, then every
+// rule on that line only needs a listen port and destination.
+type Line struct {
+	ID            string      `json:"id"`
+	Name          string      `json:"name"`
+	Mode          ForwardMode `json:"mode"`
+	IngressNodeID string      `json:"ingress_node_id"`
+	EgressNodeID  string      `json:"egress_node_id"`
+	ListenAddress string      `json:"listen_address"`
+	Engine        string      `json:"engine"`
+	Enabled       bool        `json:"enabled"`
 	CreatedAt     time.Time   `json:"created_at"`
 	UpdatedAt     time.Time   `json:"updated_at"`
 }
