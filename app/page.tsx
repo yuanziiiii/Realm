@@ -34,7 +34,7 @@ const demoRuleTraffic:RuleTraffic[]=[
   {rule_id:"r2",total_upload_bytes:98.2*1024**3,total_download_bytes:442.5*1024**3,today_upload_bytes:1.3*1024**3,today_download_bytes:6.2*1024**3,week_upload_bytes:6*1024**3,week_download_bytes:25*1024**3,month_upload_bytes:27*1024**3,month_download_bytes:108*1024**3,quarter_upload_bytes:73*1024**3,quarter_download_bytes:307*1024**3,upload_bytes_per_second:218*1024,download_bytes_per_second:890*1024},
 ];
 
-const blankNode={name:"",role:"ingress" as NodeRole,public_address:"",private_address:"",public_interface:"eth0",private_interface:"wg0"};
+const blankNode={name:"",role:"ingress" as NodeRole,public_address:"",private_address:"",public_interface:"",private_interface:""};
 const blankLine={name:"",mode:"dual_managed" as Mode,ingress_node_id:"",egress_node_id:"",listen_address:"",relay_port_range:"",engine:"nftables" as Engine,enabled:true};
 
 async function api<T>(path:string,init?:RequestInit):Promise<T>{const response=await fetch(path,{...init,headers:{"Content-Type":"application/json",...(init?.headers||{})}});if(!response.ok){let message=`请求失败 (${response.status})`;try{message=(await response.json()).error||message}catch{/* non-JSON */}throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
@@ -99,6 +99,7 @@ export default function Home(){
   useEffect(()=>{void load()},[load]);
   useEffect(()=>{if(!authenticated||demo||(view!=="traffic"&&!trafficRule))return;const timer=window.setInterval(()=>{void api<RuleTraffic[]>("/api/v1/traffic/rules").then(setRuleTraffic).catch(()=>{})},10000);return()=>window.clearInterval(timer)},[authenticated,demo,view,trafficRule]);
   useEffect(()=>{if(!authenticated||demo||view!=="traffic")return;void api<Point[]>(`/api/v1/traffic?period=${trafficPeriod}`).then(setTraffic).catch(()=>{})},[authenticated,demo,view,trafficPeriod]);
+  useEffect(()=>{if(!authenticated||demo||view!=="nodes")return;const update=()=>void api<Node[]>("/api/v1/nodes").then(setNodes).catch(()=>{});update();const timer=window.setInterval(update,5000);return()=>window.clearInterval(timer)},[authenticated,demo,view]);
   const activateDemo=()=>{setNodes(demoNodes);setLines(demoLines);setRules(demoRules);setSummary(demoSummary);setTraffic(demoPoints);setRuleTraffic(demoRuleTraffic);setAuthenticated(true);setDemo(true)};
   if(authenticated===null)return <div className="boot"><span className="pulse"/>正在连接控制端</div>;
   if(!authenticated)return <Login onSuccess={load} onDemo={activateDemo}/>;

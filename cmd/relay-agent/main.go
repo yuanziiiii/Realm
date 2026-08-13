@@ -15,7 +15,7 @@ import (
 	"relaypanel/internal/domain"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type state struct {
 	AppliedRevision int64    `json:"applied_revision"`
@@ -47,10 +47,11 @@ func main() {
 	executor := agent.NewExecutor(cfg.Apply, cfg.StateDir, cfg.RealmBinary, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	network := agent.DetectNetwork(ctx)
 	ticker := time.NewTicker(cfg.SyncInterval)
 	defer ticker.Stop()
 	for {
-		if err = cycle(ctx, cfg, client, executor, &st); err != nil {
+		if err = cycle(ctx, cfg, client, executor, &st, network); err != nil {
 			log.Warn("sync failed", "error", err)
 		}
 		saveState(statePath, st)
@@ -62,7 +63,7 @@ func main() {
 	}
 }
 
-func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor *agent.Executor, st *state) error {
+func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor *agent.Executor, st *state, network domain.NetworkInfo) error {
 	var traffic []domain.TrafficDelta
 	if cfg.Apply {
 		if counters, err := agent.ReadCounters(ctx); err == nil {
@@ -72,7 +73,7 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 			}
 		}
 	}
-	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Traffic: traffic})
+	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic})
 	if err != nil {
 		return err
 	}

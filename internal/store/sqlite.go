@@ -310,8 +310,32 @@ func (s *Store) DeleteNode(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Store) UpdateHeartbeat(ctx context.Context, id, version, status, applyErr string, revision int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE nodes SET agent_version=?,applied_revision=?,apply_status=?,apply_error=?,last_seen_at=? WHERE id=?`, version, revision, status, applyErr, time.Now().Unix(), id)
+func (s *Store) UpdateHeartbeat(ctx context.Context, id, version, status, applyErr string, revision int64, network domain.NetworkInfo) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	node, _, err := scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if node.PublicAddress == "" {
+		node.PublicAddress = network.PublicAddress
+		if network.PublicInterface != "" && (node.PublicInterface == "" || node.PublicInterface == "eth0") {
+			node.PublicInterface = network.PublicInterface
+		}
+	}
+	if node.PrivateAddress == "" {
+		node.PrivateAddress = network.PrivateAddress
+		if network.PrivateInterface != "" && (node.PrivateInterface == "" || node.PrivateInterface == "wg0") {
+			node.PrivateInterface = network.PrivateInterface
+		}
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET public_address=?,private_address=?,public_interface=?,private_interface=?,agent_version=?,applied_revision=?,apply_status=?,apply_error=?,last_seen_at=? WHERE id=?`, node.PublicAddress, node.PrivateAddress, node.PublicInterface, node.PrivateInterface, version, revision, status, applyErr, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -319,7 +343,7 @@ func (s *Store) UpdateHeartbeat(ctx context.Context, id, version, status, applyE
 	if count == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 func scanLine(scanner interface{ Scan(...any) error }) (domain.Line, error) {

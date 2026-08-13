@@ -108,12 +108,20 @@ type RuleTrafficSummary struct {
 	DownloadBytesPerSecond int64  `json:"download_bytes_per_second"`
 }
 
+type NetworkInfo struct {
+	PublicAddress    string `json:"public_address,omitempty"`
+	PrivateAddress   string `json:"private_address,omitempty"`
+	PublicInterface  string `json:"public_interface,omitempty"`
+	PrivateInterface string `json:"private_interface,omitempty"`
+}
+
 type SyncRequest struct {
 	NodeID          string         `json:"node_id"`
 	AgentVersion    string         `json:"agent_version"`
 	AppliedRevision int64          `json:"applied_revision"`
 	ApplyStatus     string         `json:"apply_status"`
 	ApplyError      string         `json:"apply_error,omitempty"`
+	Network         NetworkInfo    `json:"network,omitempty"`
 	Traffic         []TrafficDelta `json:"traffic,omitempty"`
 }
 

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -775,9 +776,15 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	if req.ApplyStatus == "" {
 		req.ApplyStatus = "normal"
 	}
-	if err := s.store.UpdateHeartbeat(r.Context(), req.NodeID, req.AgentVersion, req.ApplyStatus, req.ApplyError, req.AppliedRevision); err != nil {
+	if address := requestPublicAddress(r); address != "" {
+		req.Network.PublicAddress = address
+	}
+	if err := s.store.UpdateHeartbeat(r.Context(), req.NodeID, req.AgentVersion, req.ApplyStatus, req.ApplyError, req.AppliedRevision, req.Network); err != nil {
 		writeError(w, 500, err)
 		return
+	}
+	if refreshed, refreshedHash, refreshErr := s.store.GetNode(r.Context(), req.NodeID); refreshErr == nil {
+		node, hash = refreshed, refreshedHash
 	}
 	if len(req.Traffic) > 0 {
 		if err := s.store.AddTraffic(r.Context(), req.NodeID, req.Traffic); err != nil {
@@ -811,6 +818,20 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	node.Status = "online"
 	node.LastSeenAt = time.Now().UTC()
 	writeJSON(w, 200, domain.SyncResponse{Revision: revision, GeneratedAt: time.Now().UTC(), Node: node, Peers: peers, Deployments: deployments})
+}
+
+func requestPublicAddress(r *http.Request) string {
+	for _, candidate := range []string{strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0], r.Header.Get("X-Real-IP"), r.RemoteAddr} {
+		candidate = strings.TrimSpace(candidate)
+		if host, _, err := net.SplitHostPort(candidate); err == nil {
+			candidate = host
+		}
+		ip := net.ParseIP(candidate)
+		if ip != nil && ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 func validateNode(n domain.Node) error {

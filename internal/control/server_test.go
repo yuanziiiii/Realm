@@ -68,6 +68,20 @@ func TestSaveRuleUpdatePreservesRelayPortAndChangesFields(t *testing.T) {
 	}
 }
 
+func TestRequestPublicAddressSupportsDirectAndHTTPSProxyRequests(t *testing.T) {
+	direct := httptest.NewRequest(http.MethodPost, "/agent/v1/sync", nil)
+	direct.RemoteAddr = "198.51.100.20:43210"
+	if got := requestPublicAddress(direct); got != "198.51.100.20" {
+		t.Fatalf("unexpected direct public address: %q", got)
+	}
+	proxied := httptest.NewRequest(http.MethodPost, "/agent/v1/sync", nil)
+	proxied.RemoteAddr = "172.18.0.2:1234"
+	proxied.Header.Set("X-Forwarded-For", "203.0.113.88, 172.18.0.2")
+	if got := requestPublicAddress(proxied); got != "203.0.113.88" {
+		t.Fatalf("unexpected proxied public address: %q", got)
+	}
+}
+
 func TestCompleteSimpleRuleSelectsNodesAndRelayPort(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))

@@ -65,6 +65,47 @@ func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	}
 }
 
+func TestHeartbeatAutoFillsBlankNetworkWithoutOverwritingManualValues(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	node := domain.Node{ID: "node", Name: "NAT 出口", Role: domain.NodeRoleEgress, PublicInterface: "eth0", PrivateInterface: "wg0", CreatedAt: time.Now().UTC()}
+	if err := st.CreateNode(ctx, node, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	auto := domain.NetworkInfo{PublicAddress: "198.51.100.20", PrivateAddress: "10.24.0.3", PublicInterface: "ens3", PrivateInterface: "eth1"}
+	if err := st.UpdateHeartbeat(ctx, node.ID, "0.3.0", "normal", "", 1, auto); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := st.GetNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PublicAddress != auto.PublicAddress || got.PrivateAddress != auto.PrivateAddress || got.PublicInterface != auto.PublicInterface || got.PrivateInterface != auto.PrivateInterface {
+		t.Fatalf("network fields were not auto-filled: %+v", got)
+	}
+	got.PublicAddress = "203.0.113.9"
+	got.PrivateAddress = "172.16.1.9"
+	got.PublicInterface = "manual0"
+	got.PrivateInterface = "manual1"
+	if err := st.UpdateNode(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateHeartbeat(ctx, node.ID, "0.3.0", "normal", "", 1, domain.NetworkInfo{PublicAddress: "198.51.100.99", PrivateAddress: "10.0.0.99", PublicInterface: "eth9", PrivateInterface: "eth8"}); err != nil {
+		t.Fatal(err)
+	}
+	preserved, _, err := st.GetNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.PublicAddress != "203.0.113.9" || preserved.PrivateAddress != "172.16.1.9" || preserved.PublicInterface != "manual0" || preserved.PrivateInterface != "manual1" {
+		t.Fatalf("manual network values were overwritten: %+v", preserved)
+	}
+}
+
 func TestTrafficKeepsDailyHistoryAndPrunesMinuteDetail(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
