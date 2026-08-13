@@ -65,6 +65,50 @@ func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	}
 }
 
+func TestTrafficKeepsDailyHistoryAndPrunesMinuteDetail(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, n := range []domain.Node{{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now}, {ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}} {
+		if err := st.CreateNode(ctx, n, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", Mode: domain.ForwardModeDualManaged, Name: "测试", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.2", TargetPort: 80, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	old := domain.TrafficDelta{RuleID: "rule", CapturedAt: now.AddDate(0, 0, -10), UploadBytes: 100, DownloadBytes: 200}
+	current := domain.TrafficDelta{RuleID: "rule", CapturedAt: now, UploadBytes: 300, DownloadBytes: 400}
+	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{old, current}); err != nil {
+		t.Fatal(err)
+	}
+	var minuteRows int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM traffic_minute`).Scan(&minuteRows); err != nil {
+		t.Fatal(err)
+	}
+	if minuteRows != 1 {
+		t.Fatalf("expected only recent minute detail, got %d rows", minuteRows)
+	}
+	daily, err := st.DailyTraffic(ctx, "rule", now.AddDate(0, 0, -30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(daily) != 2 {
+		t.Fatalf("expected old and current daily totals, got %+v", daily)
+	}
+	summaries, err := st.RuleTrafficSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].TotalUploadBytes != 400 || summaries[0].TotalDownloadBytes != 600 || summaries[0].TodayUploadBytes != 300 || summaries[0].TodayDownloadBytes != 400 {
+		t.Fatalf("unexpected compacted totals: %+v", summaries)
+	}
+}
+
 func TestExitOnlyRuleCreatesOnlyEgressDeployment(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

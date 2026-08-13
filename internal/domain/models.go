@@ -98,6 +98,12 @@ type RuleTrafficSummary struct {
 	TotalDownloadBytes     int64  `json:"total_download_bytes"`
 	TodayUploadBytes       int64  `json:"today_upload_bytes"`
 	TodayDownloadBytes     int64  `json:"today_download_bytes"`
+	WeekUploadBytes        int64  `json:"week_upload_bytes"`
+	WeekDownloadBytes      int64  `json:"week_download_bytes"`
+	MonthUploadBytes       int64  `json:"month_upload_bytes"`
+	MonthDownloadBytes     int64  `json:"month_download_bytes"`
+	QuarterUploadBytes     int64  `json:"quarter_upload_bytes"`
+	QuarterDownloadBytes   int64  `json:"quarter_download_bytes"`
 	UploadBytesPerSecond   int64  `json:"upload_bytes_per_second"`
 	DownloadBytesPerSecond int64  `json:"download_bytes_per_second"`
 }
@@ -120,11 +126,17 @@ type SyncResponse struct {
 }
 
 type DashboardSummary struct {
-	OnlineNodes   int64          `json:"online_nodes"`
-	TotalNodes    int64          `json:"total_nodes"`
-	EnabledRules  int64          `json:"enabled_rules"`
-	TotalRules    int64          `json:"total_rules"`
-	TodayUpload   int64          `json:"today_upload"`
-	TodayDownload int64          `json:"today_download"`
-	RecentTraffic []TrafficPoint `json:"recent_traffic"`
+	OnlineNodes     int64          `json:"online_nodes"`
+	TotalNodes      int64          `json:"total_nodes"`
+	EnabledRules    int64          `json:"enabled_rules"`
+	TotalRules      int64          `json:"total_rules"`
+	TodayUpload     int64          `json:"today_upload"`
+	TodayDownload   int64          `json:"today_download"`
+	WeekUpload      int64          `json:"week_upload"`
+	WeekDownload    int64          `json:"week_download"`
+	MonthUpload     int64          `json:"month_upload"`
+	MonthDownload   int64          `json:"month_download"`
+	QuarterUpload   int64          `json:"quarter_upload"`
+	QuarterDownload int64          `json:"quarter_download"`
+	RecentTraffic   []TrafficPoint `json:"recent_traffic"`
 }

@@ -720,11 +720,23 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 func (s *Server) traffic(w http.ResponseWriter, r *http.Request) {
-	hours, _ := strconv.Atoi(r.URL.Query().Get("hours"))
-	if hours <= 0 || hours > 24*90 {
-		hours = 24
+	period := r.URL.Query().Get("period")
+	ruleID := r.URL.Query().Get("rule_id")
+	now := time.Now().UTC()
+	var points []domain.TrafficPoint
+	var err error
+	switch period {
+	case "week":
+		weekday := (int(now.Weekday()) + 6) % 7
+		points, err = s.store.DailyTraffic(r.Context(), ruleID, now.Truncate(24*time.Hour).AddDate(0, 0, -weekday))
+	case "month":
+		points, err = s.store.DailyTraffic(r.Context(), ruleID, time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC))
+	case "quarter":
+		quarterMonth := time.Month(((int(now.Month()) - 1) / 3 * 3) + 1)
+		points, err = s.store.DailyTraffic(r.Context(), ruleID, time.Date(now.Year(), quarterMonth, 1, 0, 0, 0, 0, time.UTC))
+	default:
+		points, err = s.store.Traffic(r.Context(), ruleID, now.Truncate(24*time.Hour))
 	}
-	points, err := s.store.Traffic(r.Context(), r.URL.Query().Get("rule_id"), time.Now().UTC().Add(-time.Duration(hours)*time.Hour))
 	if err != nil {
 		writeError(w, 500, err)
 		return

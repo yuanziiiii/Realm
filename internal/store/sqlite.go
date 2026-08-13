@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,7 +15,10 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db               *sql.DB
+	lastTrafficPrune atomic.Int64
+}
 
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
@@ -73,6 +77,14 @@ func (s *Store) migrate(ctx context.Context) error {
 			download_packets INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(rule_id, node_id, bucket)
 		)`,
+		`CREATE TABLE IF NOT EXISTS traffic_daily (
+			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			bucket INTEGER NOT NULL, upload_bytes INTEGER NOT NULL DEFAULT 0,
+			download_bytes INTEGER NOT NULL DEFAULT 0, upload_packets INTEGER NOT NULL DEFAULT 0,
+			download_packets INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(rule_id, node_id, bucket)
+		)`,
 		`CREATE TABLE IF NOT EXISTS traffic_baselines (
 			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
 			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -90,6 +102,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_lines_nodes ON lines(ingress_node_id, egress_node_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_rules_line ON forward_rules(line_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic_minute(bucket)`,
+		`CREATE INDEX IF NOT EXISTS idx_traffic_daily_bucket ON traffic_daily(bucket)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -106,6 +119,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key, value) VALUES ('revision', '1')`)
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO traffic_daily(rule_id,node_id,bucket,upload_bytes,download_bytes,upload_packets,download_packets)
+		SELECT rule_id,node_id,(bucket/86400)*86400,SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets)
+		FROM traffic_minute
+		WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='traffic_daily_backfilled_v1')
+		GROUP BY rule_id,node_id,(bucket/86400)*86400
+		ON CONFLICT(rule_id,node_id,bucket) DO NOTHING`); err != nil {
+		return fmt.Errorf("backfill daily traffic: %w", err)
+	}
+	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key,value) VALUES ('traffic_daily_backfilled_v1','1')`)
 	_, _ = s.db.ExecContext(ctx, `PRAGMA optimize`)
 	return nil
 }
@@ -533,6 +556,18 @@ func (s *Store) AddTraffic(ctx context.Context, nodeID string, deltas []domain.T
 		if err != nil {
 			return err
 		}
+		dayBucket := (bucket / 86400) * 86400
+		_, err = tx.ExecContext(ctx, `INSERT INTO traffic_daily(rule_id,node_id,bucket,upload_bytes,download_bytes,upload_packets,download_packets) VALUES(?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id,bucket) DO UPDATE SET upload_bytes=upload_bytes+excluded.upload_bytes,download_bytes=download_bytes+excluded.download_bytes,upload_packets=upload_packets+excluded.upload_packets,download_packets=download_packets+excluded.download_packets`, d.RuleID, nodeID, dayBucket, d.UploadBytes, d.DownloadBytes, d.UploadPackets, d.DownloadPackets)
+		if err != nil {
+			return err
+		}
+	}
+	today := time.Now().UTC().Truncate(24 * time.Hour).Unix()
+	previousPrune := s.lastTrafficPrune.Load()
+	if previousPrune != today && s.lastTrafficPrune.CompareAndSwap(previousPrune, today) {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM traffic_minute WHERE bucket<?`, time.Now().UTC().Add(-7*24*time.Hour).Unix()); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -545,13 +580,13 @@ func counterDelta(current, previous int64) int64 {
 }
 
 func (s *Store) Traffic(ctx context.Context, ruleID string, since time.Time) ([]domain.TrafficPoint, error) {
-	query := `SELECT bucket,SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets) FROM traffic_minute WHERE bucket>=?`
+	query := `SELECT (bucket/3600)*3600,SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets) FROM traffic_minute WHERE bucket>=?`
 	args := []any{since.Unix()}
 	if ruleID != "" {
 		query += ` AND rule_id=?`
 		args = append(args, ruleID)
 	}
-	query += ` GROUP BY bucket ORDER BY bucket`
+	query += ` GROUP BY (bucket/3600)*3600 ORDER BY (bucket/3600)*3600`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -570,9 +605,46 @@ func (s *Store) Traffic(ctx context.Context, ruleID string, since time.Time) ([]
 	return out, rows.Err()
 }
 
+func (s *Store) DailyTraffic(ctx context.Context, ruleID string, since time.Time) ([]domain.TrafficPoint, error) {
+	query := `SELECT bucket,SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets) FROM traffic_daily WHERE bucket>=?`
+	args := []any{since.UTC().Truncate(24 * time.Hour).Unix()}
+	if ruleID != "" {
+		query += ` AND rule_id=?`
+		args = append(args, ruleID)
+	}
+	query += ` GROUP BY bucket ORDER BY bucket`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.TrafficPoint
+	for rows.Next() {
+		var p domain.TrafficPoint
+		var bucket int64
+		if err := rows.Scan(&bucket, &p.UploadBytes, &p.DownloadBytes, &p.UploadPackets, &p.DownloadPackets); err != nil {
+			return nil, err
+		}
+		p.Bucket = fromUnix(bucket)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func trafficPeriodStarts(now time.Time) (today, week, month, quarter int64) {
+	now = now.UTC()
+	day := now.Truncate(24 * time.Hour)
+	weekday := (int(day.Weekday()) + 6) % 7
+	weekStart := day.AddDate(0, 0, -weekday)
+	monthStart := time.Date(day.Year(), day.Month(), 1, 0, 0, 0, 0, time.UTC)
+	quarterMonth := time.Month(((int(day.Month()) - 1) / 3 * 3) + 1)
+	quarterStart := time.Date(day.Year(), quarterMonth, 1, 0, 0, 0, 0, time.UTC)
+	return day.Unix(), weekStart.Unix(), monthStart.Unix(), quarterStart.Unix()
+}
+
 func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficSummary, error) {
 	now := time.Now().UTC()
-	today := now.Truncate(24 * time.Hour).Unix()
+	today, week, month, quarter := trafficPeriodStarts(now)
 	currentMinute := now.Truncate(time.Minute)
 	elapsed := int64(now.Sub(currentMinute).Seconds())
 	if elapsed < 10 {
@@ -580,15 +652,21 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.id,
-			COALESCE(SUM(t.upload_bytes),0), COALESCE(SUM(t.download_bytes),0),
-			COALESCE(SUM(CASE WHEN t.bucket>=? THEN t.upload_bytes ELSE 0 END),0),
-			COALESCE(SUM(CASE WHEN t.bucket>=? THEN t.download_bytes ELSE 0 END),0),
-			COALESCE(SUM(CASE WHEN t.bucket=? THEN t.upload_bytes ELSE 0 END),0),
-			COALESCE(SUM(CASE WHEN t.bucket=? THEN t.download_bytes ELSE 0 END),0)
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.download_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.download_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.download_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.download_bytes ELSE 0 END),0),
+			COALESCE(SUM(d.upload_bytes),0), COALESCE(SUM(d.download_bytes),0),
+			COALESCE((SELECT SUM(m.upload_bytes) FROM traffic_minute m WHERE m.rule_id=r.id AND m.bucket=?),0),
+			COALESCE((SELECT SUM(m.download_bytes) FROM traffic_minute m WHERE m.rule_id=r.id AND m.bucket=?),0)
 		FROM forward_rules r
-		LEFT JOIN traffic_minute t ON t.rule_id=r.id
+		LEFT JOIN traffic_daily d ON d.rule_id=r.id
 		GROUP BY r.id
-		ORDER BY r.created_at DESC`, today, today, currentMinute.Unix(), currentMinute.Unix())
+		ORDER BY r.created_at DESC`, today, today, week, week, month, month, quarter, quarter, currentMinute.Unix(), currentMinute.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -597,7 +675,7 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 	for rows.Next() {
 		var item domain.RuleTrafficSummary
 		var currentUpload, currentDownload int64
-		if err := rows.Scan(&item.RuleID, &item.TotalUploadBytes, &item.TotalDownloadBytes, &item.TodayUploadBytes, &item.TodayDownloadBytes, &currentUpload, &currentDownload); err != nil {
+		if err := rows.Scan(&item.RuleID, &item.TodayUploadBytes, &item.TodayDownloadBytes, &item.WeekUploadBytes, &item.WeekDownloadBytes, &item.MonthUploadBytes, &item.MonthDownloadBytes, &item.QuarterUploadBytes, &item.QuarterDownloadBytes, &item.TotalUploadBytes, &item.TotalDownloadBytes, &currentUpload, &currentDownload); err != nil {
 			return nil, err
 		}
 		item.UploadBytesPerSecond = currentUpload / elapsed
@@ -615,8 +693,21 @@ func (s *Store) Summary(ctx context.Context) (domain.DashboardSummary, error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(enabled),0) FROM forward_rules`).Scan(&d.TotalRules, &d.EnabledRules); err != nil {
 		return d, err
 	}
-	today := time.Now().UTC().Truncate(24 * time.Hour)
-	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(upload_bytes),0),COALESCE(SUM(download_bytes),0) FROM traffic_minute WHERE bucket>=?`, today.Unix()).Scan(&d.TodayUpload, &d.TodayDownload)
+	now := time.Now().UTC()
+	today, week, month, quarter := trafficPeriodStarts(now)
+	_ = s.db.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(CASE WHEN bucket>=? THEN upload_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN download_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN upload_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN download_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN upload_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN download_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN upload_bytes ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN bucket>=? THEN download_bytes ELSE 0 END),0)
+		FROM traffic_daily`, today, today, week, week, month, month, quarter, quarter).Scan(
+		&d.TodayUpload, &d.TodayDownload, &d.WeekUpload, &d.WeekDownload,
+		&d.MonthUpload, &d.MonthDownload, &d.QuarterUpload, &d.QuarterDownload,
+	)
 	points, err := s.Traffic(ctx, "", time.Now().UTC().Add(-24*time.Hour))
 	d.RecentTraffic = points
 	return d, err
