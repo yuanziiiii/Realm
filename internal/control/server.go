@@ -440,8 +440,23 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isCreate := r.PathValue("id") == ""
+	var existing domain.ForwardRule
 	if id := r.PathValue("id"); id != "" {
 		rule.ID = id
+		var err error
+		existing, err = s.store.GetRule(r.Context(), id)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, 404, err)
+			return
+		}
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		if rule.RelayPort == 0 {
+			rule.RelayPort = existing.RelayPort
+		}
+		rule.CreatedAt = existing.CreatedAt
 	} else {
 		rule.ID = randomID("rule")
 	}
@@ -486,6 +501,10 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, err)
 		return
 	}
+	if err := s.ensureRulePortsAvailable(r.Context(), rule); err != nil {
+		writeError(w, 409, err)
+		return
+	}
 	if _, _, err := s.store.GetNode(r.Context(), rule.IngressNodeID); err != nil {
 		writeError(w, 422, errors.New("入口节点不存在"))
 		return
@@ -494,15 +513,31 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, errors.New("出口节点不存在"))
 		return
 	}
-	if existing, err := s.store.GetRule(r.Context(), rule.ID); err == nil {
-		rule.CreatedAt = existing.CreatedAt
-	}
 	saved, err := s.store.SaveRule(r.Context(), rule)
 	if err != nil {
 		writeError(w, 409, err)
 		return
 	}
 	writeJSON(w, 200, saved)
+}
+
+func (s *Server) ensureRulePortsAvailable(ctx context.Context, rule domain.ForwardRule) error {
+	rules, err := s.store.ListRules(ctx)
+	if err != nil {
+		return err
+	}
+	for _, other := range rules {
+		if other.ID == rule.ID || !protocolsOverlap(other.Protocol, rule.Protocol) {
+			continue
+		}
+		if other.IngressNodeID == rule.IngressNodeID && other.ListenPort == rule.ListenPort {
+			return fmt.Errorf("入口端口 %d 已被规则 %q 占用", rule.ListenPort, other.Name)
+		}
+		if other.EgressNodeID == rule.EgressNodeID && other.RelayPort == rule.RelayPort {
+			return fmt.Errorf("出口中继端口 %d 已被规则 %q 占用", rule.RelayPort, other.Name)
+		}
+	}
+	return nil
 }
 
 func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRule) error {

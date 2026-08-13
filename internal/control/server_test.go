@@ -1,7 +1,11 @@
 package control
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,6 +13,60 @@ import (
 	"relaypanel/internal/domain"
 	"relaypanel/internal/store"
 )
+
+func TestSaveRuleUpdatePreservesRelayPortAndChangesFields(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", LineID: line.ID, Name: "旧目标", Mode: line.Mode, Protocol: "both", IngressNodeID: line.IngressNodeID, EgressNodeID: line.EgressNodeID, ListenAddress: line.ListenAddress, ListenPort: 10000, RelayPort: 31000, TargetHost: "192.0.2.1", TargetPort: 80, Engine: line.Engine, BurstKBytes: 512, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"line_id": line.ID, "name": "新目标", "protocol": "tcp", "listen_port": 10001,
+		"target_host": "192.0.2.2", "target_port": 443, "upload_mbps": 20,
+		"download_mbps": 50, "burst_kbytes": 256, "enabled": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/rules/rule", bytes.NewReader(body))
+	req.SetPathValue("id", original.ID)
+	recorder := httptest.NewRecorder()
+	(&Server{store: st}).saveRule(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var updated domain.ForwardRule
+	if err := json.NewDecoder(recorder.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.ListenPort != 10001 || updated.TargetHost != "192.0.2.2" || updated.TargetPort != 443 || updated.Protocol != "tcp" {
+		t.Fatalf("editable fields were not updated: %+v", updated)
+	}
+	if updated.UploadMbps != 20 || updated.DownloadMbps != 50 || updated.BurstKBytes != 256 {
+		t.Fatalf("rate limits were not updated: %+v", updated)
+	}
+	if updated.RelayPort != original.RelayPort {
+		t.Fatalf("relay port changed unexpectedly: got %d, want %d", updated.RelayPort, original.RelayPort)
+	}
+}
 
 func TestCompleteSimpleRuleSelectsNodesAndRelayPort(t *testing.T) {
 	ctx := context.Background()
