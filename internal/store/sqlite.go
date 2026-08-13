@@ -48,7 +48,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'dual_managed',
 			ingress_node_id TEXT NOT NULL REFERENCES nodes(id),
 			egress_node_id TEXT NOT NULL REFERENCES nodes(id),
-			listen_address TEXT NOT NULL DEFAULT '', engine TEXT NOT NULL DEFAULT 'nftables',
+			listen_address TEXT NOT NULL DEFAULT '', relay_port_range TEXT NOT NULL DEFAULT '',
+			engine TEXT NOT NULL DEFAULT 'nftables',
 			enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS forward_rules (
@@ -99,6 +100,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "line_id", `ALTER TABLE forward_rules ADD COLUMN line_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "lines", "relay_port_range", `ALTER TABLE lines ADD COLUMN relay_port_range TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key, value) VALUES ('revision', '1')`)
@@ -273,14 +277,14 @@ func scanLine(scanner interface{ Scan(...any) error }) (domain.Line, error) {
 	var line domain.Line
 	var enabled int
 	var created, updated int64
-	err := scanner.Scan(&line.ID, &line.Name, &line.Mode, &line.IngressNodeID, &line.EgressNodeID, &line.ListenAddress, &line.Engine, &enabled, &created, &updated)
+	err := scanner.Scan(&line.ID, &line.Name, &line.Mode, &line.IngressNodeID, &line.EgressNodeID, &line.ListenAddress, &line.RelayPortRange, &line.Engine, &enabled, &created, &updated)
 	line.Enabled = enabled == 1
 	line.CreatedAt = fromUnix(created)
 	line.UpdatedAt = fromUnix(updated)
 	return line, err
 }
 
-const lineColumns = `id,name,mode,ingress_node_id,egress_node_id,listen_address,engine,enabled,created_at,updated_at`
+const lineColumns = `id,name,mode,ingress_node_id,egress_node_id,listen_address,relay_port_range,engine,enabled,created_at,updated_at`
 
 func (s *Store) ListLines(ctx context.Context) ([]domain.Line, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+lineColumns+` FROM lines ORDER BY created_at DESC`)
@@ -313,11 +317,50 @@ func (s *Store) SaveLine(ctx context.Context, line domain.Line) (domain.Line, er
 	if line.CreatedAt.IsZero() {
 		line.CreatedAt = now
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,engine=excluded.engine,enabled=excluded.enabled,updated_at=excluded.updated_at`, line.ID, line.Name, line.Mode, line.IngressNodeID, line.EgressNodeID, line.ListenAddress, line.Engine, boolInt(line.Enabled), unix(line.CreatedAt), unix(line.UpdatedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,enabled=excluded.enabled,updated_at=excluded.updated_at`, line.ID, line.Name, line.Mode, line.IngressNodeID, line.EgressNodeID, line.ListenAddress, line.RelayPortRange, line.Engine, boolInt(line.Enabled), unix(line.CreatedAt), unix(line.UpdatedAt))
 	if err == nil {
 		s.audit(ctx, "save", "line", line.ID, line.Name)
 	}
 	return line, err
+}
+
+// SaveLineRules changes a line and every rule that belongs to it in one
+// transaction. This prevents Agents from observing a line whose rules still
+// reference the previous ingress or egress server.
+func (s *Store) SaveLineRules(ctx context.Context, line domain.Line, rules []domain.ForwardRule) (domain.Line, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return line, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	line.UpdatedAt = now
+	if line.CreatedAt.IsZero() {
+		line.CreatedAt = now
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,enabled=excluded.enabled,updated_at=excluded.updated_at`, line.ID, line.Name, line.Mode, line.IngressNodeID, line.EgressNodeID, line.ListenAddress, line.RelayPortRange, line.Engine, boolInt(line.Enabled), unix(line.CreatedAt), unix(line.UpdatedAt))
+	if err != nil {
+		return line, err
+	}
+	if len(rules) > 0 {
+		revision, err := s.bumpRevision(ctx, tx)
+		if err != nil {
+			return line, err
+		}
+		for i := range rules {
+			rules[i].Revision = revision
+			rules[i].UpdatedAt = now
+			_, err = tx.ExecContext(ctx, `UPDATE forward_rules SET mode=?,ingress_node_id=?,egress_node_id=?,listen_address=?,relay_port=?,engine=?,revision=?,updated_at=? WHERE id=? AND line_id=?`, rules[i].Mode, rules[i].IngressNodeID, rules[i].EgressNodeID, rules[i].ListenAddress, rules[i].RelayPort, rules[i].Engine, revision, unix(now), rules[i].ID, line.ID)
+			if err != nil {
+				return line, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return line, err
+	}
+	s.audit(ctx, "save", "line", line.ID, line.Name)
+	return line, nil
 }
 
 func (s *Store) DeleteLine(ctx context.Context, id string) error {

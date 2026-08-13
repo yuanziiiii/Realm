@@ -97,3 +97,83 @@ func TestCompleteLineValidatesRolesAndFillsListener(t *testing.T) {
 		t.Fatal("expected invalid node roles to be rejected")
 	}
 }
+
+func TestCompleteSimpleRuleUsesConfiguredExitPortPool(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out", Name: "NAT 出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "NAT 线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", RelayPortRange: "20000-20002", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.SaveRule(ctx, domain.ForwardRule{ID: "used", Name: "占用端口", Mode: domain.ForwardModeDualManaged, Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10001, RelayPort: 20000, TargetHost: "192.0.2.1", TargetPort: 80, Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: st}
+	rule := domain.ForwardRule{LineID: line.ID, Mode: line.Mode, Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenPort: 10002, TargetHost: "192.0.2.2", TargetPort: 80}
+	if err := s.completeSimpleRule(ctx, &rule); err != nil {
+		t.Fatal(err)
+	}
+	if rule.RelayPort != 20001 {
+		t.Fatalf("expected first free NAT port 20001, got %d", rule.RelayPort)
+	}
+}
+
+func TestLineUpdateMigratesExistingRulesToNewServers(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in-a", Name: "入口 A", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out-a", Name: "出口 A", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+		{ID: "out-b", Name: "出口 B", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.4", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in-a", EgressNodeID: "out-a", ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.SaveRule(ctx, domain.ForwardRule{ID: "rule", LineID: line.ID, Name: "网站", Mode: line.Mode, Protocol: "both", IngressNodeID: line.IngressNodeID, EgressNodeID: line.EgressNodeID, ListenAddress: line.ListenAddress, ListenPort: 24444, RelayPort: 32444, TargetHost: "192.0.2.88", TargetPort: 443, Engine: line.Engine, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := line
+	updated.EgressNodeID = "out-b"
+	updated.RelayPortRange = "41000-41001"
+	updated.Engine = "realm"
+	s := &Server{store: st}
+	rules, err := s.rulesForLineUpdate(ctx, updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || rules[0].EgressNodeID != "out-b" || rules[0].RelayPort != 41000 || rules[0].Engine != "realm" {
+		t.Fatalf("unexpected migrated rule: %+v", rules)
+	}
+	if _, err := st.SaveLineRules(ctx, updated, rules); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetRule(ctx, "rule")
+	if err != nil || stored.EgressNodeID != "out-b" || stored.RelayPort != 41000 || stored.Engine != "realm" {
+		t.Fatalf("rule migration was not stored: %+v, %v", stored, err)
+	}
+}
