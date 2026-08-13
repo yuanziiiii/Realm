@@ -527,6 +527,43 @@ func (s *Store) Traffic(ctx context.Context, ruleID string, since time.Time) ([]
 	return out, rows.Err()
 }
 
+func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficSummary, error) {
+	now := time.Now().UTC()
+	today := now.Truncate(24 * time.Hour).Unix()
+	currentMinute := now.Truncate(time.Minute)
+	elapsed := int64(now.Sub(currentMinute).Seconds())
+	if elapsed < 10 {
+		elapsed = 10
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.id,
+			COALESCE(SUM(t.upload_bytes),0), COALESCE(SUM(t.download_bytes),0),
+			COALESCE(SUM(CASE WHEN t.bucket>=? THEN t.upload_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN t.bucket>=? THEN t.download_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN t.bucket=? THEN t.upload_bytes ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN t.bucket=? THEN t.download_bytes ELSE 0 END),0)
+		FROM forward_rules r
+		LEFT JOIN traffic_minute t ON t.rule_id=r.id
+		GROUP BY r.id
+		ORDER BY r.created_at DESC`, today, today, currentMinute.Unix(), currentMinute.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.RuleTrafficSummary
+	for rows.Next() {
+		var item domain.RuleTrafficSummary
+		var currentUpload, currentDownload int64
+		if err := rows.Scan(&item.RuleID, &item.TotalUploadBytes, &item.TotalDownloadBytes, &item.TodayUploadBytes, &item.TodayDownloadBytes, &currentUpload, &currentDownload); err != nil {
+			return nil, err
+		}
+		item.UploadBytesPerSecond = currentUpload / elapsed
+		item.DownloadBytesPerSecond = currentDownload / elapsed
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Summary(ctx context.Context) (domain.DashboardSummary, error) {
 	var d domain.DashboardSummary
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),SUM(CASE WHEN last_seen_at>=? THEN 1 ELSE 0 END) FROM nodes`, time.Now().Add(-45*time.Second).Unix()).Scan(&d.TotalNodes, &d.OnlineNodes); err != nil {

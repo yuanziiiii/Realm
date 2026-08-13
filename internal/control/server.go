@@ -118,6 +118,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
+	mux.HandleFunc("GET /api/v1/traffic/rules", s.requireAdmin(s.ruleTraffic))
 	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if s.webProxy != nil {
@@ -541,6 +542,15 @@ func (s *Server) traffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, nonNil(points))
+}
+
+func (s *Server) ruleTraffic(w http.ResponseWriter, r *http.Request) {
+	items, err := s.store.RuleTrafficSummaries(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(items))
 }
 
 func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {

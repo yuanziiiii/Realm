@@ -91,6 +91,16 @@ type TrafficPoint struct {
 	DownloadPackets int64     `json:"download_packets"`
 }
 
+type RuleTrafficSummary struct {
+	RuleID                 string `json:"rule_id"`
+	TotalUploadBytes       int64  `json:"total_upload_bytes"`
+	TotalDownloadBytes     int64  `json:"total_download_bytes"`
+	TodayUploadBytes       int64  `json:"today_upload_bytes"`
+	TodayDownloadBytes     int64  `json:"today_download_bytes"`
+	UploadBytesPerSecond   int64  `json:"upload_bytes_per_second"`
+	DownloadBytesPerSecond int64  `json:"download_bytes_per_second"`
+}
+
 type SyncRequest struct {
 	NodeID          string         `json:"node_id"`
 	AgentVersion    string         `json:"agent_version"`

@@ -52,6 +52,17 @@ func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	if up != 1100 || down != 2200 {
 		t.Fatalf("expected reset-aware totals 1100/2200, got %d/%d", up, down)
 	}
+	summaries, err := st.RuleTrafficSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("expected one rule traffic summary, got %+v", summaries)
+	}
+	got := summaries[0]
+	if got.RuleID != "rule" || got.TotalUploadBytes != 1100 || got.TotalDownloadBytes != 2200 || got.TodayUploadBytes != 1100 || got.TodayDownloadBytes != 2200 {
+		t.Fatalf("unexpected rule traffic summary: %+v", got)
+	}
 }
 
 func TestExitOnlyRuleCreatesOnlyEgressDeployment(t *testing.T) {
