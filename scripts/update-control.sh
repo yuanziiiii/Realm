@@ -32,16 +32,11 @@ control_id="$(docker compose --project-directory "${install_dir}" ps -aq control
 [[ -n "${control_id}" ]] || fail "没有找到 control 容器"
 image_ref="$(docker inspect --format '{{.Config.Image}}' "${control_id}")"
 [[ -n "${image_ref}" ]] || fail "无法识别 control 镜像"
+old_image_id="$(docker image inspect --format '{{.Id}}' "${image_ref}")"
+[[ -n "${old_image_id}" ]] || fail "无法识别当前 control 镜像版本"
 
 tmp_dir="$(mktemp -d)"
-restart_needed=false
-cleanup() {
-  rm -rf "${tmp_dir}"
-  if [[ "${restart_needed}" == true ]]; then
-    docker start "${control_id}" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
+trap 'rm -rf "${tmp_dir}"' EXIT
 
 binary_name="relay-control-linux-${control_arch}"
 say "下载 Relay Control ${version} (${control_arch})"
@@ -52,26 +47,38 @@ actual="$(sha256sum "${tmp_dir}/relay-control" | awk '{print $1}')"
 [[ -n "${expected}" && "${actual}" == "${expected}" ]] || fail "控制端 SHA-256 校验失败"
 chmod 0755 "${tmp_dir}/relay-control"
 
-say "备份当前控制端并更新程序"
-docker cp "${control_id}:/usr/local/bin/relay-control" "${tmp_dir}/relay-control.previous"
-docker compose --project-directory "${install_dir}" stop control >/dev/null
-restart_needed=true
-docker cp "${tmp_dir}/relay-control" "${control_id}:/usr/local/bin/relay-control"
-docker commit "${control_id}" "${image_ref}" >/dev/null
-docker start "${control_id}" >/dev/null
+cat > "${tmp_dir}/Dockerfile" <<'EOF'
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S relay \
+    && adduser -S -G relay relay \
+    && mkdir -p /data \
+    && chown relay:relay /data
+COPY relay-control /usr/local/bin/relay-control
+USER relay
+VOLUME ["/data"]
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/relay-control"]
+EOF
+
+say "构建轻量控制端镜像（不编译源码）"
+docker build --quiet --tag "${image_ref}" "${tmp_dir}" >/dev/null
+say "规范重建 control 容器"
+if ! docker compose --project-directory "${install_dir}" up -d --no-deps --no-build --force-recreate control >/dev/null; then
+  docker tag "${old_image_id}" "${image_ref}"
+  docker compose --project-directory "${install_dir}" up -d --no-deps --no-build --force-recreate control >/dev/null 2>&1 || true
+  fail "控制端容器重建失败，已恢复旧镜像"
+fi
 sleep 3
 
-if [[ "$(docker inspect --format '{{.State.Status}}' "${control_id}")" == "running" ]] && docker exec "${control_id}" wget -q -O /dev/null http://127.0.0.1:8080/healthz; then
-  restart_needed=false
+new_control_id="$(docker compose --project-directory "${install_dir}" ps -q control)"
+if [[ -n "${new_control_id}" && "$(docker inspect --format '{{.State.Status}}' "${new_control_id}")" == "running" ]] && docker exec "${new_control_id}" wget -q -O /dev/null http://127.0.0.1:8080/healthz; then
   say "控制端更新完成，数据库、密码和面板配置均未改动"
   exit 0
 fi
 
 say "新版启动失败，正在恢复旧版本"
-docker stop "${control_id}" >/dev/null 2>&1 || true
-docker cp "${tmp_dir}/relay-control.previous" "${control_id}:/usr/local/bin/relay-control"
-docker commit "${control_id}" "${image_ref}" >/dev/null
-docker start "${control_id}" >/dev/null 2>&1 || true
-restart_needed=false
-docker logs --tail 30 "${control_id}" >&2 || true
+[[ -n "${new_control_id}" ]] && docker logs --tail 30 "${new_control_id}" >&2 || true
+docker tag "${old_image_id}" "${image_ref}"
+docker compose --project-directory "${install_dir}" up -d --no-deps --no-build --force-recreate control >/dev/null 2>&1 || true
 fail "控制端更新失败，已恢复旧版本"
