@@ -21,6 +21,7 @@ type Plan struct {
 	TC             []Command `json:"tc"`
 	RealmConfig    []byte    `json:"realm_config,omitempty"`
 	IngressRuleIDs []string  `json:"ingress_rule_ids"`
+	ForwardMarks   []uint32  `json:"forward_marks,omitempty"`
 }
 
 func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscReplace bool) (Plan, error) {
@@ -34,6 +35,9 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 			fmt.Fprintf(&b, "  counter %s { comment \"%s upload\"; }\n", counterName(d.Rule.ID, "up"), escapeComment(d.Rule.Name))
 			fmt.Fprintf(&b, "  counter %s { comment \"%s download\"; }\n", counterName(d.Rule.ID, "down"), escapeComment(d.Rule.Name))
 			p.IngressRuleIDs = append(p.IngressRuleIDs, d.Rule.ID)
+		}
+		if d.Rule.Engine == "nftables" {
+			p.ForwardMarks = append(p.ForwardMarks, uploadMark(d.Rule.ID))
 		}
 	}
 	b.WriteString("  chain prerouting { type nat hook prerouting priority dstnat; policy accept;\n")
@@ -50,6 +54,12 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 			if err := renderPostrouting(&b, node, d); err != nil {
 				return p, err
 			}
+		}
+	}
+	b.WriteString("  }\n  chain forward_stats { type filter hook forward priority -10; policy accept;\n")
+	for _, d := range deployments {
+		if d.Rule.Engine == "nftables" && ownsTrafficCounters(d) {
+			fmt.Fprintf(&b, "    ct mark %d ct direction reply counter name %s meta mark set %d\n", uploadMark(d.Rule.ID), counterName(d.Rule.ID, "down"), downloadMark(d.Rule.ID))
 		}
 	}
 	b.WriteString("  }\n  chain input_stats { type filter hook input priority filter; policy accept;\n")
@@ -92,7 +102,7 @@ func renderPrerouting(b *strings.Builder, node domain.Node, d domain.Deployment)
 	r := d.Rule
 	if d.Role == domain.NodeRoleIngress || d.Role == domain.NodeRoleBoth {
 		for _, proto := range protocols(r.Protocol) {
-			fmt.Fprintf(b, "    iifname \"%s\" %s dport %d counter name %s meta mark set %d dnat ip to %s:%d\n", safeInterface(node.PublicInterface), proto, r.ListenPort, counterName(r.ID, "up"), uploadMark(r.ID), mustIPv4Placeholder(r.EgressNodeID), r.RelayPort)
+			fmt.Fprintf(b, "    iifname \"%s\" %s dport %d counter name %s meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PublicInterface), proto, r.ListenPort, counterName(r.ID, "up"), uploadMark(r.ID), uploadMark(r.ID), mustIPv4Placeholder(r.EgressNodeID), r.RelayPort)
 		}
 	}
 	if d.Role == domain.NodeRoleEgress || d.Role == domain.NodeRoleBoth {
@@ -101,9 +111,9 @@ func renderPrerouting(b *strings.Builder, node domain.Node, d domain.Deployment)
 		}
 		for _, proto := range protocols(r.Protocol) {
 			if r.Mode == domain.ForwardModeExitOnly {
-				fmt.Fprintf(b, "    iifname \"%s\" ip daddr %s %s dport %d counter name %s meta mark set %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), r.ListenAddress, proto, r.ListenPort, counterName(r.ID, "up"), uploadMark(r.ID), r.TargetHost, r.TargetPort)
+				fmt.Fprintf(b, "    iifname \"%s\" ip daddr %s %s dport %d counter name %s meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), r.ListenAddress, proto, r.ListenPort, counterName(r.ID, "up"), uploadMark(r.ID), uploadMark(r.ID), r.TargetHost, r.TargetPort)
 			} else {
-				fmt.Fprintf(b, "    iifname \"%s\" %s dport %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), proto, r.RelayPort, r.TargetHost, r.TargetPort)
+				fmt.Fprintf(b, "    iifname \"%s\" %s dport %d meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), proto, r.RelayPort, uploadMark(r.ID), uploadMark(r.ID), r.TargetHost, r.TargetPort)
 			}
 		}
 	}
@@ -147,20 +157,15 @@ func renderPostrouting(b *strings.Builder, node domain.Node, d domain.Deployment
 	r := d.Rule
 	if d.Role == domain.NodeRoleIngress || d.Role == domain.NodeRoleBoth {
 		for _, proto := range protocols(r.Protocol) {
-			fmt.Fprintf(b, "    oifname \"%s\" %s sport %d counter name %s meta mark set %d\n", safeInterface(node.PublicInterface), proto, r.ListenPort, counterName(r.ID, "down"), downloadMark(r.ID))
 			fmt.Fprintf(b, "    oifname \"%s\" %s dport %d masquerade\n", safeInterface(node.PrivateInterface), proto, r.RelayPort)
 		}
 	}
 	if d.Role == domain.NodeRoleEgress || d.Role == domain.NodeRoleBoth {
 		for _, proto := range protocols(r.Protocol) {
-			if ip := net.ParseIP(node.PublicAddress); ip != nil && ip.To4() != nil {
-				fmt.Fprintf(b, "    oifname \"%s\" ip daddr %s %s dport %d snat ip to %s\n", safeInterface(node.PublicInterface), r.TargetHost, proto, r.TargetPort, ip.String())
-			} else {
-				fmt.Fprintf(b, "    oifname \"%s\" ip daddr %s %s dport %d masquerade\n", safeInterface(node.PublicInterface), r.TargetHost, proto, r.TargetPort)
-			}
-			if r.Mode == domain.ForwardModeExitOnly {
-				fmt.Fprintf(b, "    oifname \"%s\" ip saddr %s %s sport %d counter name %s meta mark set %d\n", safeInterface(node.PrivateInterface), r.ListenAddress, proto, r.ListenPort, counterName(r.ID, "down"), downloadMark(r.ID))
-			}
+			// PublicAddress is often a provider-side NAT address and is not
+			// assigned to the host. Masquerade selects the interface's real source
+			// address and works for both directly routed and cloud NAT servers.
+			fmt.Fprintf(b, "    oifname \"%s\" ip daddr %s %s dport %d masquerade\n", safeInterface(node.PublicInterface), r.TargetHost, proto, r.TargetPort)
 		}
 	}
 	return nil
@@ -284,7 +289,9 @@ func renderRealm(node domain.Node, deployments []domain.Deployment) []byte {
 			if r.Mode == domain.ForwardModeExitOnly {
 				listenAddress = r.ListenAddress
 			}
-			endpoints = append(endpoints, endpoint{Listen: net.JoinHostPort(listenAddress, strconv.Itoa(r.RelayPort)), Remote: net.JoinHostPort(r.TargetHost, strconv.Itoa(r.TargetPort)), Through: node.PublicAddress, Interface: node.PublicInterface, Network: network})
+			// PublicAddress may only exist on the cloud provider's NAT gateway.
+			// Pin the outbound interface and let the kernel choose a local source.
+			endpoints = append(endpoints, endpoint{Listen: net.JoinHostPort(listenAddress, strconv.Itoa(r.RelayPort)), Remote: net.JoinHostPort(r.TargetHost, strconv.Itoa(r.TargetPort)), Interface: node.PublicInterface, Network: network})
 		}
 	}
 	if len(endpoints) == 0 {

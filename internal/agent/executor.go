@@ -58,11 +58,25 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("apply nftables: %w: %s", err, bytes.TrimSpace(out))
 	}
+	if err := reconcileForwardingCompat(ctx, p.ForwardMarks); err != nil {
+		rollbackNFT(ctx, previous, hadPrevious)
+		return err
+	}
 	for _, c := range p.TC {
 		cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil && isManagedQdiscAlreadyPresent(ctx, c, out) {
 			continue
+		}
+		if err != nil {
+			replaced, replaceErr := replaceDefaultRootQdisc(ctx, c, out)
+			if replaceErr != nil {
+				rollbackNFT(ctx, previous, hadPrevious)
+				return replaceErr
+			}
+			if replaced {
+				continue
+			}
 		}
 		if err != nil && !(c.Name == "ip" && strings.Contains(string(out), "File exists")) {
 			rollbackNFT(ctx, previous, hadPrevious)
@@ -74,6 +88,92 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 		return err
 	}
 	return nil
+}
+
+// reconcileForwardingCompat inserts a narrowly scoped iptables chain ahead of
+// Docker's FORWARD policy. Docker commonly changes that policy to DROP, which
+// otherwise blocks packets that were already DNATed by the managed nftables
+// rules. Connection marks make the exception apply only to Relay Panel flows,
+// including their return packets.
+func reconcileForwardingCompat(ctx context.Context, marks []uint32) error {
+	iptables, err := exec.LookPath("iptables")
+	if err != nil {
+		return nil
+	}
+	run := func(args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, iptables, append([]string{"-w"}, args...)...).CombinedOutput()
+	}
+	const chain = "RELAY-PANEL"
+	if _, err := run("-S", chain); err != nil {
+		if out, createErr := run("-N", chain); createErr != nil {
+			return fmt.Errorf("create forwarding compatibility chain: %w: %s", createErr, bytes.TrimSpace(out))
+		}
+	}
+	if _, err := run("-C", "FORWARD", "-j", chain); err != nil {
+		if out, insertErr := run("-I", "FORWARD", "1", "-j", chain); insertErr != nil {
+			return fmt.Errorf("attach forwarding compatibility chain: %w: %s", insertErr, bytes.TrimSpace(out))
+		}
+	}
+	if out, err := run("-F", chain); err != nil {
+		return fmt.Errorf("flush forwarding compatibility chain: %w: %s", err, bytes.TrimSpace(out))
+	}
+	seen := make(map[uint32]bool, len(marks))
+	for _, mark := range marks {
+		if mark == 0 || seen[mark] {
+			continue
+		}
+		seen[mark] = true
+		value := fmt.Sprintf("0x%x/0xffffffff", mark)
+		if out, err := run("-A", chain, "-m", "connmark", "--mark", value, "-j", "ACCEPT"); err != nil {
+			return fmt.Errorf("allow managed forwarding mark %s: %w: %s", value, err, bytes.TrimSpace(out))
+		}
+	}
+	if out, err := run("-A", chain, "-j", "RETURN"); err != nil {
+		return fmt.Errorf("finalize forwarding compatibility chain: %w: %s", err, bytes.TrimSpace(out))
+	}
+	return nil
+}
+
+func replaceDefaultRootQdisc(ctx context.Context, c Command, commandOutput []byte) (bool, error) {
+	if c.Name != "tc" || len(c.Args) < 5 || c.Args[0] != "qdisc" || c.Args[1] != "add" || !strings.Contains(string(commandOutput), "File exists") {
+		return false, nil
+	}
+	var iface string
+	for i, arg := range c.Args {
+		if arg == "dev" && i+1 < len(c.Args) {
+			iface = c.Args[i+1]
+			break
+		}
+	}
+	if iface == "" {
+		return false, nil
+	}
+	listed, err := exec.CommandContext(ctx, "tc", "qdisc", "show", "dev", iface).Output()
+	if err != nil || !isReplaceableDefaultQdisc(string(listed)) {
+		return false, nil
+	}
+	args := append([]string(nil), c.Args...)
+	args[1] = "replace"
+	out, err := exec.CommandContext(ctx, c.Name, args...).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("replace default qdisc on %s: %w: %s", iface, err, bytes.TrimSpace(out))
+	}
+	return true, nil
+}
+
+func isReplaceableDefaultQdisc(listed string) bool {
+	for _, line := range strings.Split(listed, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(" "+line+" ", " root ") {
+			continue
+		}
+		for _, prefix := range []string{"qdisc pfifo_fast 0:", "qdisc fq_codel 0:", "qdisc noqueue 0:", "qdisc mq 0:"} {
+			if strings.HasPrefix(line, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func captureNFT(ctx context.Context) ([]byte, bool) {

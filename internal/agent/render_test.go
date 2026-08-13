@@ -20,7 +20,7 @@ func TestRenderPlanBuildsTwoHopNATCountersAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"counter rp_demo_up", "counter rp_demo_down", "tcp dport 24444", "udp dport 24444", "dnat ip to 10.24.0.3:32444", "masquerade"} {
+	for _, want := range []string{"counter rp_demo_up", "counter rp_demo_down", "tcp dport 24444", "udp dport 24444", "ct mark set", "dnat ip to 10.24.0.3:32444", "masquerade"} {
 		if !strings.Contains(plan.NFTScript, want) {
 			t.Errorf("NFT script missing %q\n%s", want, plan.NFTScript)
 		}
@@ -60,7 +60,8 @@ func TestRenderExitOnlyNFTOwnsCountersAndUsesPrivateListener(t *testing.T) {
 		"counter rp_exit_up", "counter rp_exit_down",
 		`iifname "wg0" ip daddr 10.24.0.3 tcp dport 24444`,
 		"dnat ip to 192.0.2.88:443",
-		"snat ip to 198.51.100.24",
+		`oifname "eth0" ip daddr 192.0.2.88 tcp dport 443 masquerade`,
+		"ct direction reply counter name rp_exit_down",
 	} {
 		if !strings.Contains(plan.NFTScript, want) {
 			t.Errorf("NFT script missing %q\n%s", want, plan.NFTScript)
@@ -71,6 +72,9 @@ func TestRenderExitOnlyNFTOwnsCountersAndUsesPrivateListener(t *testing.T) {
 	}
 	if len(plan.IngressRuleIDs) != 1 || plan.IngressRuleIDs[0] != rule.ID {
 		t.Fatalf("exit-only egress must report traffic counters, got %#v", plan.IngressRuleIDs)
+	}
+	if len(plan.ForwardMarks) != 1 || plan.ForwardMarks[0] != uploadMark(rule.ID) {
+		t.Fatalf("exit-only nftables rule must publish its connection mark, got %#v", plan.ForwardMarks)
 	}
 	joined := ""
 	for _, cmd := range plan.TC {
@@ -83,7 +87,7 @@ func TestRenderExitOnlyNFTOwnsCountersAndUsesPrivateListener(t *testing.T) {
 	}
 }
 
-func TestRenderExitOnlyRealmBindsPrivateAndPublicAddresses(t *testing.T) {
+func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T) {
 	node := domain.Node{
 		ID: "node_out", PublicAddress: "198.51.100.24", PrivateAddress: "10.24.0.3",
 		PublicInterface: "eth0", PrivateInterface: "wg0",
@@ -113,7 +117,7 @@ func TestRenderExitOnlyRealmBindsPrivateAndPublicAddresses(t *testing.T) {
 		t.Fatalf("expected one endpoint, got %#v", config.Endpoints)
 	}
 	got := config.Endpoints[0]
-	if got.Listen != "10.24.0.3:24444" || got.Remote != "192.0.2.88:443" || got.Through != "198.51.100.24" || got.Interface != "eth0" {
+	if got.Listen != "10.24.0.3:24444" || got.Remote != "192.0.2.88:443" || got.Through != "" || got.Interface != "eth0" {
 		t.Fatalf("unexpected Realm endpoint: %+v", got)
 	}
 }
@@ -126,5 +130,21 @@ func TestCounterSnapshotsAreCumulative(t *testing.T) {
 	got := snapshots[0]
 	if !got.Cumulative || got.UploadBytes != 1000 || got.DownloadBytes != 2000 {
 		t.Fatalf("unexpected snapshot: %+v", got)
+	}
+}
+
+func TestReplaceableDefaultQdiscDetection(t *testing.T) {
+	for _, listed := range []string{
+		"qdisc pfifo_fast 0: root refcnt 2 bands 3",
+		"qdisc fq_codel 0: root refcnt 2 limit 10240p",
+		"qdisc noqueue 0: root refcnt 2",
+		"qdisc mq 0: root",
+	} {
+		if !isReplaceableDefaultQdisc(listed) {
+			t.Errorf("expected default qdisc to be replaceable: %s", listed)
+		}
+	}
+	if isReplaceableDefaultQdisc("qdisc cake 8010: root bandwidth 100Mbit") {
+		t.Fatal("must not replace an administrator-managed root qdisc")
 	}
 }
