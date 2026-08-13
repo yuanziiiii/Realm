@@ -197,6 +197,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
+	d.RecentTraffic = nonNil(d.RecentTraffic)
 	writeJSON(w, 200, d)
 }
 func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {

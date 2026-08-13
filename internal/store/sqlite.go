@@ -764,6 +764,9 @@ func (s *Store) Summary(ctx context.Context) (domain.DashboardSummary, error) {
 		&d.MonthUpload, &d.MonthDownload, &d.QuarterUpload, &d.QuarterDownload,
 	)
 	points, err := s.Traffic(ctx, "", time.Now().UTC().Add(-24*time.Hour))
+	if points == nil {
+		points = []domain.TrafficPoint{}
+	}
 	d.RecentTraffic = points
 	return d, err
 }

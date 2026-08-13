@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +25,16 @@ func TestSummarySupportsFreshEmptyDatabase(t *testing.T) {
 	}
 	if summary.TotalNodes != 0 || summary.OnlineNodes != 0 || summary.TotalRules != 0 || summary.EnabledRules != 0 {
 		t.Fatalf("unexpected empty summary: %+v", summary)
+	}
+	if summary.RecentTraffic == nil {
+		t.Fatal("fresh summary must expose recent_traffic as an empty array, not null")
+	}
+	payload, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"recent_traffic":[]`) {
+		t.Fatalf("unexpected empty summary JSON: %s", payload)
 	}
 }
 

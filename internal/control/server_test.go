@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,6 +15,75 @@ import (
 	"relaypanel/internal/domain"
 	"relaypanel/internal/store"
 )
+
+func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := New(ctx, st, Options{AdminPassword: "fresh-install-password", Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	loginBody := bytes.NewBufferString(`{"password":"fresh-install-password"}`)
+	loginResponse, err := http.Post(httpServer.URL+"/api/v1/login", "application/json", loginBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loginResponse.Body.Close()
+	if loginResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(loginResponse.Body)
+		t.Fatalf("login failed with %d: %s", loginResponse.StatusCode, body)
+	}
+	cookies := loginResponse.Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("login did not return a session cookie")
+	}
+
+	paths := []string{
+		"/api/v1/me",
+		"/api/v1/dashboard",
+		"/api/v1/nodes",
+		"/api/v1/lines",
+		"/api/v1/rules",
+		"/api/v1/traffic?period=day",
+		"/api/v1/traffic/rules",
+	}
+	for _, path := range paths {
+		req, err := http.NewRequest(http.MethodGet, httpServer.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cookie := range cookies {
+			req.AddCookie(cookie)
+		}
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read %s: %v", path, readErr)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s returned %d: %s", path, response.StatusCode, body)
+		}
+		if path == "/api/v1/dashboard" && !bytes.Contains(body, []byte(`"recent_traffic":[]`)) {
+			t.Fatalf("dashboard must return recent_traffic as [] on a fresh install: %s", body)
+		}
+		if path != "/api/v1/me" && path != "/api/v1/dashboard" && !bytes.Equal(bytes.TrimSpace(body), []byte("[]")) {
+			t.Fatalf("GET %s must return [] on a fresh install: %s", path, body)
+		}
+	}
+}
 
 func TestSaveRuleUpdatePreservesRelayPortAndChangesFields(t *testing.T) {
 	ctx := context.Background()
