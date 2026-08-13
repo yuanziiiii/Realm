@@ -109,6 +109,61 @@ func TestTrafficKeepsDailyHistoryAndPrunesMinuteDetail(t *testing.T) {
 	}
 }
 
+func TestTrafficPeriodsUseBeijingTime(t *testing.T) {
+	beforeMidnight := time.Date(2026, 8, 13, 15, 59, 0, 0, time.UTC)
+	afterMidnight := time.Date(2026, 8, 13, 16, 1, 0, 0, time.UTC)
+
+	beforeToday, beforeWeek, beforeMonth, beforeQuarter := trafficPeriodStarts(beforeMidnight)
+	if got, want := time.Unix(beforeToday, 0), time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("unexpected Beijing day start before midnight: got %s, want %s", got, want)
+	}
+	if got, want := time.Unix(beforeWeek, 0), time.Date(2026, 8, 9, 16, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("unexpected Beijing week start: got %s, want %s", got, want)
+	}
+	if got, want := time.Unix(beforeMonth, 0), time.Date(2026, 7, 31, 16, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("unexpected Beijing month start: got %s, want %s", got, want)
+	}
+	if got, want := time.Unix(beforeQuarter, 0), time.Date(2026, 6, 30, 16, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("unexpected Beijing quarter start: got %s, want %s", got, want)
+	}
+	afterToday, _, _, _ := trafficPeriodStarts(afterMidnight)
+	if got, want := time.Unix(afterToday, 0), time.Date(2026, 8, 13, 16, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("unexpected Beijing day start after midnight: got %s, want %s", got, want)
+	}
+}
+
+func TestDailyTrafficSplitsAtBeijingMidnight(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Date(2026, 8, 13, 16, 1, 0, 0, time.UTC)
+	for _, n := range []domain.Node{{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now}, {ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}} {
+		if err := st.CreateNode(ctx, n, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", Mode: domain.ForwardModeDualManaged, Name: "测试", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.2", TargetPort: 80, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	deltas := []domain.TrafficDelta{
+		{RuleID: "rule", CapturedAt: time.Date(2026, 8, 13, 15, 59, 0, 0, time.UTC), UploadBytes: 100},
+		{RuleID: "rule", CapturedAt: time.Date(2026, 8, 13, 16, 1, 0, 0, time.UTC), UploadBytes: 200},
+	}
+	if err := st.AddTraffic(ctx, "in", deltas); err != nil {
+		t.Fatal(err)
+	}
+	points, err := st.DailyTraffic(ctx, "rule", time.Date(2026, 8, 13, 0, 0, 0, 0, trafficLocation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 2 || points[0].UploadBytes != 100 || points[1].UploadBytes != 200 {
+		t.Fatalf("expected traffic on both sides of Beijing midnight, got %+v", points)
+	}
+}
+
 func TestExitOnlyRuleCreatesOnlyEgressDeployment(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

@@ -15,6 +15,8 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+var trafficLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
 type Store struct {
 	db               *sql.DB
 	lastTrafficPrune atomic.Int64
@@ -119,16 +121,40 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key, value) VALUES ('revision', '1')`)
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO traffic_daily(rule_id,node_id,bucket,upload_bytes,download_bytes,upload_packets,download_packets)
-		SELECT rule_id,node_id,(bucket/86400)*86400,SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets)
-		FROM traffic_minute
-		WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='traffic_daily_backfilled_v1')
-		GROUP BY rule_id,node_id,(bucket/86400)*86400
-		ON CONFLICT(rule_id,node_id,bucket) DO NOTHING`); err != nil {
-		return fmt.Errorf("backfill daily traffic: %w", err)
+	var dailyTimezone string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='traffic_daily_timezone'`).Scan(&dailyTimezone)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read daily traffic timezone: %w", err)
 	}
-	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key,value) VALUES ('traffic_daily_backfilled_v1','1')`)
+	if dailyTimezone != "Asia/Shanghai" {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		// Existing releases stored one aggregate per UTC day. Shift those buckets
+		// to Beijing midnight so upgrades preserve long-term totals. The minute
+		// detail backfill below covers databases that did not have daily rows yet.
+		if _, err = tx.ExecContext(ctx, `UPDATE traffic_daily SET bucket=bucket-28800`); err != nil {
+			return fmt.Errorf("shift daily traffic to Beijing time: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `
+			INSERT INTO traffic_daily(rule_id,node_id,bucket,upload_bytes,download_bytes,upload_packets,download_packets)
+			SELECT rule_id,node_id,
+				CAST(strftime('%s',bucket,'unixepoch','+8 hours','start of day') AS INTEGER)-28800,
+				SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets)
+			FROM traffic_minute
+			GROUP BY rule_id,node_id,CAST(strftime('%s',bucket,'unixepoch','+8 hours','start of day') AS INTEGER)-28800
+			ON CONFLICT(rule_id,node_id,bucket) DO NOTHING`); err != nil {
+			return fmt.Errorf("backfill Beijing daily traffic: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES ('traffic_daily_timezone','Asia/Shanghai') ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+			return fmt.Errorf("save daily traffic timezone: %w", err)
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+	}
 	_, _ = s.db.ExecContext(ctx, `PRAGMA optimize`)
 	return nil
 }
@@ -556,7 +582,7 @@ func (s *Store) AddTraffic(ctx context.Context, nodeID string, deltas []domain.T
 		if err != nil {
 			return err
 		}
-		dayBucket := (bucket / 86400) * 86400
+		dayBucket := trafficDayStart(time.Unix(bucket, 0)).Unix()
 		_, err = tx.ExecContext(ctx, `INSERT INTO traffic_daily(rule_id,node_id,bucket,upload_bytes,download_bytes,upload_packets,download_packets) VALUES(?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id,bucket) DO UPDATE SET upload_bytes=upload_bytes+excluded.upload_bytes,download_bytes=download_bytes+excluded.download_bytes,upload_packets=upload_packets+excluded.upload_packets,download_packets=download_packets+excluded.download_packets`, d.RuleID, nodeID, dayBucket, d.UploadBytes, d.DownloadBytes, d.UploadPackets, d.DownloadPackets)
 		if err != nil {
 			return err
@@ -607,7 +633,7 @@ func (s *Store) Traffic(ctx context.Context, ruleID string, since time.Time) ([]
 
 func (s *Store) DailyTraffic(ctx context.Context, ruleID string, since time.Time) ([]domain.TrafficPoint, error) {
 	query := `SELECT bucket,SUM(upload_bytes),SUM(download_bytes),SUM(upload_packets),SUM(download_packets) FROM traffic_daily WHERE bucket>=?`
-	args := []any{since.UTC().Truncate(24 * time.Hour).Unix()}
+	args := []any{trafficDayStart(since).Unix()}
 	if ruleID != "" {
 		query += ` AND rule_id=?`
 		args = append(args, ruleID)
@@ -632,14 +658,19 @@ func (s *Store) DailyTraffic(ctx context.Context, ruleID string, since time.Time
 }
 
 func trafficPeriodStarts(now time.Time) (today, week, month, quarter int64) {
-	now = now.UTC()
-	day := now.Truncate(24 * time.Hour)
+	now = now.In(trafficLocation)
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, trafficLocation)
 	weekday := (int(day.Weekday()) + 6) % 7
 	weekStart := day.AddDate(0, 0, -weekday)
-	monthStart := time.Date(day.Year(), day.Month(), 1, 0, 0, 0, 0, time.UTC)
+	monthStart := time.Date(day.Year(), day.Month(), 1, 0, 0, 0, 0, trafficLocation)
 	quarterMonth := time.Month(((int(day.Month()) - 1) / 3 * 3) + 1)
-	quarterStart := time.Date(day.Year(), quarterMonth, 1, 0, 0, 0, 0, time.UTC)
+	quarterStart := time.Date(day.Year(), quarterMonth, 1, 0, 0, 0, 0, trafficLocation)
 	return day.Unix(), weekStart.Unix(), monthStart.Unix(), quarterStart.Unix()
+}
+
+func trafficDayStart(t time.Time) time.Time {
+	local := t.In(trafficLocation)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, trafficLocation)
 }
 
 func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficSummary, error) {

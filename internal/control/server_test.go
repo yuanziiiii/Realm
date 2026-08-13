@@ -190,6 +190,17 @@ func TestCompleteSimpleRuleUsesConfiguredExitPortPool(t *testing.T) {
 	}
 }
 
+func TestDiscreteProviderPortsAreAcceptedAndAllocated(t *testing.T) {
+	ranges, err := parsePortRanges("12001,16388,22000-22002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := []domain.ForwardRule{{ID: "used", EgressNodeID: "out", RelayPort: 12001, Protocol: "both"}}
+	if got := allocateRelayPort(ranges, rules, "out", "tcp", ""); got != 16388 {
+		t.Fatalf("expected first unused provider port 16388, got %d", got)
+	}
+}
+
 func TestLineUpdateMigratesExistingRulesToNewServers(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))

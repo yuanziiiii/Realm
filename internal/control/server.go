@@ -722,20 +722,21 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) traffic(w http.ResponseWriter, r *http.Request) {
 	period := r.URL.Query().Get("period")
 	ruleID := r.URL.Query().Get("rule_id")
-	now := time.Now().UTC()
+	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	var points []domain.TrafficPoint
 	var err error
 	switch period {
 	case "week":
 		weekday := (int(now.Weekday()) + 6) % 7
-		points, err = s.store.DailyTraffic(r.Context(), ruleID, now.Truncate(24*time.Hour).AddDate(0, 0, -weekday))
+		points, err = s.store.DailyTraffic(r.Context(), ruleID, day.AddDate(0, 0, -weekday))
 	case "month":
-		points, err = s.store.DailyTraffic(r.Context(), ruleID, time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC))
+		points, err = s.store.DailyTraffic(r.Context(), ruleID, time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()))
 	case "quarter":
 		quarterMonth := time.Month(((int(now.Month()) - 1) / 3 * 3) + 1)
-		points, err = s.store.DailyTraffic(r.Context(), ruleID, time.Date(now.Year(), quarterMonth, 1, 0, 0, 0, 0, time.UTC))
+		points, err = s.store.DailyTraffic(r.Context(), ruleID, time.Date(now.Year(), quarterMonth, 1, 0, 0, 0, 0, now.Location()))
 	default:
-		points, err = s.store.Traffic(r.Context(), ruleID, now.Truncate(24*time.Hour))
+		points, err = s.store.Traffic(r.Context(), ruleID, day)
 	}
 	if err != nil {
 		writeError(w, 500, err)
