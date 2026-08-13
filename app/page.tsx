@@ -44,6 +44,38 @@ function roleName(role:NodeRole){return role==="ingress"?"入口":role==="egress
 function nodeName(nodes:Node[],id:string){return nodes.find(n=>n.id===id)?.name||"未选择"}
 function modeName(mode:Mode){return mode==="dual_managed"?"双端托管":"仅出口接管"}
 
+async function copyText(value:string){
+  if(window.navigator.clipboard&&window.isSecureContext){
+    try{await window.navigator.clipboard.writeText(value);showCopyNotice("✓ 已复制");return}catch{/* HTTP/permission fallback below */}
+  }
+  const textarea=document.createElement("textarea");
+  textarea.value=value;
+  textarea.readOnly=true;
+  textarea.style.position="fixed";
+  textarea.style.left="-9999px";
+  textarea.style.opacity="0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0,value.length);
+  const copied=document.execCommand("copy");
+  textarea.remove();
+  if(!copied){showCopyNotice("复制失败，请手动复制",true);throw new Error("copy failed")}
+  showCopyNotice("✓ 已复制");
+}
+
+function showCopyNotice(message:string,failed=false){
+  let notice=document.getElementById("copy-notice");
+  if(!notice){notice=document.createElement("div");notice.id="copy-notice";notice.setAttribute("role","status");notice.setAttribute("aria-live","polite");document.body.appendChild(notice)}
+  notice.textContent=message;
+  notice.className=failed?"copy-notice visible failed":"copy-notice visible";
+  window.setTimeout(()=>notice?.classList.remove("visible"),2200);
+}
+
+// The existing install buttons call navigator.clipboard.writeText. Use this
+// local adapter so the same buttons also work when the panel is opened by HTTP.
+const navigator={clipboard:{writeText:copyText}};
+
 export default function Home(){
   const [view,setView]=useState<View>("overview");
   const [authenticated,setAuthenticated]=useState<boolean|null>(null);
