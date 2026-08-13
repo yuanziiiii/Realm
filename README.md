@@ -25,6 +25,7 @@
 - 线路可修改入口、出口、接入 IP、NAT 端口池和转发引擎，已有规则自动迁移并重新下发
 - 出口 NAT 机器支持端口或端口范围，例如 `20000-20999,25000`
 - Agent 首次上线自动回填公网 IP、默认出口网卡、内网 IP 和内网网卡；面板手工配置优先且不会被覆盖
+- 已安装 Agent 可从服务器卡片复制免 Token 更新命令；更新保留原 Node ID、Token 和控制端地址，失败自动回滚
 - 转发规则按线路分组，日常添加不再重复选择服务器和引擎
 - 已有转发可修改所属线路、协议、监听端口、落地地址和速率限制，保存后自动重新下发
 - TCP、UDP、TCP+UDP 规则
@@ -118,6 +119,16 @@ curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/insta
 ```
 
 脚本随后会在终端中隐式询问 Agent Token，避免 Token 留在 shell 历史。安装器支持 Debian、Ubuntu、Alpine、RHEL 系发行版，以及 x86_64、ARM64；自动安装 nftables、`tc`、systemd 服务和 Realm。只使用 nftables 时可添加 `--skip-realm`。
+
+### 更新已安装的 Agent
+
+首次安装后不需要保存面板显示的一次性 Token。打开“服务器”页，在对应服务器卡片点击“更新 Agent”并复制命令，或直接在该服务器执行：
+
+```bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update-agent.sh | sudo bash
+```
+
+更新脚本只替换 Agent 程序，保留 `/etc/relay-agent/config.json` 中现有的 Node ID、Token 和控制端地址，不会再次索取 Token。新版本启动失败时会恢复原程序并重新启动服务。
 
 ### 手工安装
 
