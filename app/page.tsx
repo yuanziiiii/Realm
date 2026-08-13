@@ -37,7 +37,7 @@ const demoRuleTraffic:RuleTraffic[]=[
 const blankNode={name:"",role:"ingress" as NodeRole,public_address:"",private_address:"",public_interface:"",private_interface:""};
 const blankLine={name:"",mode:"dual_managed" as Mode,ingress_node_id:"",egress_node_id:"",listen_address:"",relay_port_range:"",engine:"nftables" as Engine,enabled:true};
 
-async function api<T>(path:string,init?:RequestInit):Promise<T>{const response=await fetch(path,{...init,headers:{"Content-Type":"application/json",...(init?.headers||{})}});if(!response.ok){let message=`请求失败 (${response.status})`;try{message=(await response.json()).error||message}catch{/* non-JSON */}throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
+async function api<T>(path:string,init?:RequestInit):Promise<T>{const response=await fetch(path,{credentials:"include",cache:"no-store",...init,headers:{"Content-Type":"application/json",...(init?.headers||{})}});if(!response.ok){let message=`请求失败 (${response.status})`;try{message=(await response.json()).error||message}catch{/* non-JSON */}throw new Error(message)}if(response.status===204)return undefined as T;return response.json()}
 function bytes(value:number){if(!Number.isFinite(value))return "0 B";const units=["B","KB","MB","GB","TB"];let n=value,i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return `${n.toFixed(i>2?2:1)} ${units[i]}`}
 function speed(value:number){return `${bytes(value)}/s`}
 function roleName(role:NodeRole){return role==="ingress"?"入口":role==="egress"?"出口":"入口 / 出口"}
@@ -95,7 +95,7 @@ export default function Home(){
   const [editingNode,setEditingNode]=useState<Node|null>(null),[editingLine,setEditingLine]=useState<Line|null>(null),[editingRule,setEditingRule]=useState<Rule|null>(null),[preferredLine,setPreferredLine]=useState("");
   const [updateNode,setUpdateNode]=useState<Node|null>(null);
   const [credential,setCredential]=useState<{nodeId:string;token:string}|null>(null);
-  const load=useCallback(async()=>{try{const [n,l,r,s,t,rt]=await Promise.all([api<Node[]>("/api/v1/nodes"),api<Line[]>("/api/v1/lines"),api<Rule[]>("/api/v1/rules"),api<Summary>("/api/v1/dashboard"),api<Point[]>("/api/v1/traffic?period=day"),api<RuleTraffic[]>("/api/v1/traffic/rules")]);setNodes(n);setLines(l);setRules(r);setSummary(s);setTraffic(t);setRuleTraffic(rt);setAuthenticated(true);setDemo(false)}catch{setAuthenticated(false)}},[]);
+  const load=useCallback(async()=>{try{await api("/api/v1/me")}catch{setAuthenticated(false);return}setAuthenticated(true);setDemo(false);try{const [n,l,r,s,t,rt]=await Promise.all([api<Node[]>("/api/v1/nodes"),api<Line[]>("/api/v1/lines"),api<Rule[]>("/api/v1/rules"),api<Summary>("/api/v1/dashboard"),api<Point[]>("/api/v1/traffic?period=day"),api<RuleTraffic[]>("/api/v1/traffic/rules")]);setNodes(n);setLines(l);setRules(r);setSummary(s);setTraffic(t);setRuleTraffic(rt);setError("")}catch(e){setError(`控制台数据加载失败：${(e as Error).message}`)}},[]);
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(()=>{void load()},[load]);
   useEffect(()=>{if(!authenticated||demo||(view!=="traffic"&&!trafficRule))return;const timer=window.setInterval(()=>{void api<RuleTraffic[]>("/api/v1/traffic/rules").then(setRuleTraffic).catch(()=>{})},10000);return()=>window.clearInterval(timer)},[authenticated,demo,view,trafficRule]);

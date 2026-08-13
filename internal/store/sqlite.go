@@ -742,7 +742,7 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 
 func (s *Store) Summary(ctx context.Context) (domain.DashboardSummary, error) {
 	var d domain.DashboardSummary
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),SUM(CASE WHEN last_seen_at>=? THEN 1 ELSE 0 END) FROM nodes`, time.Now().Add(-45*time.Second).Unix()).Scan(&d.TotalNodes, &d.OnlineNodes); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN last_seen_at>=? THEN 1 ELSE 0 END),0) FROM nodes`, time.Now().Add(-45*time.Second).Unix()).Scan(&d.TotalNodes, &d.OnlineNodes); err != nil {
 		return d, err
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(enabled),0) FROM forward_rules`).Scan(&d.TotalRules, &d.EnabledRules); err != nil {

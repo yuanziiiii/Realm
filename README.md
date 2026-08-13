@@ -83,6 +83,14 @@ sudo docker compose --project-directory /opt/relay-panel up -d
 
 安装脚本只用于全新安装；检测到 `/opt/relay-panel` 已存在时会主动停止，不会覆盖已有数据库或配置。
 
+### 更新控制端
+
+控制端可以直接更新 GitHub Release 中的最新程序，不重新构建网页、不修改数据库和登录密码：
+
+```bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update-control.sh | sudo bash
+```
+
 ### 忘记或重置管理员密码
 
 在控制端 SSH 终端执行一条命令，按提示输入两遍新密码即可。脚本会自动备份 SQLite 数据库、更新密码并重启控制端，不影响服务器、线路、规则和流量记录：

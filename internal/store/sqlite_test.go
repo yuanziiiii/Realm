@@ -9,6 +9,23 @@ import (
 	"relaypanel/internal/domain"
 )
 
+func TestSummarySupportsFreshEmptyDatabase(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	summary, err := st.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.TotalNodes != 0 || summary.OnlineNodes != 0 || summary.TotalRules != 0 || summary.EnabledRules != 0 {
+		t.Fatalf("unexpected empty summary: %+v", summary)
+	}
+}
+
 func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
