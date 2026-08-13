@@ -83,6 +83,14 @@ sudo docker compose --project-directory /opt/relay-panel up -d
 
 安装脚本只用于全新安装；检测到 `/opt/relay-panel` 已存在时会主动停止，不会覆盖已有数据库或配置。
 
+### 忘记或重置管理员密码
+
+在控制端 SSH 终端执行一条命令，按提示输入两遍新密码即可。脚本会自动备份 SQLite 数据库、更新密码并重启控制端，不影响服务器、线路、规则和流量记录：
+
+```bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/reset-admin-password.sh | sudo bash
+```
+
 ### 1C1G 低内存服务器
 
 1 核 1 GB 可以运行个人面板。实机中控制端与网页端两个容器空闲时合计约 140 MB，实际占用会随规则数量和访问量变化。

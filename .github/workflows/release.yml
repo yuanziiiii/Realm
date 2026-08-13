@@ -27,6 +27,7 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "release/relay-control-linux-$arch" ./cmd/relay-control
           done
           install -m 0755 scripts/update-agent.sh release/update-agent.sh
+          install -m 0755 scripts/reset-admin-password.sh release/reset-admin-password.sh
           for file in release/*; do
             sha256sum "$file" > "$file.sha256"
           done

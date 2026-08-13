@@ -15,7 +15,7 @@ import (
 	"relaypanel/internal/domain"
 )
 
-const version = "0.3.1"
+const version = "0.3.2"
 
 type state struct {
 	AppliedRevision int64    `json:"applied_revision"`
