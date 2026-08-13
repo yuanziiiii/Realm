@@ -43,8 +43,33 @@ install_docker() {
   docker compose version >/dev/null 2>&1 || fail "Docker Compose 插件安装失败"
 }
 
+ensure_build_swap() {
+  local memory_kb swap_kb swap_dir swap_file
+  memory_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+  swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
+  if (( memory_kb >= 1572864 || swap_kb >= 1572864 )); then
+    return
+  fi
+  swap_dir="/var/lib/relay-panel"
+  swap_file="${swap_dir}/build.swap"
+  say "检测到内存不足 1.5 GB，创建 2 GB 构建交换空间"
+  mkdir -p "${swap_dir}"
+  if [[ ! -f "${swap_file}" ]]; then
+    if command -v fallocate >/dev/null 2>&1; then
+      fallocate -l 2G "${swap_file}"
+    else
+      dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none
+    fi
+    chmod 600 "${swap_file}"
+    mkswap "${swap_file}" >/dev/null
+  fi
+  swapon "${swap_file}" 2>/dev/null || true
+  grep -Fq "${swap_file} none swap sw 0 0" /etc/fstab || printf '%s\n' "${swap_file} none swap sw 0 0" >> /etc/fstab
+}
+
 install_prerequisites
 install_docker
+ensure_build_swap
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -63,8 +88,12 @@ printf '%s\n' \
   "RELAY_HTTP_PORT=${http_port}" \
   "RELAY_SECURE_COOKIES=false" > "${install_dir}/.env"
 
-say "构建并启动控制端"
-docker compose --project-directory "${install_dir}" up -d --build
+say "低内存模式：串行构建控制端"
+COMPOSE_PARALLEL_LIMIT=1 docker compose --project-directory "${install_dir}" build control
+say "低内存模式：串行构建网页端"
+COMPOSE_PARALLEL_LIMIT=1 docker compose --project-directory "${install_dir}" build web
+say "启动控制端"
+docker compose --project-directory "${install_dir}" up -d --no-build
 
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 host_ip="${host_ip:-服务器IP}"
