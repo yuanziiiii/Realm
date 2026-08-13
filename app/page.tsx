@@ -72,9 +72,15 @@ function showCopyNotice(message:string,failed=false){
   window.setTimeout(()=>notice?.classList.remove("visible"),2200);
 }
 
-// The existing install buttons call navigator.clipboard.writeText. Use this
-// local adapter so the same buttons also work when the panel is opened by HTTP.
-const navigator={clipboard:{writeText:copyText}};
+function handleCopyClick(event:React.MouseEvent<HTMLElement>){
+  const button=(event.target as HTMLElement).closest("button");
+  if(!button||!(button.textContent?.includes("复制命令")||button.textContent?.includes("复制 Agent Token")))return;
+  const value=button.closest(".command-box,.token-box")?.querySelector("code")?.textContent;
+  if(!value)return;
+  event.preventDefault();
+  event.stopPropagation();
+  void copyText(value);
+}
 
 export default function Home(){
   const [view,setView]=useState<View>("overview");
@@ -100,7 +106,7 @@ export default function Home(){
   const openRule=(lineId="")=>{setEditingRule(null);setPreferredLine(lineId);setRuleModal(true)};
   const action=()=>{if(view==="nodes"){setEditingNode(null);setNodeModal(true)}else if(view==="lines"){setEditingLine(null);setLineModal(true)}else openRule()};
   const actionLabel=view==="nodes"?"接入服务器":view==="lines"?"创建线路":"新建转发";
-  return <div className="shell">
+  return <div className="shell" onClickCapture={handleCopyClick}>
     <Sidebar view={view} setView={setView} demo={demo}/>
     <main className="main">
       <header className="topbar"><div><p className="eyebrow">个人转发控制台</p><h1>{({overview:"网络总览",nodes:"服务器",lines:"线路",rules:"转发规则",traffic:"流量统计"} as const)[view]}</h1></div><div className="top-actions"><span className="health"><i/>控制端正常</span><button className="primary" onClick={action}>＋ {actionLabel}</button></div></header>
