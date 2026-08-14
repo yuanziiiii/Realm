@@ -14,6 +14,7 @@ type Summary = { online_nodes:number; total_nodes:number; enabled_rules:number; 
 type View = "overview"|"nodes"|"lines"|"rules"|"traffic"|"settings";
 type TrafficPeriod = "day"|"week"|"month"|"quarter";
 type ChartMode = "line"|"bar";
+type ThemeMode = "light"|"dark"|"system";
 type LinkProbe = { ingress_node_id:string; egress_node_id:string; address:string; latency_ms:number; packet_loss:number; success:boolean; has_succeeded:boolean; failure_count:number; success_count:number; checked_at:string };
 type TargetProbe = { rule_id:string; node_id:string; address:string; port:number; latency_ms:number; packet_loss:number; success:boolean; has_succeeded:boolean; failure_count:number; success_count:number; checked_at:string };
 
@@ -92,6 +93,7 @@ function handleCopyClick(event:React.MouseEvent<HTMLElement>){
 
 export default function Home(){
   const [view,setView]=useState<View>("overview");
+  const [themeMode,setThemeMode]=useState<ThemeMode>("system");
   const [authenticated,setAuthenticated]=useState<boolean|null>(null);
   const [demo,setDemo]=useState(false);
   const [nodes,setNodes]=useState<Node[]>([]),[lines,setLines]=useState<Line[]>([]),[rules,setRules]=useState<Rule[]>([]);
@@ -106,6 +108,8 @@ export default function Home(){
   const [updateNode,setUpdateNode]=useState<Node|null>(null);
   const [credential,setCredential]=useState<{nodeId:string;token:string}|null>(null);
   const [loginNotice,setLoginNotice]=useState("");
+  useEffect(()=>{const saved=window.localStorage.getItem("relay-panel-theme");if(saved==="light"||saved==="dark"||saved==="system")window.setTimeout(()=>setThemeMode(saved),0)},[]);
+  useEffect(()=>{const media=window.matchMedia("(prefers-color-scheme: dark)");const apply=()=>{const resolved=themeMode==="system"?(media.matches?"dark":"light"):themeMode;document.documentElement.dataset.theme=resolved;document.documentElement.dataset.themeMode=themeMode};apply();window.localStorage.setItem("relay-panel-theme",themeMode);media.addEventListener("change",apply);return()=>media.removeEventListener("change",apply)},[themeMode]);
   const load=useCallback(async()=>{try{await api("/api/v1/me")}catch{setAuthenticated(false);return}setAuthenticated(true);setDemo(false);try{const [n,l,r,s,t,rt,p,tp]=await Promise.all([api<Node[]>("/api/v1/nodes"),api<Line[]>("/api/v1/lines"),api<Rule[]>("/api/v1/rules"),api<Summary>("/api/v1/dashboard"),api<Point[]>("/api/v1/traffic?period=day"),api<RuleTraffic[]>("/api/v1/traffic/rules"),api<LinkProbe[]>("/api/v1/probes"),api<TargetProbe[]>("/api/v1/target-probes")]);setNodes(asArray(n));setLines(asArray(l));setRules(asArray(r));setSummary(normalizeSummary(s));setTraffic(asArray(t));setRuleTraffic(asArray(rt));setProbes(asArray(p));setTargetProbes(asArray(tp));setError("")}catch(e){setError(`控制台数据加载失败：${(e as Error).message}`)}},[]);
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(()=>{void load()},[load]);
@@ -116,7 +120,7 @@ export default function Home(){
   useEffect(()=>{if(!authenticated||demo||view!=="rules")return;const update=()=>void Promise.all([api<RuleTraffic[]>("/api/v1/traffic/rules"),api<TargetProbe[]>("/api/v1/target-probes")]).then(([rt,tp])=>{setRuleTraffic(asArray(rt));setTargetProbes(asArray(tp))}).catch(()=>{});update();const timer=window.setInterval(update,10000);return()=>window.clearInterval(timer)},[authenticated,demo,view]);
   const activateDemo=()=>{setNodes(demoNodes);setLines(demoLines);setRules(demoRules);setSummary(demoSummary);setTraffic(demoPoints);setRuleTraffic(demoRuleTraffic);setProbes(demoProbes);setTargetProbes(demoTargetProbes);setAuthenticated(true);setDemo(true)};
   if(authenticated===null)return <div className="boot"><span className="pulse"/>正在连接控制端</div>;
-  if(!authenticated)return <Login notice={loginNotice} onSuccess={async()=>{setLoginNotice("");await load()}} onDemo={activateDemo}/>;
+  if(!authenticated)return <Login notice={loginNotice} themeMode={themeMode} onThemeMode={setThemeMode} onSuccess={async()=>{setLoginNotice("");await load()}} onDemo={activateDemo}/>;
   const refresh=demo?async()=>{}:load;
   const openRule=(lineId="")=>{setEditingRule(null);setPreferredLine(lineId);setRuleModal(true)};
   const action=()=>{if(view==="nodes"){setEditingNode(null);setNodeModal(true)}else if(view==="lines"){setEditingLine(null);setLineModal(true)}else openRule()};
@@ -126,7 +130,7 @@ export default function Home(){
   return <div className="shell" onClickCapture={handleCopyClick}>
     <Sidebar view={view} setView={setView} demo={demo} onLogout={logout}/>
     <main className="main">
-      <header className="topbar"><div><p className="eyebrow">个人转发控制台</p><h1>{({overview:"网络总览",nodes:"服务器",lines:"线路",rules:"转发规则",traffic:"流量统计",settings:"系统设置"} as const)[view]}</h1></div><div className="top-actions"><span className="health"><i/>控制端正常</span>{showAction&&<button className="primary" onClick={action}>＋ {actionLabel}</button>}</div></header>
+      <header className="topbar"><div><p className="eyebrow">个人转发控制台</p><h1>{({overview:"网络总览",nodes:"服务器",lines:"线路",rules:"转发规则",traffic:"流量统计",settings:"系统设置"} as const)[view]}</h1></div><div className="top-actions"><ThemePicker value={themeMode} onChange={setThemeMode}/><span className="health"><i/>控制端正常</span>{showAction&&<button className="primary" onClick={action}>＋ {actionLabel}</button>}</div></header>
       {demo&&<div className="notice">当前为界面预览数据。服务器、线路和转发规则可直接操作体验。</div>}
       {error&&<div className="error">{error}<button onClick={()=>setError("")}>×</button></div>}
       {view==="overview"&&<Overview summary={summary} nodes={nodes} lines={lines} rules={rules} points={traffic.length?traffic:summary.recent_traffic} onOpenLines={()=>setView("lines")}/>}
@@ -139,7 +143,7 @@ export default function Home(){
         onDelete={async id=>{if(demo){setRules(v=>v.filter(r=>r.id!==id));return}if(confirm("确认删除该转发及其统计？")){await api(`/api/v1/rules/${id}`,{method:"DELETE"});await refresh()}}}
 	    />}
       {view==="traffic"&&<Traffic
-        rules={rules} ruleTraffic={ruleTraffic} points={traffic.length?traffic:summary.recent_traffic} summary={summary} period={trafficPeriod} onPeriod={setTrafficPeriod}
+        rules={rules} ruleTraffic={ruleTraffic} points={traffic.length?traffic:summary.recent_traffic} summary={summary} period={trafficPeriod} onPeriod={setTrafficPeriod} onRule={setTrafficRule}
       />}
       {view==="settings"&&<Settings demo={demo} onPasswordChanged={()=>{setLoginNotice("管理员密码已修改，请使用新密码重新登录。");setAuthenticated(false);setDemo(false)}}/>}
     </main>
@@ -157,9 +161,11 @@ export default function Home(){
   </div>;
 }
 
-function Login({notice,onSuccess,onDemo}:{notice:string;onSuccess:()=>Promise<void>;onDemo:()=>void}){const [password,setPassword]=useState(""),[error,setError]=useState(""),[busy,setBusy]=useState(false);async function submit(e:FormEvent){e.preventDefault();setBusy(true);setError("");try{await api("/api/v1/login",{method:"POST",body:JSON.stringify({password})});await onSuccess()}catch(err){setError((err as Error).message)}finally{setBusy(false)}}return <div className="login-page"><div className="login-brand"><Logo/><div><b>Relay Panel</b><span>专线端口转发</span></div></div><div className="login-card"><div className="login-mark"><span>RP</span></div><p className="eyebrow">安全管理入口</p><h1>欢迎回来</h1><p>登录以管理服务器、线路与转发规则。</p>{notice&&<div className="success-notice">{notice}</div>}<form onSubmit={submit}><label>管理员密码<input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="输入控制端密码"/></label>{error&&<div className="form-error">{error}</div>}<button className="primary wide" disabled={busy}>{busy?"正在登录…":"进入控制台"}</button></form><button className="text-button" onClick={onDemo}>预览管理界面 →</button></div><p className="login-foot">单管理员模式 · 本地数据 · Agent 加密鉴权</p></div>}
+function Login({notice,themeMode,onThemeMode,onSuccess,onDemo}:{notice:string;themeMode:ThemeMode;onThemeMode:(mode:ThemeMode)=>void;onSuccess:()=>Promise<void>;onDemo:()=>void}){const [password,setPassword]=useState(""),[error,setError]=useState(""),[busy,setBusy]=useState(false);async function submit(e:FormEvent){e.preventDefault();setBusy(true);setError("");try{await api("/api/v1/login",{method:"POST",body:JSON.stringify({password})});await onSuccess()}catch(err){setError((err as Error).message)}finally{setBusy(false)}}return <div className="login-page"><div className="login-brand"><Logo/><div><b>Relay Panel</b><span>专线端口转发</span></div></div><div className="login-theme"><ThemePicker value={themeMode} onChange={onThemeMode}/></div><div className="login-card"><div className="login-mark"><span>RP</span></div><p className="eyebrow">安全管理入口</p><h1>欢迎回来</h1><p>登录以管理服务器、线路与转发规则。</p>{notice&&<div className="success-notice">{notice}</div>}<form onSubmit={submit}><label>管理员密码<input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="输入控制端密码"/></label>{error&&<div className="form-error">{error}</div>}<button className="primary wide" disabled={busy}>{busy?"正在登录…":"进入控制台"}</button></form><button className="text-button" onClick={onDemo}>预览管理界面 →</button></div><p className="login-foot">单管理员模式 · 本地数据 · Agent 加密鉴权</p></div>}
 function Logo(){return <div className="logo"><span/><span/><span/></div>}
-function Sidebar({view,setView,demo,onLogout}:{view:View;setView:(v:View)=>void;demo:boolean;onLogout:()=>void}){const items:[View,string,string][]=[["overview","总览","⌁"],["nodes","服务器","◇"],["lines","线路","—"],["rules","转发规则","⇄"],["traffic","流量统计","▥"],["settings","系统设置","⚙"]];return <aside className="sidebar"><div className="brand"><Logo/><div><b>Relay Panel</b><span>Personal Edition</span></div></div><nav>{items.map(([key,label,icon])=><button key={key} className={view===key?"active":""} onClick={()=>setView(key)}><i>{icon}</i>{label}</button>)}</nav><div className="sidebar-foot"><div className="mini-status"><i/><div><b>{demo?"预览模式":"系统运行中"}</b><span>{demo?"Demo data":"Agents ready"}</span></div></div><button className="logout-button" onClick={onLogout}>{demo?"退出预览":"退出登录"}</button><div className="version">在线更新 · 私人部署</div></div></aside>}
+function BarChartIcon(){return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V10h4v9H4Zm6 0V5h4v14h-4Zm6 0v-7h4v7h-4Z" fill="currentColor"/><path d="M3 20h18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>}
+function ThemePicker({value,onChange}:{value:ThemeMode;onChange:(mode:ThemeMode)=>void}){const items:[ThemeMode,string,string][]=[["light","浅色","☀"],["dark","深色","☾"],["system","跟随系统","◐"]];return <div className="theme-picker" aria-label="页面主题">{items.map(([mode,label,icon])=><button key={mode} type="button" className={value===mode?"active":""} title={label} aria-label={label} onClick={()=>onChange(mode)}><span>{icon}</span><b>{label}</b></button>)}</div>}
+function Sidebar({view,setView,demo,onLogout}:{view:View;setView:(v:View)=>void;demo:boolean;onLogout:()=>void}){const items:[View,string,string][]=[["overview","总览","⌁"],["nodes","服务器","◇"],["lines","线路","—"],["rules","转发规则","⇄"],["traffic","流量统计","chart"],["settings","系统设置","⚙"]];return <aside className="sidebar"><div className="brand"><Logo/><div><b>Relay Panel</b><span>Personal Edition</span></div></div><nav>{items.map(([key,label,icon])=><button key={key} className={view===key?"active":""} onClick={()=>setView(key)}><i>{icon==="chart"?<BarChartIcon/>:icon}</i>{label}</button>)}</nav><div className="sidebar-foot"><div className="mini-status"><i/><div><b>{demo?"预览模式":"系统运行中"}</b><span>{demo?"Demo data":"Agents ready"}</span></div></div><button className="logout-button" onClick={onLogout}>{demo?"退出预览":"退出登录"}</button><div className="version">在线更新 · 私人部署</div></div></aside>}
 
 function Overview({summary,nodes,lines,rules,points,onOpenLines}:{summary:Summary;nodes:Node[];lines:Line[];rules:Rule[];points:Point[];onOpenLines:()=>void}){return <div className="page-grid"><section className="hero-panel"><div><p className="eyebrow">运行结构</p><h2>服务器、线路、转发各司其职</h2><p>服务器只接入一次；线路固定拓扑；日常转发只填写端口和落地。</p></div><div className="topology"><NodeDot label="本机"/><FlowLine/><NodeDot label="入口" active/><FlowLine privateLine/><NodeDot label="出口" active/><FlowLine/><NodeDot label="落地"/></div></section><section className="stats-row"><Metric label="今日总流量" value={bytes(summary.today_upload+summary.today_download)} note={`↑ ${bytes(summary.today_upload)} · ↓ ${bytes(summary.today_download)}`} tone="violet"/><Metric label="可用线路" value={String(lines.filter(l=>l.enabled).length)} note="固定链路配置" tone="cyan"/><Metric label="在线服务器" value={`${summary.online_nodes}/${summary.total_nodes}`} note={`${nodes.filter(n=>n.status!=="online").length} 台离线`} tone="green"/><Metric label="运行中转发" value={String(rules.filter(r=>r.enabled).length)} note={`共 ${rules.length} 条`} tone="amber"/></section><section className="chart-card"><div className="section-head"><div><p className="eyebrow">最近 24 小时</p><h3>流量趋势</h3></div><div className="legend"><span className="down">下载</span><span className="up">上传</span></div></div><TrafficChart points={points}/></section><section className="side-card"><div className="section-head"><div><p className="eyebrow">线路状态</p><h3>常用线路</h3></div></div><div className="line-mini-list">{lines.slice(0,4).map(l=><div key={l.id}><i className={nodes.find(n=>n.id===l.egress_node_id)?.status||"offline"}/><span><b>{l.name}</b><small>{modeName(l.mode)} · {l.engine}</small></span></div>)}</div><button className="outline wide" onClick={onOpenLines}>管理线路</button></section></div>}
 function NodeDot({label,active}:{label:string;active?:boolean}){return <div className={`topo-node ${active?"active":""}`}><span>{active?"●":"○"}</span><b>{label}</b></div>}
@@ -205,6 +211,12 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
       canvas.style.height = `${height}px`;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
+      const styles = window.getComputedStyle(stage),
+        chartColor = (name:string,fallback:string) => styles.getPropertyValue(name).trim() || fallback,
+        gridColor = chartColor("--chart-grid", "#202936"),
+        axisColor = chartColor("--chart-axis", "#364151"),
+        labelColor = chartColor("--chart-label", "#657286"),
+        markerColor = chartColor("--chart-marker", "#10151e");
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
       const left = 54,
@@ -236,13 +248,13 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
       for (let i = 0; i <= 4; i++) {
         const y = top + (plotH * i) / 4,
           value = (nice * (4 - i)) / 4;
-        ctx.strokeStyle = i === 4 ? "#364151" : "#202936";
+        ctx.strokeStyle = i === 4 ? axisColor : gridColor;
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(left, y + 0.5);
         ctx.lineTo(width - right, y + 0.5);
         ctx.stroke();
-        ctx.fillStyle = "#657286";
+        ctx.fillStyle = labelColor;
         ctx.textAlign = "right";
         ctx.fillText(
           (value / unitScale).toFixed(
@@ -252,11 +264,11 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
           y,
         );
       }
-      ctx.fillStyle = "#718096";
+      ctx.fillStyle = labelColor;
       ctx.textAlign = "left";
       ctx.fillText(units[unitIndex], 8, top - 7);
       if (!values.length) {
-        ctx.fillStyle = "#657286";
+        ctx.fillStyle = labelColor;
         ctx.textAlign = "center";
         ctx.fillText("当前周期暂无流量", left + plotW / 2, top + plotH / 2);
         return;
@@ -277,14 +289,14 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
           (i % labelEvery !== 0 || last - i < labelEvery)
         )
           return;
-        ctx.fillStyle = "#5f6c80";
+        ctx.fillStyle = labelColor;
         ctx.textAlign =
           i === 0 ? "left" : i === values.length - 1 ? "right" : "center";
         ctx.fillText(label(point.bucket), xAt(i), height - 14);
       });
       const series = [
-        { key: "download_bytes" as const, color: "#806cff" },
-        { key: "upload_bytes" as const, color: "#24c9d5" },
+        { key: "download_bytes" as const, color: chartColor("--chart-download", "#806cff") },
+        { key: "upload_bytes" as const, color: chartColor("--chart-upload", "#24c9d5") },
       ];
       if (mode === "bar") {
         const group = Math.max(
@@ -342,7 +354,7 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
       }
       if (hover !== null && values[hover]) {
         const x = xAt(hover);
-        ctx.strokeStyle = "#8190a755";
+        ctx.strokeStyle = chartColor("--chart-hover", "#8190a755");
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
         ctx.moveTo(x, top);
@@ -352,7 +364,7 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
         series.forEach((item) => {
           ctx.beginPath();
           ctx.arc(x, yAt(values[hover][item.key]), 4, 0, Math.PI * 2);
-          ctx.fillStyle = "#10151e";
+          ctx.fillStyle = markerColor;
           ctx.fill();
           ctx.lineWidth = 2;
           ctx.strokeStyle = item.color;
@@ -556,9 +568,9 @@ function RuleTable({rules,lines,traffic,targetProbes,onTraffic,onEdit,onToggle,o
 const periodNames:Record<TrafficPeriod,string>={day:"今日",week:"本周",month:"本月",quarter:"本季度"};
 function PeriodPicker({value,onChange}:{value:TrafficPeriod;onChange:(period:TrafficPeriod)=>void}){return <div className="period-picker">{(Object.keys(periodNames) as TrafficPeriod[]).map(period=><button key={period} className={value===period?"active":""} onClick={()=>onChange(period)}>{periodNames[period]}</button>)}</div>}
 function periodTotal(stats:RuleTraffic|undefined,period:TrafficPeriod){if(!stats)return 0;switch(period){case"week":return stats.week_upload_bytes+stats.week_download_bytes;case"month":return stats.month_upload_bytes+stats.month_download_bytes;case"quarter":return stats.quarter_upload_bytes+stats.quarter_download_bytes;default:return stats.today_upload_bytes+stats.today_download_bytes}}
-function Traffic({rules,ruleTraffic,points,summary,period,onPeriod}:{rules:Rule[];ruleTraffic:RuleTraffic[];points:Point[];summary:Summary;period:TrafficPeriod;onPeriod:(period:TrafficPeriod)=>void}){const totals={day:[summary.today_upload,summary.today_download],week:[summary.week_upload,summary.week_download],month:[summary.month_upload,summary.month_download],quarter:[summary.quarter_upload,summary.quarter_download]} as const;return <div className="traffic-page"><section className="stats-row period-stats">{(Object.keys(periodNames) as TrafficPeriod[]).map((key,index)=>{const [up,down]=totals[key];return <Metric key={key} label={periodNames[key]} value={bytes(up+down)} note={`↑ ${bytes(up)} · ↓ ${bytes(down)}`} tone={["violet","cyan","green","amber"][index]}/>} )}</section><section className="chart-card full"><div className="section-head"><div><p className="eyebrow">流量趋势 · 北京时间自然周期</p><h3>全规则趋势</h3></div><PeriodPicker value={period} onChange={onPeriod}/></div><TrafficChart points={points}/></section><section className="table-card"><div className="section-head"><div><p className="eyebrow">逐条统计</p><h3>规则流量</h3></div><span className="tag">实时速率仅本页每 10 秒刷新</span></div><div className="data-table traffic-table">{rules.map(r=>{const t=ruleTraffic.find(item=>item.rule_id===r.id);return <div className="table-row" key={r.id}><span><i className={`protocol ${r.protocol}`}>{r.protocol.toUpperCase()}</i><b>{r.name}</b></span><span><small>实时速率</small><b>↓ {speed(t?.download_bytes_per_second||0)}</b><small>↑ {speed(t?.upload_bytes_per_second||0)}</small></span><span><small>今日</small><b>{bytes(periodTotal(t,"day"))}</b></span><span><small>本周</small><b>{bytes(periodTotal(t,"week"))}</b></span><span><small>本月</small><b>{bytes(periodTotal(t,"month"))}</b></span><span><small>本季度</small><b>{bytes(periodTotal(t,"quarter"))}</b></span></div>})}</div></section></div>}
+function Traffic({rules,ruleTraffic,points,summary,period,onPeriod,onRule}:{rules:Rule[];ruleTraffic:RuleTraffic[];points:Point[];summary:Summary;period:TrafficPeriod;onPeriod:(period:TrafficPeriod)=>void;onRule:(rule:Rule)=>void}){const totals={day:[summary.today_upload,summary.today_download],week:[summary.week_upload,summary.week_download],month:[summary.month_upload,summary.month_download],quarter:[summary.quarter_upload,summary.quarter_download]} as const;return <div className="traffic-page"><section className="stats-row period-stats">{(Object.keys(periodNames) as TrafficPeriod[]).map((key,index)=>{const [up,down]=totals[key];return <Metric key={key} label={periodNames[key]} value={bytes(up+down)} note={`↑ ${bytes(up)} · ↓ ${bytes(down)}`} tone={["violet","cyan","green","amber"][index]}/>} )}</section><section className="chart-card full"><div className="section-head"><div><p className="eyebrow">流量趋势 · 北京时间自然周期</p><h3>全规则趋势</h3></div><PeriodPicker value={period} onChange={onPeriod}/></div><TrafficChart points={points}/></section><section className="table-card"><div className="section-head"><div><p className="eyebrow">逐条统计 · 点击规则查看独立趋势</p><h3>规则流量</h3></div><span className="tag">实时速率每 10 秒刷新</span></div><div className="data-table traffic-table">{rules.map(r=>{const t=ruleTraffic.find(item=>item.rule_id===r.id);const open=()=>onRule(r);return <div className="table-row traffic-rule-row" key={r.id} role="button" tabIndex={0} aria-label={`查看 ${r.name} 的流量趋势`} onClick={open} onKeyDown={event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();open()}}}><span><i className={`protocol ${r.protocol}`}>{r.protocol.toUpperCase()}</i><b>{r.name}</b><small>点击查看折线图与柱形图</small></span><span><small>实时速率</small><b>↓ {speed(t?.download_bytes_per_second||0)}</b><small>↑ {speed(t?.upload_bytes_per_second||0)}</small></span><span><small>今日</small><b>{bytes(periodTotal(t,"day"))}</b></span><span><small>本周</small><b>{bytes(periodTotal(t,"week"))}</b></span><span><small>本月</small><b>{bytes(periodTotal(t,"month"))}</b></span><span><small>本季度</small><b>{bytes(periodTotal(t,"quarter"))}</b></span><span className="traffic-open"><BarChartIcon/><b>查看趋势</b></span></div>})}{!rules.length&&<div className="group-empty">还没有可以统计的转发规则</div>}</div></section></div>}
 function Settings({demo,onPasswordChanged}:{demo:boolean;onPasswordChanged:()=>void}){const [currentPassword,setCurrentPassword]=useState(""),[newPassword,setNewPassword]=useState(""),[confirmPassword,setConfirmPassword]=useState(""),[error,setError]=useState(""),[busy,setBusy]=useState(false);const updateCommand="curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh | sudo bash";async function changePassword(e:FormEvent){e.preventDefault();setError("");if(demo){setError("预览模式不会修改管理员密码");return}if(newPassword.length<10){setError("新密码至少需要 10 个字符");return}if(newPassword!==confirmPassword){setError("两次输入的新密码不一致");return}setBusy(true);try{await api("/api/v1/admin/password",{method:"POST",body:JSON.stringify({current_password:currentPassword,new_password:newPassword})});onPasswordChanged()}catch(err){setError((err as Error).message)}finally{setBusy(false)}}return <div className="settings-grid"><section className="settings-card"><div className="section-head"><div><p className="eyebrow">管理员账户</p><h3>修改登录密码</h3></div><span className="settings-icon">⌁</span></div><p>修改成功后会注销全部管理会话，服务器 Agent 和现有转发不受影响。</p><form className="settings-form" onSubmit={changePassword}><label>当前密码<input required type="password" autoComplete="current-password" value={currentPassword} onChange={e=>setCurrentPassword(e.target.value)}/></label><label>新密码<input required minLength={10} type="password" autoComplete="new-password" value={newPassword} onChange={e=>setNewPassword(e.target.value)}/><small>至少 10 个字符</small></label><label>再次输入新密码<input required minLength={10} type="password" autoComplete="new-password" value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)}/></label>{error&&<div className="form-error">{error}</div>}<button className="primary" disabled={busy}>{busy?"修改中…":"修改密码"}</button></form></section><section className="settings-card"><div className="section-head"><div><p className="eyebrow">GitHub 在线更新</p><h3>更新主控</h3></div><span className="settings-icon">↻</span></div><p>只更新网页端与控制端，保留数据库、管理员密码、面板端口、HTTPS 反代、服务器、线路、规则和流量记录。</p><div className="update-points"><span>✓ 自动下载并校验最新版</span><span>✓ 新版健康检查失败自动回滚</span><span>✓ 不需要重新运行安装脚本</span></div><div className="command-box"><code>{updateCommand}</code><button onClick={()=>void copyText(updateCommand)}>复制更新命令</button></div><small className="settings-hint">在主控服务器 SSH 中执行。已安装 Agent 可继续使用各服务器卡片中的“更新 Agent”。</small></section></div>}
-function RuleTrafficModal({rule,stats,demo,onClose}:{rule:Rule;stats?:RuleTraffic;demo:boolean;onClose:()=>void}){const [points,setPoints]=useState<Point[]>(demo?demoPoints:[]),[period,setPeriod]=useState<TrafficPeriod>("day");useEffect(()=>{if(demo)return;void api<Point[]>(`/api/v1/traffic?rule_id=${encodeURIComponent(rule.id)}&period=${period}`).then(value=>setPoints(asArray(value))).catch(()=>setPoints([]))},[demo,rule.id,period]);return <Modal title={rule.name} kicker="规则流量详情" onClose={onClose}><div className="traffic-detail-metrics"><Metric label="累计流量" value={bytes((stats?.total_upload_bytes||0)+(stats?.total_download_bytes||0))} note={`↑ ${bytes(stats?.total_upload_bytes||0)} · ↓ ${bytes(stats?.total_download_bytes||0)}`} tone="violet"/><Metric label={periodNames[period]} value={bytes(periodTotal(stats,period))} note="上传与下载合计" tone="cyan"/><Metric label="当前速率" value={`↓ ${speed(stats?.download_bytes_per_second||0)}`} note={`上传 ${speed(stats?.upload_bytes_per_second||0)}`} tone="green"/></div><div className="traffic-detail-chart"><div className="section-head"><div><p className="eyebrow">北京时间自然周期</p><h3>此规则流量趋势</h3></div><PeriodPicker value={period} onChange={setPeriod}/></div>{points.length?<TrafficChart points={points}/>:<div className="group-empty">这条规则暂时没有流量记录</div>}</div></Modal>}
+function RuleTrafficModal({rule,stats,demo,onClose}:{rule:Rule;stats?:RuleTraffic;demo:boolean;onClose:()=>void}){const [points,setPoints]=useState<Point[]>(demo?demoPoints:[]),[period,setPeriod]=useState<TrafficPeriod>("day"),[loading,setLoading]=useState(!demo);const changePeriod=(value:TrafficPeriod)=>{if(value!==period&&!demo)setLoading(true);setPeriod(value)};useEffect(()=>{if(demo)return;void api<Point[]>(`/api/v1/traffic?rule_id=${encodeURIComponent(rule.id)}&period=${period}`).then(value=>setPoints(asArray(value))).catch(()=>setPoints([])).finally(()=>setLoading(false))},[demo,rule.id,period]);return <Modal title={rule.name} kicker="规则流量详情" onClose={onClose}><div className="rule-period-grid">{(Object.keys(periodNames) as TrafficPeriod[]).map((key,index)=><button key={key} className={period===key?"active":""} onClick={()=>changePeriod(key)}><Metric label={periodNames[key]} value={bytes(periodTotal(stats,key))} note={key===period?"正在查看此周期":"点击查看趋势"} tone={["violet","cyan","green","amber"][index]}/></button>)}</div><div className="traffic-detail-summary"><span><small>累计流量</small><b>{bytes((stats?.total_upload_bytes||0)+(stats?.total_download_bytes||0))}</b><em>↑ {bytes(stats?.total_upload_bytes||0)} · ↓ {bytes(stats?.total_download_bytes||0)}</em></span><span><small>当前速率</small><b>↓ {speed(stats?.download_bytes_per_second||0)}</b><em>↑ {speed(stats?.upload_bytes_per_second||0)}</em></span></div><div className="traffic-detail-chart"><div className="section-head"><div><p className="eyebrow">北京时间自然周期</p><h3>{periodNames[period]}流量趋势</h3></div><PeriodPicker value={period} onChange={changePeriod}/></div>{loading?<div className="group-empty">正在读取统计…</div>:<TrafficChart points={points}/>}</div></Modal>}
 function Empty({title,description,action}:{title:string;description:string;action:()=>void}){return <div className="empty"><span>＋</span><h3>{title}</h3><p>{description}</p><button className="primary" onClick={action}>开始配置</button></div>}
 
 function NodeModal({initial,credential,busy,onClose,onSave}:{initial:Node|null;credential:{nodeId:string;token:string}|null;busy:boolean;onClose:()=>void;onSave:(n:typeof blankNode)=>void}){const [n,setN]=useState(()=>initial?{name:initial.name,role:initial.role,public_address:initial.public_address,private_address:initial.private_address,public_interface:initial.public_interface||"eth0",private_interface:initial.private_interface||"wg0"}:blankNode);const field=(key:keyof typeof n)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setN({...n,[key]:e.target.value} as typeof n);const installCommand=credential?`curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/install-agent-online.sh | sudo bash -s -- --controller ${typeof window!=="undefined"?window.location.origin:"https://panel.example.com"} --node-id ${credential.nodeId}`:"";if(credential)return <Modal title="复制安装命令" kicker="服务器已创建" onClose={onClose}><div className="install-step"><span className="success-mark">1</span><div><b>在目标服务器执行</b><p>安装器会自动安装 Agent、nftables、tc 和 Realm。</p></div></div><div className="command-box"><code>{installCommand}</code><button onClick={()=>navigator.clipboard.writeText(installCommand)}>复制命令</button></div><div className="install-step"><span>2</span><div><b>按提示粘贴 Agent Token</b><p>Token 只显示这一次，不会写进命令历史。</p></div></div><div className="token-box"><code>{credential.token}</code><button className="outline wide" onClick={()=>navigator.clipboard.writeText(credential.token)}>复制 Agent Token</button></div><div className="modal-actions"><button className="primary" onClick={onClose}>完成</button></div></Modal>;return <Modal title={initial?"配置服务器":"接入服务器"} kicker={initial?"网络参数":"第一步"} onClose={onClose}><form className="form-grid" onSubmit={e=>{e.preventDefault();onSave(n)}}><label className="full">服务器名称<input required value={n.name} onChange={field("name")} placeholder="例如：广州入口、香港出口"/></label><label className="full">服务器用途<select value={n.role} onChange={field("role")}><option value="ingress">入口服务器</option><option value="egress">出口服务器</option><option value="both">入口 / 出口均可</option></select><small>用途只影响线路选择，不会自动修改服务器网络。</small></label><details className="advanced full" open={Boolean(initial)}><summary>网络参数（可稍后配置）</summary><div className="advanced-grid"><label>公网地址<input value={n.public_address} onChange={field("public_address")} placeholder="例如：203.0.113.18"/></label><label>内网地址<input value={n.private_address} onChange={field("private_address")} placeholder="例如：10.24.0.3"/></label><label>公网网卡<input value={n.public_interface} onChange={field("public_interface")}/></label><label>内网网卡<input value={n.private_interface} onChange={field("private_interface")}/></label></div></details><div className="modal-actions full"><button type="button" className="outline" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy?"保存中…":initial?"保存配置":"创建并获取安装命令"}</button></div></form></Modal>}
