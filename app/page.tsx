@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 type NodeRole = "ingress" | "egress" | "both";
 type Mode = "dual_managed" | "exit_only";
@@ -13,6 +13,7 @@ type RuleTraffic = { rule_id:string; total_upload_bytes:number; total_download_b
 type Summary = { online_nodes:number; total_nodes:number; enabled_rules:number; total_rules:number; today_upload:number; today_download:number; week_upload:number; week_download:number; month_upload:number; month_download:number; quarter_upload:number; quarter_download:number; recent_traffic:Point[] };
 type View = "overview"|"nodes"|"lines"|"rules"|"traffic"|"settings";
 type TrafficPeriod = "day"|"week"|"month"|"quarter";
+type ChartMode = "line"|"bar";
 type LinkProbe = { ingress_node_id:string; egress_node_id:string; address:string; latency_ms:number; packet_loss:number; success:boolean; has_succeeded:boolean; failure_count:number; success_count:number; checked_at:string };
 type TargetProbe = { rule_id:string; node_id:string; address:string; port:number; latency_ms:number; packet_loss:number; success:boolean; has_succeeded:boolean; failure_count:number; success_count:number; checked_at:string };
 
@@ -31,7 +32,8 @@ const demoRules:Rule[] = [
   {id:"r2",line_id:"line-hk-exit",mode:"exit_only",name:"远程桌面",protocol:"both",ingress_node_id:"out-hkg",egress_node_id:"out-hkg",listen_address:"10.24.0.3",listen_port:33890,relay_port:33890,target_host:"192.0.2.91",target_port:3389,engine:"realm",upload_mbps:10,download_mbps:40,burst_kbytes:256,enabled:true},
 ];
 const demoTargetProbes:TargetProbe[]=[{rule_id:"r1",node_id:"out-hkg",address:"192.0.2.88",port:24444,latency_ms:28.4,packet_loss:0,success:true,has_succeeded:true,failure_count:0,success_count:12,checked_at:new Date().toISOString()},{rule_id:"r2",node_id:"out-hkg",address:"192.0.2.91",port:3389,latency_ms:32.1,packet_loss:0,success:true,has_succeeded:true,failure_count:0,success_count:12,checked_at:new Date().toISOString()}];
-const demoPoints = Array.from({length:24},(_,i)=>({bucket:new Date(Date.now()-(23-i)*3600_000).toISOString(),upload_bytes:(8+Math.sin(i/2)*4)*1024**3/24,download_bytes:(38+Math.cos(i/3)*12)*1024**3/24}));
+const demoHour=Math.floor(Date.now()/3600_000)*3600_000;
+const demoPoints = Array.from({length:24},(_,i)=>({bucket:new Date(demoHour-(23-i)*3600_000).toISOString(),upload_bytes:(8+Math.sin(i/2)*4)*1024**3/24,download_bytes:(38+Math.cos(i/3)*12)*1024**3/24}));
 const demoSummary:Summary={online_nodes:2,total_nodes:3,enabled_rules:2,total_rules:2,today_upload:8.4*1024**3,today_download:38.6*1024**3,week_upload:44*1024**3,week_download:196*1024**3,month_upload:178*1024**3,month_download:812*1024**3,quarter_upload:493*1024**3,quarter_download:2.3*1024**4,recent_traffic:demoPoints};
 const demoRuleTraffic:RuleTraffic[]=[
   {rule_id:"r1",total_upload_bytes:428.7*1024**3,total_download_bytes:2.1*1024**4,today_upload_bytes:7.1*1024**3,today_download_bytes:32.4*1024**3,week_upload_bytes:38*1024**3,week_download_bytes:171*1024**3,month_upload_bytes:151*1024**3,month_download_bytes:704*1024**3,quarter_upload_bytes:420*1024**3,quarter_download_bytes:2*1024**4,upload_bytes_per_second:1.4*1024**2,download_bytes_per_second:5.8*1024**2},
@@ -163,9 +165,388 @@ function Overview({summary,nodes,lines,rules,points,onOpenLines}:{summary:Summar
 function NodeDot({label,active}:{label:string;active?:boolean}){return <div className={`topo-node ${active?"active":""}`}><span>{active?"●":"○"}</span><b>{label}</b></div>}
 function FlowLine({privateLine}:{privateLine?:boolean}){return <div className={`topo-line ${privateLine?"private":""}`}><span>{privateLine?"内网":""}</span></div>}
 function Metric({label,value,note,tone}:{label:string;value:string;note:string;tone:string}){return <div className={`metric ${tone}`}><span>{label}</span><strong>{value}</strong><small>{note}</small></div>}
-function TrafficChart({points}:{points:Point[]|null|undefined}){const values=asArray(points).slice(-92),max=Math.max(1,...values.map(p=>p.upload_bytes+p.download_bytes)),daily=values.length>1&&new Date(values.at(-1)!.bucket).getTime()-new Date(values[0].bucket).getTime()>=24*3600_000;const label=(bucket:string)=>new Intl.DateTimeFormat("zh-CN",daily?{timeZone:"Asia/Shanghai",month:"numeric",day:"numeric"}:{timeZone:"Asia/Shanghai",hour:"2-digit",hour12:false}).format(new Date(bucket));const labelEvery=Math.max(1,Math.ceil(values.length/8));return <div className="bars">{values.map((p,i)=><div className="bar-col" key={p.bucket||i} title={`${label(p.bucket)} · ${bytes(p.upload_bytes+p.download_bytes)}`}><span className="bar-download" style={{height:`${Math.max(3,p.download_bytes/max*100)}%`}}/><span className="bar-upload" style={{height:`${Math.max(2,p.upload_bytes/max*100)}%`}}/><i>{i%labelEvery===0?label(p.bucket):""}</i></div>)}</div>}
+function TrafficChart({ points }: { points: Point[] | null | undefined }) {
+  const values = asArray(points).slice(-92),
+    canvasRef = useRef<HTMLCanvasElement>(null),
+    stageRef = useRef<HTMLDivElement>(null);
+  const [mode, setMode] = useState<ChartMode>("line"),
+    [hover, setHover] = useState<number | null>(null);
+  const daily =
+    values.length > 1 &&
+    new Date(values[1].bucket).getTime() -
+      new Date(values[0].bucket).getTime() >=
+      20 * 3600_000;
+  const label = useCallback(
+    (bucket: string) =>
+      new Intl.DateTimeFormat(
+        "zh-CN",
+        daily
+          ? { timeZone: "Asia/Shanghai", month: "numeric", day: "numeric" }
+          : {
+              timeZone: "Asia/Shanghai",
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: false,
+            },
+      ).format(new Date(bucket)),
+    [daily],
+  );
+  useEffect(() => {
+    const canvas = canvasRef.current,
+      stage = stageRef.current;
+    if (!canvas || !stage) return;
+    const draw = () => {
+      const width = Math.max(320, stage.clientWidth),
+        height = 278,
+        dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const left = 54,
+        right = 18,
+        top = 19,
+        bottom = 36,
+        plotW = width - left - right,
+        plotH = height - top - bottom;
+      const rawMax = Math.max(
+        1,
+        ...values.flatMap((p) => [p.upload_bytes, p.download_bytes]),
+      );
+      const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+      let unitIndex = 0,
+        unitScale = 1;
+      while (rawMax / unitScale >= 1024 && unitIndex < units.length - 1) {
+        unitScale *= 1024;
+        unitIndex++;
+      }
+      const displayMax = rawMax / unitScale,
+        exponent = Math.pow(10, Math.floor(Math.log10(displayMax))),
+        fraction = displayMax / exponent,
+        niceDisplay =
+          (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) *
+          exponent,
+        nice = niceDisplay * unitScale;
+      ctx.font = '10px Inter,"PingFang SC",sans-serif';
+      ctx.textBaseline = "middle";
+      for (let i = 0; i <= 4; i++) {
+        const y = top + (plotH * i) / 4,
+          value = (nice * (4 - i)) / 4;
+        ctx.strokeStyle = i === 4 ? "#364151" : "#202936";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(left, y + 0.5);
+        ctx.lineTo(width - right, y + 0.5);
+        ctx.stroke();
+        ctx.fillStyle = "#657286";
+        ctx.textAlign = "right";
+        ctx.fillText(
+          (value / unitScale).toFixed(
+            value === 0 ? 0 : value / unitScale < 10 ? 1 : 0,
+          ),
+          left - 10,
+          y,
+        );
+      }
+      ctx.fillStyle = "#718096";
+      ctx.textAlign = "left";
+      ctx.fillText(units[unitIndex], 8, top - 7);
+      if (!values.length) {
+        ctx.fillStyle = "#657286";
+        ctx.textAlign = "center";
+        ctx.fillText("当前周期暂无流量", left + plotW / 2, top + plotH / 2);
+        return;
+      }
+      const xAt = (i: number) =>
+          values.length === 1
+            ? left + plotW / 2
+            : left + (plotW * i) / (values.length - 1),
+        yAt = (value: number) =>
+          top + plotH - Math.max(0, Math.min(1, value / nice)) * plotH;
+      const maxLabels = Math.max(2, Math.floor(plotW / 64)),
+        labelEvery = Math.max(1, Math.ceil(values.length / maxLabels));
+      values.forEach((point, i) => {
+        const last = values.length - 1;
+        if (
+          i !== 0 &&
+          i !== last &&
+          (i % labelEvery !== 0 || last - i < labelEvery)
+        )
+          return;
+        ctx.fillStyle = "#5f6c80";
+        ctx.textAlign =
+          i === 0 ? "left" : i === values.length - 1 ? "right" : "center";
+        ctx.fillText(label(point.bucket), xAt(i), height - 14);
+      });
+      const series = [
+        { key: "download_bytes" as const, color: "#806cff" },
+        { key: "upload_bytes" as const, color: "#24c9d5" },
+      ];
+      if (mode === "bar") {
+        const group = Math.max(
+            5,
+            Math.min(32, (plotW / Math.max(values.length, 1)) * 0.72),
+          ),
+          bar = Math.max(2, (group - 2) / 2);
+        series.forEach((item, s) =>
+          values.forEach((point, i) => {
+            const x = xAt(i) - group / 2 + s * (bar + 2),
+              y = yAt(point[item.key]);
+            ctx.fillStyle = item.color;
+            ctx.globalAlpha = 0.9;
+            ctx.fillRect(x, y, bar, top + plotH - y);
+          }),
+        );
+        ctx.globalAlpha = 1;
+      } else {
+        series.forEach((item) => {
+          const coords = values.map((point, i) => ({
+            x: xAt(i),
+            y: yAt(point[item.key]),
+          }));
+          const gradient = ctx.createLinearGradient(0, top, 0, top + plotH);
+          gradient.addColorStop(0, item.color + "2b");
+          gradient.addColorStop(1, item.color + "00");
+          ctx.beginPath();
+          ctx.moveTo(coords[0].x, top + plotH);
+          coords.forEach((p, i) => {
+            if (i === 0) ctx.lineTo(p.x, p.y);
+            else {
+              const prev = coords[i - 1],
+                mid = (prev.x + p.x) / 2;
+              ctx.bezierCurveTo(mid, prev.y, mid, p.y, p.x, p.y);
+            }
+          });
+          ctx.lineTo(coords.at(-1)!.x, top + plotH);
+          ctx.closePath();
+          ctx.fillStyle = gradient;
+          ctx.fill();
+          ctx.beginPath();
+          coords.forEach((p, i) => {
+            if (i === 0) ctx.moveTo(p.x, p.y);
+            else {
+              const prev = coords[i - 1],
+                mid = (prev.x + p.x) / 2;
+              ctx.bezierCurveTo(mid, prev.y, mid, p.y, p.x, p.y);
+            }
+          });
+          ctx.strokeStyle = item.color;
+          ctx.lineWidth = 2;
+          ctx.lineJoin = "round";
+          ctx.stroke();
+        });
+      }
+      if (hover !== null && values[hover]) {
+        const x = xAt(hover);
+        ctx.strokeStyle = "#8190a755";
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x, top);
+        ctx.lineTo(x, top + plotH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        series.forEach((item) => {
+          ctx.beginPath();
+          ctx.arc(x, yAt(values[hover][item.key]), 4, 0, Math.PI * 2);
+          ctx.fillStyle = "#10151e";
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = item.color;
+          ctx.stroke();
+        });
+      }
+    };
+    draw();
+    const observer = new ResizeObserver(draw);
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, [values, mode, hover, label]);
+  const move = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!values.length) return;
+    const rect = event.currentTarget.getBoundingClientRect(),
+      left = 54,
+      right = 18,
+      usable = Math.max(1, rect.width - left - right),
+      index = Math.round(
+        ((event.clientX - rect.left - left) / usable) * (values.length - 1),
+      );
+    setHover(Math.max(0, Math.min(values.length - 1, index)));
+  };
+  const active = hover === null ? null : values[hover];
+  return (
+    <div className="traffic-chart">
+      <div className="chart-toolbar">
+        <div className="chart-legend">
+          <span className="download">下载</span>
+          <span className="upload">上传</span>
+        </div>
+        <div className="chart-mode" aria-label="图表类型">
+          <button
+            className={mode === "line" ? "active" : ""}
+            onClick={() => setMode("line")}
+          >
+            折线图
+          </button>
+          <button
+            className={mode === "bar" ? "active" : ""}
+            onClick={() => setMode("bar")}
+          >
+            柱形图
+          </button>
+        </div>
+      </div>
+      <div
+        className="traffic-chart-stage"
+        ref={stageRef}
+        onPointerMove={move}
+        onPointerLeave={() => setHover(null)}
+      >
+        <canvas ref={canvasRef} role="img" aria-label="上传和下载流量趋势图" />
+        {active && (
+          <div
+            className="chart-tooltip"
+            style={{
+              left: `clamp(78px, ${values.length === 1 ? 50 : ((hover || 0) / (values.length - 1)) * 100}%, calc(100% - 78px))`,
+            }}
+          >
+            <b>{label(active.bucket)}</b>
+            <span className="download">
+              下载 {bytes(active.download_bytes)}
+            </span>
+            <span className="upload">上传 {bytes(active.upload_bytes)}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-function Nodes({nodes,onAdd,onEdit,onUpdate,onDelete}:{nodes:Node[];onAdd:()=>void;onEdit:(n:Node)=>void;onUpdate:(n:Node)=>void;onDelete:(id:string)=>void}){return <div className="resource-page"><section className="workflow-strip"><span>1</span><div><b>在面板创建服务器</b><small>只需要名称和用途</small></div><i/><span>2</span><div><b>复制一键安装命令</b><small>在服务器执行一次</small></div><i/><span>3</span><div><b>Agent 上线</b><small>再用于创建线路</small></div></section><section className="table-card"><div className="section-head"><div><p className="eyebrow">{nodes.length} 台服务器</p><h3>已接入服务器</h3></div><button className="outline" onClick={onAdd}>＋ 接入服务器</button></div><div className="node-cards">{nodes.map(n=><article key={n.id} className={n.apply_status==="failed"?"apply-failed":""}><div className="node-card-top"><span className={`node-icon large ${n.status}`}>{n.role==="ingress"?"IN":n.role==="egress"?"OUT":"I/O"}</span><em className={n.apply_status==="failed"?"failed":n.status}>{n.apply_status==="failed"?"下发失败":n.status==="online"?"在线":"等待连接"}</em></div><h3>{n.name}</h3><p>{roleName(n.role)}服务器{n.agent_version?` · Agent ${n.agent_version}`:""}</p>{n.apply_status==="failed"&&<div className="apply-error"><b>配置未生效</b><span>{n.apply_error||"请检查 Agent 日志后重试"}</span></div>}<dl><div><dt>公网</dt><dd>{n.public_address||"待配置"}</dd></div><div><dt>内网</dt><dd>{n.private_address||"待配置"}</dd></div><div><dt>网卡</dt><dd>{n.public_interface||"—"} / {n.private_interface||"—"}</dd></div></dl><div className="card-actions"><span className="secondary-actions"><button className="outline" onClick={()=>onEdit(n)}>配置</button><button className="outline" onClick={()=>onUpdate(n)}>更新 Agent</button></span><button className="danger-link" onClick={()=>onDelete(n.id)}>删除</button></div></article>)}</div>{!nodes.length&&<Empty title="还没有服务器" description="先创建服务器，面板会给出一键安装命令。" action={onAdd}/>}</section></div>}
+function Nodes({
+  nodes,
+  onAdd,
+  onEdit,
+  onUpdate,
+  onDelete,
+}: {
+  nodes: Node[];
+  onAdd: () => void;
+  onEdit: (n: Node) => void;
+  onUpdate: (n: Node) => void;
+  onDelete: (id: string) => void;
+}) {
+  return (
+    <div className="resource-page">
+      <section className="workflow-strip">
+        <span>1</span>
+        <div>
+          <b>在面板创建服务器</b>
+          <small>只需要名称和用途</small>
+        </div>
+        <i />
+        <span>2</span>
+        <div>
+          <b>复制一键安装命令</b>
+          <small>在服务器执行一次</small>
+        </div>
+        <i />
+        <span>3</span>
+        <div>
+          <b>Agent 上线</b>
+          <small>再用于创建线路</small>
+        </div>
+      </section>
+      <section className="table-card">
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">{nodes.length} 台服务器</p>
+            <h3>已接入服务器</h3>
+          </div>
+          <button className="outline" onClick={onAdd}>
+            ＋ 接入服务器
+          </button>
+        </div>
+        <div className="node-cards">
+          {nodes.map((n) => (
+            <article
+              key={n.id}
+              className={n.apply_status === "failed" ? "apply-failed" : ""}
+            >
+              <div className="node-card-top">
+                <span className={`node-icon large ${n.status}`}>
+                  {n.role === "ingress"
+                    ? "IN"
+                    : n.role === "egress"
+                      ? "OUT"
+                      : "I/O"}
+                </span>
+                <em
+                  className={n.apply_status === "failed" ? "failed" : n.status}
+                >
+                  {n.apply_status === "failed"
+                    ? "下发失败"
+                    : n.status === "online"
+                      ? "在线"
+                      : "等待连接"}
+                </em>
+              </div>
+              <h3>{n.name}</h3>
+              <p>
+                {roleName(n.role)}服务器
+                {n.agent_version ? ` · Agent ${n.agent_version}` : ""}
+              </p>
+              {n.apply_status === "failed" && (
+                <div className="apply-error">
+                  <b>配置未生效</b>
+                  <span>{n.apply_error || "请检查 Agent 日志后重试"}</span>
+                </div>
+              )}
+              <dl>
+                <div>
+                  <dt>公网</dt>
+                  <dd>{n.public_address || "待配置"}</dd>
+                </div>
+                <div>
+                  <dt>内网</dt>
+                  <dd>{n.private_address || "待配置"}</dd>
+                </div>
+                <div>
+                  <dt>网卡</dt>
+                  <dd>
+                    {n.public_interface || "—"} / {n.private_interface || "—"}
+                  </dd>
+                </div>
+              </dl>
+              <div className="card-actions">
+                <span className="secondary-actions">
+                  <button className="outline" onClick={() => onEdit(n)}>
+                    配置
+                  </button>
+                  <button className="outline" onClick={() => onUpdate(n)}>
+                    更新 Agent
+                  </button>
+                </span>
+                <button className="danger-link" onClick={() => onDelete(n.id)}>
+                  删除
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+        {!nodes.length && (
+          <Empty
+            title="还没有服务器"
+            description="先创建服务器，面板会给出一键安装命令。"
+            action={onAdd}
+          />
+        )}
+      </section>
+    </div>
+  );
+}
 
 function Lines({nodes,lines,rules,probes,onAdd,onEdit,onRule,onDelete}:{nodes:Node[];lines:Line[];rules:Rule[];probes:LinkProbe[];onAdd:()=>void;onEdit:(line:Line)=>void;onRule:(id:string)=>void;onDelete:(id:string)=>void}){return <section className="table-card"><div className="section-head"><div><p className="eyebrow">延迟探测 · 多出口自动切换</p><h3>线路</h3></div><button className="outline" onClick={onAdd}>＋ 创建线路</button></div><div className="line-grid">{lines.map(line=>{const ingress=nodes.find(n=>n.id===line.ingress_node_id),activeID=line.active_egress_node_id||line.egress_node_id,egress=nodes.find(n=>n.id===activeID),count=rules.filter(r=>r.line_id===line.id).length,probe=probes.find(p=>p.ingress_node_id===line.ingress_node_id&&p.egress_node_id===activeID),exitCount=(line.egress_node_ids?.length||1),probeClass=!probe||!probe.has_succeeded?"unknown":probe.packet_loss>=100?"bad":probe.packet_loss>0?"warn":"good";return <article className="line-card" key={line.id}><div className="line-card-head"><div><span className="line-badge">{modeName(line.mode)}</span>{line.failover_enabled&&<span className="line-badge failover">自动主备</span>}<h3>{line.name}</h3><p>{line.engine} · {count} 条转发 · {exitCount} 个出口 · 端口 {line.relay_port_range||"不限制"}</p></div><i className={egress?.status||"offline"}/></div>{line.mode==="dual_managed"&&<div className={`link-quality ${probeClass}`}><span>当前出口：<b>{egress?.name||"未选择"}</b></span><span>{probe?.has_succeeded?`延迟 ${probe.latency_ms.toFixed(1)} ms · 丢包 ${probe.packet_loss.toFixed(0)}%`:probe?"ICMP 不可用 · 按 Agent 在线状态判断":"等待入口 Agent 探测"}</span></div>}<div className="route-visual"><div><small>{line.mode==="dual_managed"?"公网入口":"已有入口"}</small><b>{line.mode==="dual_managed"?ingress?.name:"已有入口规则"}</b><code>{line.mode==="dual_managed"?(ingress?.public_address||"待配置"):"不由面板管理"}</code></div><span>→</span><div><small>{line.failover_enabled?"当前活动出口":"出口接管"}</small><b>{egress?.name}</b><code>{line.mode==="exit_only"?(line.listen_address||egress?.private_address||"待配置"):(egress?.private_address||"待配置")}</code></div><span>→</span><div><small>规则目标</small><b>落地服务器</b><code>每条转发填写</code></div></div><div className="card-actions"><button className="primary" onClick={()=>onRule(line.id)}>＋ 在此线路新建转发</button><span className="secondary-actions"><button className="outline" onClick={()=>onEdit(line)}>修改线路</button><button className="danger-link" onClick={()=>onDelete(line.id)}>删除</button></span></div></article>})}</div>{!lines.length&&<Empty title="还没有线路" description="把入口、出口和转发引擎组合成一条可复用线路。" action={onAdd}/>}</section>}
 
