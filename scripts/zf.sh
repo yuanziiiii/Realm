@@ -65,8 +65,15 @@ run_release_script() {
   return "${result}"
 }
 
-has_control() { [[ -f "${install_dir}/docker-compose.yml" ]] && command -v docker >/dev/null 2>&1; }
-has_agent() { [[ -s "${agent_config}" ]] && command -v systemctl >/dev/null 2>&1; }
+has_control() {
+  [[ -f "${install_dir}/docker-compose.yml" && -f "${install_dir}/.env" ]] \
+    && command -v docker >/dev/null 2>&1
+}
+has_agent() {
+  [[ -s "${agent_config}" ]] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl cat "${agent_service}" >/dev/null 2>&1
+}
 compose() { docker compose --project-directory "${install_dir}" "$@"; }
 
 control_status() {
@@ -265,19 +272,14 @@ fi
 if [[ $# -ge 1 ]]; then
   selected_role="${2:-}"
   if [[ "${selected_role}" != 'control' && "${selected_role}" != 'agent' ]]; then
-    if [[ "${control_installed}" == true ]]; then selected_role='control'; else selected_role='agent'; fi
+    if [[ "${agent_installed}" == true ]]; then selected_role='agent'; else selected_role='control'; fi
   fi
   run_command "${selected_role}" "$1"
   exit $?
 fi
 
-if [[ "${control_installed}" == true && "${agent_installed}" == true ]]; then
-  clear_screen; print_header '主控端 + Agent'
-  printf '1. 管理主控端\n2. 管理 Agent\n0. 退出\n\n请选择：' > /dev/tty
-  IFS= read -r role_choice < /dev/tty || exit 0
-  case "${role_choice}" in 1) control_menu ;; 2) agent_menu ;; *) exit 0 ;; esac
-elif [[ "${control_installed}" == true ]]; then
-  control_menu
-else
+if [[ "${agent_installed}" == true ]]; then
   agent_menu
+else
+  control_menu
 fi
