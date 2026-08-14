@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  common:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -17,11 +17,9 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
       - name: Test
         run: go test ./...
-      - name: Build Linux binaries
+      - name: Build common release files
         run: |
           mkdir -p release
           for arch in amd64 arm64; do
@@ -38,25 +36,68 @@ jobs:
           install -m 0755 scripts/update.sh release/update.sh
           install -m 0755 scripts/zf.sh release/zf.sh
           install -m 0755 scripts/reset-admin-password.sh release/reset-admin-password.sh
-          for arch in amd64 arm64; do
-            docker buildx build \
-              --platform "linux/$arch" \
-              --tag "relay-panel-web-release:${GITHUB_REF_NAME}-$arch" \
-              --output "type=docker,dest=release/relay-panel-web-linux-$arch.tar" \
-              --file Dockerfile.web .
-            docker buildx build \
-              --platform "linux/$arch" \
-              --build-arg "VERSION=${GITHUB_REF_NAME#v}" \
-              --tag "relay-panel-control-release:${GITHUB_REF_NAME}-$arch" \
-              --output "type=docker,dest=release/relay-panel-control-linux-$arch.tar" \
-              --file Dockerfile.control .
-            gzip -1 "release/relay-panel-web-linux-$arch.tar"
-            gzip -1 "release/relay-panel-control-linux-$arch.tar"
-          done
           for file in release/*; do
             sha256sum "$file" > "$file.sha256"
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: common-release
+          path: release/*
+          compression-level: 0
+
+  images:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: Build native ${{ matrix.arch }} images
+        run: |
+          mkdir -p release
+          docker buildx build \
+            --platform "linux/${{ matrix.arch }}" \
+            --tag "relay-panel-web-release:${GITHUB_REF_NAME}-${{ matrix.arch }}" \
+            --output "type=docker,dest=release/relay-panel-web-linux-${{ matrix.arch }}.tar" \
+            --file Dockerfile.web .
+          docker buildx build \
+            --platform "linux/${{ matrix.arch }}" \
+            --build-arg "VERSION=${GITHUB_REF_NAME#v}" \
+            --tag "relay-panel-control-release:${GITHUB_REF_NAME}-${{ matrix.arch }}" \
+            --output "type=docker,dest=release/relay-panel-control-linux-${{ matrix.arch }}.tar" \
+            --file Dockerfile.control .
+          gzip -1 "release/relay-panel-web-linux-${{ matrix.arch }}.tar"
+          gzip -1 "release/relay-panel-control-linux-${{ matrix.arch }}.tar"
+          for file in release/*; do
+            sha256sum "$file" > "$file.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.arch }}
+          path: release/*
+          compression-level: 0
+
+  release:
+    needs: [common, images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release"
+          path: release
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "images-*"
+          path: release
+          merge-multiple: true
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" release/* --generate-notes --verify-tag
+        run: gh release create "${GITHUB_REF_NAME}" release/* --repo "${GITHUB_REPOSITORY}" --generate-notes --verify-tag
