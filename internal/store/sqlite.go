@@ -241,6 +241,20 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	return err
 }
 
+func (s *Store) SetSettings(ctx context.Context, values map[string]string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for key, value := range values {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Revision(ctx context.Context) (int64, error) {
 	var revision int64
 	err := s.db.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM settings WHERE key='revision'`).Scan(&revision)

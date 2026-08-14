@@ -91,8 +91,10 @@ sudo docker compose --project-directory /opt/relay-panel up -d
 更新命令会同时更新网页端和 Go 控制端，不修改数据库、登录密码、端口或 HTTPS 反代配置。更新器先构建候选镜像并做健康检查，失败时会同时恢复旧网页端与旧控制端：
 
 ```bash
-curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update-control.sh | sudo bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh | sudo bash
 ```
+
+全新安装与在线更新已经分开；已经部署过主控后只需执行上述更新命令，不要重新运行安装脚本。完整说明见 [UPDATE.md](UPDATE.md)。面板“系统设置”页面也会固定显示并提供复制这条更新命令。
 
 网页端需要在本机完成一次 Docker 构建；1C1G 机器会自动复用安装时创建的交换空间，通常约 1 分钟。这样从旧版本升级后，页面修复也会真正生效，不会再出现“后端已更新、浏览器还是旧页面”的情况。
 

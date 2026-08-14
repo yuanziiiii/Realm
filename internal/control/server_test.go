@@ -86,6 +86,89 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 	}
 }
 
+func TestChangePasswordVerifiesCurrentPasswordAndInvalidatesSessions(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := New(ctx, st, Options{AdminPassword: "old-password-123", Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	login := func(password string) *http.Response {
+		t.Helper()
+		response, err := http.Post(httpServer.URL+"/api/v1/login", "application/json", bytes.NewBufferString(`{"password":"`+password+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	loginResponse := login("old-password-123")
+	if loginResponse.StatusCode != http.StatusOK || len(loginResponse.Cookies()) == 0 {
+		body, _ := io.ReadAll(loginResponse.Body)
+		loginResponse.Body.Close()
+		t.Fatalf("initial login failed: %d %s", loginResponse.StatusCode, body)
+	}
+	session := loginResponse.Cookies()[0]
+	loginResponse.Body.Close()
+
+	change := func(current, next string) *http.Response {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"current_password": current, "new_password": next})
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/v1/admin/password", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(session)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	wrong := change("wrong-password", "new-password-456")
+	wrong.Body.Close()
+	if wrong.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong current password returned %d", wrong.StatusCode)
+	}
+	changed := change("old-password-123", "new-password-456")
+	changed.Body.Close()
+	if changed.StatusCode != http.StatusOK {
+		t.Fatalf("password change returned %d", changed.StatusCode)
+	}
+
+	me, err := http.NewRequest(http.MethodGet, httpServer.URL+"/api/v1/me", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	me.AddCookie(session)
+	meResponse, err := http.DefaultClient.Do(me)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meResponse.Body.Close()
+	if meResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old session remained valid after password change: %d", meResponse.StatusCode)
+	}
+	oldLogin := login("old-password-123")
+	oldLogin.Body.Close()
+	if oldLogin.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old password remained valid: %d", oldLogin.StatusCode)
+	}
+	newLogin := login("new-password-456")
+	newLogin.Body.Close()
+	if newLogin.StatusCode != http.StatusOK {
+		t.Fatalf("new password login failed: %d", newLogin.StatusCode)
+	}
+}
+
 func TestSaveRuleUpdatePreservesRelayPortAndChangesFields(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))

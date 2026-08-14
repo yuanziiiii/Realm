@@ -48,6 +48,13 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
 	if err := ensureAdmin(ctx, st, opts.AdminPassword); err != nil {
 		return nil, err
 	}
+	if _, err := st.GetSetting(ctx, "session_generation"); errors.Is(err, store.ErrNotFound) {
+		if err := st.SetSetting(ctx, "session_generation", "1"); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	}
 	secret := []byte(opts.SessionSecret)
 	if len(secret) < 32 {
 		stored, err := st.GetSetting(ctx, "session_secret")
@@ -102,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /api/v1/login", s.login)
 	mux.HandleFunc("POST /api/v1/logout", s.requireAdmin(s.logout))
+	mux.HandleFunc("POST /api/v1/admin/password", s.requireAdmin(s.changePassword))
 	mux.HandleFunc("GET /api/v1/me", s.requireAdmin(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"name": "管理员"})
 	}))
@@ -145,8 +153,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("密码错误"))
 		return
 	}
+	generation, err := s.store.GetSetting(r.Context(), "session_generation")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	expires := time.Now().Add(12 * time.Hour)
-	token := s.signSession(expires)
+	token := s.signSession(expires, generation)
 	http.SetCookie(w, &http.Cookie{Name: "relay_session", Value: token, Path: "/", Expires: expires, HttpOnly: true, Secure: s.secureCookies || requestIsHTTPS(r), SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "expires_at": expires})
 }
@@ -156,35 +169,95 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) signSession(expires time.Time) string {
-	payload := strconv.FormatInt(expires.Unix(), 10)
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	hash, err := s.store.GetSetting(r.Context(), "admin_password_hash")
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.CurrentPassword)) != nil {
+		writeError(w, http.StatusUnauthorized, errors.New("当前密码错误"))
+		return
+	}
+	if len(body.NewPassword) < 10 {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("新密码至少需要 10 个字符"))
+		return
+	}
+	if body.NewPassword == body.CurrentPassword {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("新密码不能与当前密码相同"))
+		return
+	}
+	newHash, err := bcrypt.GenerateFromPassword([]byte(body.NewPassword), 12)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	generationText, err := s.store.GetSetting(r.Context(), "session_generation")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	generation, err := strconv.ParseInt(generationText, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("登录会话版本无效"))
+		return
+	}
+	if err := s.store.SetSettings(r.Context(), map[string]string{
+		"admin_password_hash": string(newHash),
+		"session_generation":  strconv.FormatInt(generation+1, 10),
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "relay_session", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.secureCookies || requestIsHTTPS(r), SameSite: http.SameSiteStrictMode})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) signSession(expires time.Time, generation string) string {
+	payload := strconv.FormatInt(expires.Unix(), 10) + "." + generation
 	mac := hmac.New(sha256.New, s.sessionSecret)
 	_, _ = mac.Write([]byte(payload))
 	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func (s *Server) validSession(token string) bool {
+func (s *Server) validSession(ctx context.Context, token string) bool {
 	parts := strings.Split(token, ".")
-	if len(parts) != 2 {
+	if len(parts) != 2 && len(parts) != 3 {
 		return false
 	}
 	expires, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || time.Now().Unix() > expires {
 		return false
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	generation := "1"
+	payload := parts[0]
+	sigIndex := 1
+	if len(parts) == 3 {
+		generation = parts[1]
+		payload += "." + generation
+		sigIndex = 2
+	}
+	currentGeneration, err := s.store.GetSetting(ctx, "session_generation")
+	if err != nil || generation != currentGeneration {
+		return false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[sigIndex])
 	if err != nil {
 		return false
 	}
 	mac := hmac.New(sha256.New, s.sessionSecret)
-	_, _ = mac.Write([]byte(parts[0]))
+	_, _ = mac.Write([]byte(payload))
 	return hmac.Equal(sig, mac.Sum(nil))
 }
 
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("relay_session")
-		if err != nil || !s.validSession(cookie.Value) {
+		if err != nil || !s.validSession(r.Context(), cookie.Value) {
 			writeError(w, http.StatusUnauthorized, errors.New("请先登录"))
 			return
 		}

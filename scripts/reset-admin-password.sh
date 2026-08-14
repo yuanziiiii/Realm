@@ -79,7 +79,7 @@ awk -v password="${new_password}" '
 ' "${env_file}" > "${tmp_env}"
 install -m 0600 "${tmp_env}" "${env_file}"
 
-sqlite3 "${db_path}" "DELETE FROM settings WHERE key='admin_password_hash';"
+sqlite3 "${db_path}" "BEGIN; DELETE FROM settings WHERE key='admin_password_hash'; INSERT INTO settings(key,value) VALUES('session_generation','2') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1; COMMIT;"
 say "启动控制端并写入新密码"
 docker compose --project-directory "${install_dir}" up -d --force-recreate control >/dev/null
 sleep 3
