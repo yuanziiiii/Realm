@@ -32,6 +32,8 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update-a
 
 Agent 更新会保留 `/etc/relay-agent/config.json` 中的主控地址、Node ID 和 Token，失败时恢复旧二进制。
 
+涉及 Agent 新能力（例如出口到落地的延迟探测）时，应先更新主控，再更新相关入口和出口 Agent。旧 Agent 与新主控保持兼容，但只有升级后的出口 Agent 才会上报新的落地探测数据。
+
 Agent 更新也会安装或刷新同一个 `zf` 命令，但菜单会自动切换为 Agent 状态、日志、连通性和转发环境检查等节点功能。
 
 ## 指定版本

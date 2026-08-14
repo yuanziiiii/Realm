@@ -133,6 +133,23 @@ type LinkProbe struct {
 	CheckedAt     time.Time `json:"checked_at"`
 }
 
+// TargetProbe measures the path from an egress Agent to a rule's landing host.
+// NodeID is included because managed failover may deploy one rule to several
+// exits at the same time.
+type TargetProbe struct {
+	RuleID       string    `json:"rule_id"`
+	NodeID       string    `json:"node_id"`
+	Address      string    `json:"address"`
+	Port         int       `json:"port"`
+	LatencyMS    float64   `json:"latency_ms"`
+	PacketLoss   float64   `json:"packet_loss"`
+	Success      bool      `json:"success"`
+	HasSucceeded bool      `json:"has_succeeded"`
+	FailureCount int       `json:"failure_count"`
+	SuccessCount int       `json:"success_count"`
+	CheckedAt    time.Time `json:"checked_at"`
+}
+
 type SyncRequest struct {
 	NodeID          string         `json:"node_id"`
 	AgentVersion    string         `json:"agent_version"`
@@ -142,6 +159,7 @@ type SyncRequest struct {
 	Network         NetworkInfo    `json:"network,omitempty"`
 	Traffic         []TrafficDelta `json:"traffic,omitempty"`
 	Probes          []LinkProbe    `json:"probes,omitempty"`
+	TargetProbes    []TargetProbe  `json:"target_probes,omitempty"`
 }
 
 type SyncResponse struct {

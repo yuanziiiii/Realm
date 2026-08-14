@@ -129,6 +129,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
 	mux.HandleFunc("GET /api/v1/traffic/rules", s.requireAdmin(s.ruleTraffic))
 	mux.HandleFunc("GET /api/v1/probes", s.requireAdmin(s.listProbes))
+	mux.HandleFunc("GET /api/v1/target-probes", s.requireAdmin(s.listTargetProbes))
 	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if s.webProxy != nil {
@@ -968,6 +969,15 @@ func (s *Server) listProbes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, nonNil(probes))
 }
 
+func (s *Server) listTargetProbes(w http.ResponseWriter, r *http.Request) {
+	probes, err := s.store.ListTargetProbes(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(probes))
+}
+
 func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	var req domain.SyncRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -1007,6 +1017,12 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Probes) > 0 {
 		if err := s.store.UpsertLinkProbes(r.Context(), req.NodeID, req.Probes); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if len(req.TargetProbes) > 0 {
+		if err := s.store.UpsertTargetProbes(r.Context(), req.NodeID, req.TargetProbes); err != nil {
 			writeError(w, 500, err)
 			return
 		}

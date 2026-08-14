@@ -56,6 +56,7 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 		"/api/v1/traffic?period=day",
 		"/api/v1/traffic/rules",
 		"/api/v1/probes",
+		"/api/v1/target-probes",
 	}
 	for _, path := range paths {
 		req, err := http.NewRequest(http.MethodGet, httpServer.URL+path, nil)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,11 +20,12 @@ import (
 var version = "dev"
 
 type state struct {
-	AppliedRevision int64              `json:"applied_revision"`
-	ApplyStatus     string             `json:"apply_status"`
-	ApplyError      string             `json:"apply_error"`
-	IngressRuleIDs  []string           `json:"ingress_rule_ids"`
-	Probes          []domain.LinkProbe `json:"probes,omitempty"`
+	AppliedRevision int64                `json:"applied_revision"`
+	ApplyStatus     string               `json:"apply_status"`
+	ApplyError      string               `json:"apply_error"`
+	IngressRuleIDs  []string             `json:"ingress_rule_ids"`
+	Probes          []domain.LinkProbe   `json:"probes,omitempty"`
+	TargetProbes    []domain.TargetProbe `json:"target_probes,omitempty"`
 }
 
 func main() {
@@ -75,11 +77,25 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 			}
 		}
 	}
-	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes})
+	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes, TargetProbes: st.TargetProbes})
 	if err != nil {
 		return err
 	}
-	st.Probes = agent.ProbeLinks(ctx, resp.Node, resp.ProbeTargets)
+	var linkProbes []domain.LinkProbe
+	var targetProbes []domain.TargetProbe
+	var probeWG sync.WaitGroup
+	probeWG.Add(2)
+	go func() {
+		defer probeWG.Done()
+		linkProbes = agent.ProbeLinks(ctx, resp.Node, resp.ProbeTargets)
+	}()
+	go func() {
+		defer probeWG.Done()
+		targetProbes = agent.ProbeRuleTargets(ctx, resp.Node, resp.Deployments)
+	}()
+	probeWG.Wait()
+	st.Probes = linkProbes
+	st.TargetProbes = targetProbes
 	if resp.Revision == st.AppliedRevision && st.ApplyStatus == "normal" && executor.Healthy(ctx) {
 		return nil
 	}

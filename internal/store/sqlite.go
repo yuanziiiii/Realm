@@ -83,6 +83,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			UNIQUE(ingress_node_id, listen_port, protocol),
 			UNIQUE(egress_node_id, relay_port, protocol)
 		)`,
+		`CREATE TABLE IF NOT EXISTS target_probes (
+			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			address TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0,
+			latency_ms REAL NOT NULL DEFAULT 0, packet_loss REAL NOT NULL DEFAULT 100,
+			success INTEGER NOT NULL DEFAULT 0, has_succeeded INTEGER NOT NULL DEFAULT 0,
+			failure_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
+			checked_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(rule_id, node_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS traffic_minute (
 			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
 			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -115,6 +125,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_rules_nodes ON forward_rules(ingress_node_id, egress_node_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_lines_nodes ON lines(ingress_node_id, egress_node_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_probes_checked ON link_probes(checked_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_target_probes_checked ON target_probes(checked_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_rules_line ON forward_rules(line_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic_minute(bucket)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_daily_bucket ON traffic_daily(bucket)`,
@@ -324,13 +335,33 @@ func (s *Store) GetNode(ctx context.Context, id string) (domain.Node, string, er
 }
 
 func (s *Store) UpdateNode(ctx context.Context, n domain.Node) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.ID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.ID)
 	if err != nil {
 		return err
 	}
 	count, _ := res.RowsAffected()
 	if count == 0 {
 		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM link_probes WHERE ingress_node_id=? OR egress_node_id=?`, n.ID, n.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM target_probes WHERE node_id=?`, n.ID); err != nil {
+		return err
+	}
+	// Interface and address changes alter rendered nftables, Realm and tc
+	// configuration. Bump the global revision so every affected Agent
+	// reconciles immediately instead of keeping a healthy but stale plan.
+	if _, err := s.bumpRevision(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.audit(ctx, "update", "node", n.ID, n.Name)
 	return nil
@@ -597,6 +628,11 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	if err != nil {
 		return r, err
 	}
+	// Any rule edit may change the destination or active deployment. Do not
+	// display a latency result measured against the previous configuration.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM target_probes WHERE rule_id=?`, r.ID); err != nil {
+		return r, err
+	}
 	if err = tx.Commit(); err != nil {
 		return r, err
 	}
@@ -757,6 +793,79 @@ func (s *Store) ListLinkProbes(ctx context.Context) ([]domain.LinkProbe, error) 
 		var success, hasSucceeded int
 		var checkedAt int64
 		if err := rows.Scan(&probe.IngressNodeID, &probe.EgressNodeID, &probe.Address, &probe.LatencyMS, &probe.PacketLoss, &success, &hasSucceeded, &probe.FailureCount, &probe.SuccessCount, &checkedAt); err != nil {
+			return nil, err
+		}
+		probe.Success = success == 1
+		probe.HasSucceeded = hasSucceeded == 1
+		probe.CheckedAt = fromUnix(checkedAt)
+		probes = append(probes, probe)
+	}
+	return probes, rows.Err()
+}
+
+func (s *Store) UpsertTargetProbes(ctx context.Context, nodeID string, probes []domain.TargetProbe) error {
+	deployments, err := s.DeploymentsForNode(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	allowed := make(map[string]domain.ForwardRule, len(deployments))
+	for _, deployment := range deployments {
+		if deployment.Role == domain.NodeRoleEgress || deployment.Role == domain.NodeRoleBoth {
+			allowed[deployment.Rule.ID] = deployment.Rule
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, probe := range probes {
+		rule, ok := allowed[probe.RuleID]
+		if !ok || probe.Address != rule.TargetHost || probe.Port != rule.TargetPort || probe.PacketLoss < 0 || probe.PacketLoss > 100 || probe.LatencyMS < 0 {
+			continue
+		}
+		// Reject delayed results for a previous rule destination. Values written
+		// to the database still come from the controller-owned rule.
+		probe.NodeID = nodeID
+		probe.Address = rule.TargetHost
+		probe.Port = rule.TargetPort
+		var failures, successes, hasSucceeded int
+		err = tx.QueryRowContext(ctx, `SELECT failure_count,success_count,has_succeeded FROM target_probes WHERE rule_id=? AND node_id=?`, probe.RuleID, nodeID).Scan(&failures, &successes, &hasSucceeded)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if probe.Success && probe.PacketLoss < 100 {
+			failures = 0
+			successes++
+			hasSucceeded = 1
+		} else {
+			failures++
+			successes = 0
+		}
+		checkedAt := probe.CheckedAt
+		if checkedAt.IsZero() {
+			checkedAt = time.Now().UTC()
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO target_probes(rule_id,node_id,address,port,latency_ms,packet_loss,success,has_succeeded,failure_count,success_count,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id) DO UPDATE SET address=excluded.address,port=excluded.port,latency_ms=excluded.latency_ms,packet_loss=excluded.packet_loss,success=excluded.success,has_succeeded=excluded.has_succeeded,failure_count=excluded.failure_count,success_count=excluded.success_count,checked_at=excluded.checked_at`, probe.RuleID, nodeID, probe.Address, probe.Port, probe.LatencyMS, probe.PacketLoss, boolInt(probe.Success), hasSucceeded, failures, successes, unix(checkedAt))
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListTargetProbes(ctx context.Context) ([]domain.TargetProbe, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT rule_id,node_id,address,port,latency_ms,packet_loss,success,has_succeeded,failure_count,success_count,checked_at FROM target_probes ORDER BY rule_id,node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var probes []domain.TargetProbe
+	for rows.Next() {
+		var probe domain.TargetProbe
+		var success, hasSucceeded int
+		var checkedAt int64
+		if err := rows.Scan(&probe.RuleID, &probe.NodeID, &probe.Address, &probe.Port, &probe.LatencyMS, &probe.PacketLoss, &success, &hasSucceeded, &probe.FailureCount, &probe.SuccessCount, &checkedAt); err != nil {
 			return nil, err
 		}
 		probe.Success = success == 1

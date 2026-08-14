@@ -135,6 +135,66 @@ func TestHeartbeatAutoFillsBlankNetworkWithoutOverwritingManualValues(t *testing
 	}
 }
 
+func TestUpdateNodeBumpsRevisionForRuleReconciliation(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	node := domain.Node{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PublicInterface: "eth0", PrivateInterface: "wg0", CreatedAt: time.Now().UTC()}
+	if err := st.CreateNode(ctx, node, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.PrivateAddress = "199.30.90.7"
+	node.PrivateInterface = "eth0"
+	if err := st.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	after, err := st.Revision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before+1 {
+		t.Fatalf("node network update must bump revision: before=%d after=%d", before, after)
+	}
+}
+
+func TestTargetProbesAreStoredForEgressDeployments(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	node := domain.Node{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}
+	if err := st.CreateNode(ctx, node, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.SaveRule(ctx, domain.ForwardRule{ID: "rule", Mode: domain.ForwardModeExitOnly, Name: "落地", Protocol: "tcp", IngressNodeID: "out", EgressNodeID: "out", ListenAddress: "199.30.90.7", ListenPort: 1301, RelayPort: 1301, TargetHost: "38.49.57.74", TargetPort: 36666, Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertTargetProbes(ctx, "out", []domain.TargetProbe{{RuleID: "rule", Address: "38.49.57.74", Port: 36666, LatencyMS: 18.4, PacketLoss: 0, Success: true, CheckedAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertTargetProbes(ctx, "out", []domain.TargetProbe{{RuleID: "rule", Address: "old-target.example", Port: 1, LatencyMS: 1, PacketLoss: 0, Success: true, CheckedAt: now.Add(time.Second)}}); err != nil {
+		t.Fatal(err)
+	}
+	probes, err := st.ListTargetProbes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(probes) != 1 || probes[0].RuleID != "rule" || probes[0].NodeID != "out" || probes[0].Address != "38.49.57.74" || probes[0].Port != 36666 || probes[0].LatencyMS != 18.4 || !probes[0].HasSucceeded {
+		t.Fatalf("unexpected stored target probe: %+v", probes)
+	}
+}
+
 func TestHeartbeatExposesApplyFailureToThePanel(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
