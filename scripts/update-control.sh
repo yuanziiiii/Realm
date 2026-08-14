@@ -2,8 +2,10 @@
 set -euo pipefail
 
 repo="${RELAY_PANEL_REPO:-yuanziiiii/Realm}"
-version="${RELAY_PANEL_VERSION:-latest}"
+requested_version="${RELAY_PANEL_VERSION:-latest}"
 install_dir="${RELAY_PANEL_INSTALL_DIR:-/opt/relay-panel}"
+version_file="${install_dir}/.relay-panel-version"
+force_update="${RELAY_PANEL_FORCE_UPDATE:-0}"
 
 say() { printf '[Relay Panel] %s\n' "$*"; }
 fail() { printf '[Relay Panel] 错误：%s\n' "$*" >&2; exit 1; }
@@ -22,36 +24,33 @@ case "$(uname -m)" in
   *) fail "暂不支持的 CPU 架构：$(uname -m)" ;;
 esac
 
-if [[ "${version}" == "latest" ]]; then
-  download_base="https://github.com/${repo}/releases/latest/download"
-else
-  download_base="https://github.com/${repo}/releases/download/${version}"
-fi
-
-ensure_build_swap() {
-  local memory_kb swap_kb swap_dir swap_file
-  memory_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-  swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
-  if (( memory_kb >= 1572864 || swap_kb >= 1572864 )); then
-    return
-  fi
-  swap_dir="/var/lib/relay-panel"
-  swap_file="${swap_dir}/build.swap"
-  say "检测到内存不足 1.5 GB，准备 2 GB 构建交换空间"
-  mkdir -p "${swap_dir}"
-  if [[ ! -f "${swap_file}" ]]; then
-    if command -v fallocate >/dev/null 2>&1; then
-      fallocate -l 2G "${swap_file}"
-    else
-      dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none
-    fi
-    chmod 600 "${swap_file}"
-    mkswap "${swap_file}" >/dev/null
-  fi
-  swapon "${swap_file}" 2>/dev/null || true
-  grep -Fq "${swap_file} none swap sw 0 0" /etc/fstab || printf '%s\n' "${swap_file} none swap sw 0 0" >> /etc/fstab
+resolve_latest_version() {
+  local effective
+  effective="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"
+  [[ "${effective}" == */tag/* ]] || fail "无法识别 GitHub 最新版本"
+  printf '%s\n' "${effective##*/}"
 }
 
+if [[ "${requested_version}" == "latest" ]]; then
+  target_version="$(resolve_latest_version)"
+else
+  target_version="${requested_version}"
+  [[ "${target_version}" == v* ]] || target_version="v${target_version}"
+fi
+[[ "${target_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || fail "无效的目标版本：${target_version}"
+
+current_version="未知"
+if [[ -s "${version_file}" ]]; then
+  current_version="$(tr -d '[:space:]' < "${version_file}")"
+fi
+say "当前版本：${current_version}"
+say "目标版本：${target_version}"
+if [[ "${current_version}" == "${target_version}" && "${force_update}" != "1" ]]; then
+  say "已经是最新版本，无需下载镜像或重建容器"
+  exit 0
+fi
+
+download_base="https://github.com/${repo}/releases/download/${target_version}"
 control_id="$(docker compose --project-directory "${install_dir}" ps -aq control)"
 web_id="$(docker compose --project-directory "${install_dir}" ps -aq web)"
 [[ -n "${control_id}" && -n "${web_id}" ]] || fail "没有找到 control 或 web 容器"
@@ -62,11 +61,10 @@ old_web_image_id="$(docker image inspect --format '{{.Id}}' "${web_image_ref}")"
 [[ -n "${old_control_image_id}" && -n "${old_web_image_id}" ]] || fail "无法识别当前镜像版本"
 
 tmp_dir="$(mktemp -d)"
-candidate_suffix="$(date +%s)-$$"
-candidate_control="relay-panel-control-update:${candidate_suffix}"
-candidate_web="relay-panel-web-update:${candidate_suffix}"
+release_control="relay-panel-control-release:${target_version}-${control_arch}"
+release_web="relay-panel-web-release:${target_version}-${control_arch}"
 cleanup() {
-  docker image rm "${candidate_control}" "${candidate_web}" >/dev/null 2>&1 || true
+  docker image rm "${release_control}" "${release_web}" >/dev/null 2>&1 || true
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
@@ -89,48 +87,32 @@ download_optional_checked() {
   [[ -n "${expected}" && "${actual}" == "${expected}" ]] || fail "${name} 的 SHA-256 校验失败"
 }
 
-binary_name="relay-control-linux-${control_arch}"
-say "下载并校验控制端、网页端完整更新包"
-download_checked "${binary_name}" "${tmp_dir}/relay-control"
+say "发现新版本，下载 GitHub 已预构建的 ${control_arch} 镜像"
+download_checked "relay-panel-web-linux-${control_arch}.tar.gz" "${tmp_dir}/web-image.tar.gz"
+download_checked "relay-panel-control-linux-${control_arch}.tar.gz" "${tmp_dir}/control-image.tar.gz"
 download_checked "relay-panel-source.tar.gz" "${tmp_dir}/source.tar.gz"
 zf_available=false
 if download_optional_checked "zf.sh" "${tmp_dir}/zf"; then
   chmod 0755 "${tmp_dir}/zf"
   zf_available=true
 fi
-chmod 0755 "${tmp_dir}/relay-control"
-mkdir -p "${tmp_dir}/source"
-tar -xzf "${tmp_dir}/source.tar.gz" -C "${tmp_dir}/source"
 
-cat > "${tmp_dir}/Dockerfile.control" <<'EOF'
-FROM alpine:3.22
-RUN apk add --no-cache ca-certificates tzdata \
-    && addgroup -S relay \
-    && adduser -S -G relay relay \
-    && mkdir -p /data \
-    && chown relay:relay /data
-COPY relay-control /usr/local/bin/relay-control
-USER relay
-VOLUME ["/data"]
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/relay-control"]
-EOF
+say "载入预构建镜像（服务器不再执行 npm 或 Go 编译）"
+docker load --input "${tmp_dir}/web-image.tar.gz" >/dev/null
+docker load --input "${tmp_dir}/control-image.tar.gz" >/dev/null
+docker image inspect "${release_web}" >/dev/null 2>&1 || fail "网页端预构建镜像名称不匹配"
+docker image inspect "${release_control}" >/dev/null 2>&1 || fail "控制端预构建镜像名称不匹配"
+docker tag "${release_web}" "${web_image_ref}"
+docker tag "${release_control}" "${control_image_ref}"
 
-ensure_build_swap
-say "构建网页端（1C1G 会使用交换空间，通常需要约 1 分钟）"
-COMPOSE_PARALLEL_LIMIT=1 docker build --tag "${candidate_web}" --file "${tmp_dir}/source/Dockerfile.web" "${tmp_dir}/source"
-say "构建轻量控制端"
-docker build --quiet --tag "${candidate_control}" --file "${tmp_dir}/Dockerfile.control" "${tmp_dir}" >/dev/null
-
-docker tag "${candidate_web}" "${web_image_ref}"
-docker tag "${candidate_control}" "${control_image_ref}"
-say "重建 web 与 control 容器"
+say "仅重建 web 与 control 容器，数据库和配置保持不变"
 if ! docker compose --project-directory "${install_dir}" up -d --no-deps --no-build --force-recreate web control >/dev/null; then
   docker tag "${old_web_image_id}" "${web_image_ref}"
   docker tag "${old_control_image_id}" "${control_image_ref}"
   docker compose --project-directory "${install_dir}" up -d --no-deps --no-build --force-recreate web control >/dev/null 2>&1 || true
   fail "容器重建失败，已恢复旧版网页端和控制端"
 fi
+
 healthy=false
 new_control_id=""
 new_web_id=""
@@ -149,15 +131,18 @@ for _ in {1..10}; do
 done
 
 if [[ "${healthy}" == "true" ]]; then
-  # Keep deployment files in sync for the next update while preserving .env
-  # and the named database volume.
+  mkdir -p "${tmp_dir}/source"
+  tar -xzf "${tmp_dir}/source.tar.gz" -C "${tmp_dir}/source"
   tar -C "${tmp_dir}/source" -cf - . | tar -C "${install_dir}" -xf -
+  printf '%s\n' "${target_version}" > "${version_file}"
   if [[ "${zf_available}" == true ]]; then
     install -m 0755 "${tmp_dir}/zf" /usr/local/bin/zf
   fi
-  say "完整更新完成：网页端、控制端、数据库兼容层均已更新"
-  say "管理员密码、HTTPS 反代配置和数据库均未改动"
-  [[ "${zf_available}" == true ]] && say "SSH 管理工具已更新，输入 zf 即可使用"
+  [[ "${old_web_image_id}" == "$(docker image inspect --format '{{.Id}}' "${web_image_ref}")" ]] || docker image rm "${old_web_image_id}" >/dev/null 2>&1 || true
+  [[ "${old_control_image_id}" == "$(docker image inspect --format '{{.Id}}' "${control_image_ref}")" ]] || docker image rm "${old_control_image_id}" >/dev/null 2>&1 || true
+  say "增量更新完成：${current_version} → ${target_version}"
+  say "本次未在服务器编译源码；管理员密码、HTTPS 反代和数据库均未改动"
+  [[ "${zf_available}" == true ]] && say "SSH 管理工具已同步更新"
   exit 0
 fi
 

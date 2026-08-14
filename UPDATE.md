@@ -18,7 +18,13 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.s
 - 服务器、线路和转发规则
 - Agent Token 与节点关系
 
-更新器会校验下载文件，构建候选镜像并检查网页端和控制端健康状态。新版启动失败时会自动恢复原镜像。
+更新器先读取 `/opt/relay-panel/.relay-panel-version`，再解析 GitHub 最新稳定版：
+
+- 版本相同：立即结束，不下载镜像、不停止服务、不重建容器
+- 发现新版本：下载与服务器 CPU 架构匹配的预构建镜像，不在服务器执行 `npm install`、前端构建或 Go 编译
+- 旧安装没有版本文件：执行一次正常更新并自动补写版本，之后即可快速比较
+
+所有下载文件都进行 SHA-256 校验。载入镜像后只重建 `web` 和 `control` 两个容器并运行健康检查；新版启动失败时会自动恢复原镜像。
 
 更新完成后会同时安装或刷新 `/usr/local/bin/zf`。以后登录主控 SSH，直接输入 `zf` 即可通过交互菜单完成更新、启停、日志检查、健康检查和密码重置。
 
@@ -46,3 +52,10 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.s
 ```
 
 数据库会自动迁移。升级前仍建议备份控制端容器挂载到 `/data` 的 Docker volume。
+
+排障时如需强制重新载入当前版本，可显式使用：
+
+```bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh \
+  | sudo env RELAY_PANEL_FORCE_UPDATE=1 bash
+```

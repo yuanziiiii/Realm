@@ -77,11 +77,14 @@ has_agent() {
 compose() { docker compose --project-directory "${install_dir}" "$@"; }
 
 control_status() {
+  local current_version
+  current_version="$(tr -d '[:space:]' < "${install_dir}/.relay-panel-version" 2>/dev/null || true)"
   say "主控安装目录：${install_dir}"
+  say "当前版本：${current_version:-未记录（首次更新后自动记录）}"
   compose ps || true
 }
 control_update() {
-  confirm '确认在线更新主控？数据库和配置会保留' || return 0
+  say '检测本机版本与 GitHub 最新稳定版'
   run_release_script update.sh
 }
 control_restart() { say '重启网页端与控制端'; compose restart web control; }
@@ -126,12 +129,13 @@ control_password() {
   run_release_script reset-admin-password.sh
 }
 control_info() {
-  local http_port host_ip secure
+  local http_port host_ip secure current_version
   http_port="$(awk -F= '$1=="RELAY_HTTP_PORT" {print $2}' "${install_dir}/.env" 2>/dev/null | tail -n 1)"
   secure="$(awk -F= '$1=="RELAY_SECURE_COOKIES" {print $2}' "${install_dir}/.env" 2>/dev/null | tail -n 1)"
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  printf '安装目录：%s\n本机访问：http://%s:%s\n安全 Cookie：%s\n数据位置：Docker volume（relay-panel.db）\n' \
-    "${install_dir}" "${host_ip:-服务器IP}" "${http_port:-8080}" "${secure:-false}"
+  current_version="$(tr -d '[:space:]' < "${install_dir}/.relay-panel-version" 2>/dev/null || true)"
+  printf '当前版本：%s\n安装目录：%s\n本机访问：http://%s:%s\n安全 Cookie：%s\n数据位置：Docker volume（relay-panel.db）\n' \
+    "${current_version:-未记录}" "${install_dir}" "${host_ip:-服务器IP}" "${http_port:-8080}" "${secure:-false}"
   warn 'HTTPS 域名由你的 1Panel、宝塔或其他反向代理管理，zf 不会覆盖反代配置。'
 }
 
@@ -216,7 +220,7 @@ control_menu() {
   local choice
   while true; do
     clear_screen; print_header '主控端'
-    printf ' %b1.%b 查看主控状态\n %b2.%b 在线更新主控\n %b3.%b 重启主控\n %b4.%b 启动主控\n %b5.%b 停止主控\n %b6.%b 查看主控日志\n %b7.%b 运行健康检查\n %b8.%b 重置管理员密码\n %b9.%b 显示访问配置\n %b0.%b 退出\n\n请选择：' \
+    printf ' %b1.%b 查看主控状态\n %b2.%b 检测并更新主控\n %b3.%b 重启主控\n %b4.%b 启动主控\n %b5.%b 停止主控\n %b6.%b 查看主控日志\n %b7.%b 运行健康检查\n %b8.%b 重置管理员密码\n %b9.%b 显示访问配置\n %b0.%b 退出\n\n请选择：' \
       "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" \
       "${green}" "${reset}" "${green}" "${reset}" "${yellow}" "${reset}" "${green}" "${reset}" "${cyan}" "${reset}" > /dev/tty
     IFS= read -r choice < /dev/tty || break

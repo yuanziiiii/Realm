@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,7 +16,16 @@ import (
 	"relaypanel/internal/store"
 )
 
+// version is replaced by release builds through -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
+	showVersion := flag.Bool("version", false, "print controller version")
+	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 	dbPath := env("RELAY_DB_PATH", "relay-panel.db")

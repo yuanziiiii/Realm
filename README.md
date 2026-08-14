@@ -92,7 +92,7 @@ sudo docker compose --project-directory /opt/relay-panel up -d
 
 ### 更新控制端
 
-更新命令会同时更新网页端和 Go 控制端，不修改数据库、登录密码、端口或 HTTPS 反代配置。更新器先构建候选镜像并做健康检查，失败时会同时恢复旧网页端与旧控制端：
+更新命令会先比较本机记录版本与 GitHub 最新稳定版；版本相同时直接退出，不下载大文件，也不重建容器。发现新版本后会下载 GitHub Release 已预构建的对应 CPU 架构镜像，同时更新网页端和 Go 控制端，不修改数据库、登录密码、端口或 HTTPS 反代配置。更新器会做健康检查，失败时同时恢复旧网页端与旧控制端：
 
 ```bash
 curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh | sudo bash
@@ -100,7 +100,7 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.s
 
 全新安装与在线更新已经分开；已经部署过主控后只需执行上述更新命令，不要重新运行安装脚本。完整说明见 [UPDATE.md](UPDATE.md)。面板“系统设置”页面也会固定显示并提供复制这条更新命令。
 
-网页端需要在本机完成一次 Docker 构建；1C1G 机器会自动复用安装时创建的交换空间，通常约 1 分钟。这样从旧版本升级后，页面修复也会真正生效，不会再出现“后端已更新、浏览器还是旧页面”的情况。
+从支持增量更新的版本开始，更新时不再在服务器执行 `npm install`、前端构建或 Go 编译，只载入预构建镜像并短暂重建两个容器。没有本地版本记录的安装第一次使用新更新器时，会正常更新一次并写入 `/opt/relay-panel/.relay-panel-version`；以后再次检查相同版本会立即结束。预构建镜像的下载量会大于源码包，但能显著降低服务器的 CPU、内存和 Swap 峰值，临时下载文件会在结束时自动清理。
 
 ### 忘记或重置管理员密码
 
@@ -126,7 +126,7 @@ zf
 
 1 核 1 GB 可以运行个人面板。实机中控制端与网页端两个容器空闲时合计约 140 MB，实际占用会随规则数量和访问量变化。
 
-源码构建需要更多瞬时内存。安装器和完整更新器在物理内存低于 1.5 GB 且现有 Swap 不足时，会创建持久化的 2 GB `/var/lib/relay-panel/build.swap`，并串行构建网页端。该 Swap 主要用于安装和以后更新，不代表面板运行需要 2 GB 内存。
+只有全新安装和手工源码构建需要更多瞬时内存。安装器在物理内存低于 1.5 GB 且现有 Swap 不足时，会创建持久化的 2 GB `/var/lib/relay-panel/build.swap` 并串行构建。日后的在线更新直接载入 Release 预构建镜像，不再使用这块 Swap 进行编译。
 
 ### 手工安装
 
