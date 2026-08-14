@@ -44,19 +44,23 @@ type ForwardRule struct {
 	RelayPort     int         `json:"relay_port"`
 	TargetHost    string      `json:"target_host"`
 	TargetPort    int         `json:"target_port"`
-	Engine        string      `json:"engine"`
-	UploadMbps    int         `json:"upload_mbps"`
-	DownloadMbps  int         `json:"download_mbps"`
-	BurstKBytes   int         `json:"burst_kbytes"`
-	Enabled       bool        `json:"enabled"`
-	Revision      int64       `json:"revision"`
-	CreatedAt     time.Time   `json:"created_at"`
-	UpdatedAt     time.Time   `json:"updated_at"`
+	// Engine is retained as a compatibility field for older Agents and API
+	// clients. The controller rewrites it to the engine for each deployment.
+	Engine        string    `json:"engine"`
+	IngressEngine string    `json:"ingress_engine"`
+	EgressEngine  string    `json:"egress_engine"`
+	UploadMbps    int       `json:"upload_mbps"`
+	DownloadMbps  int       `json:"download_mbps"`
+	BurstKBytes   int       `json:"burst_kbytes"`
+	Enabled       bool      `json:"enabled"`
+	Revision      int64     `json:"revision"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // Line keeps the stable network topology separate from individual port rules.
-// A user chooses the servers and forwarding engine once on a line, then every
-// rule on that line only needs a listen port and destination.
+// A user chooses the servers and per-hop forwarding engines once on a line,
+// then every rule on that line only needs a listen port and destination.
 type Line struct {
 	ID                 string      `json:"id"`
 	Name               string      `json:"name"`
@@ -68,10 +72,55 @@ type Line struct {
 	FailoverEnabled    bool        `json:"failover_enabled"`
 	ListenAddress      string      `json:"listen_address"`
 	RelayPortRange     string      `json:"relay_port_range"`
-	Engine             string      `json:"engine"`
-	Enabled            bool        `json:"enabled"`
-	CreatedAt          time.Time   `json:"created_at"`
-	UpdatedAt          time.Time   `json:"updated_at"`
+	// Engine mirrors EgressEngine for compatibility with older clients.
+	Engine        string    `json:"engine"`
+	IngressEngine string    `json:"ingress_engine"`
+	EgressEngine  string    `json:"egress_engine"`
+	Enabled       bool      `json:"enabled"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func NormalizeEngines(legacy, ingress, egress string, mode ForwardMode) (string, string, string) {
+	legacyProvided := legacy != ""
+	if legacy == "" {
+		legacy = "nftables"
+	}
+	// An older client may read a new response, keep the unknown split fields,
+	// and only edit Engine. When both split values still match, treat that as a
+	// deliberate legacy update of the whole line.
+	if legacyProvided && ingress != "" && ingress == egress && legacy != egress {
+		ingress = legacy
+		egress = legacy
+	}
+	if ingress == "" {
+		ingress = legacy
+	}
+	if egress == "" {
+		egress = legacy
+	}
+	if mode == ForwardModeExitOnly {
+		ingress = egress
+	}
+	return egress, ingress, egress
+}
+
+func (line *Line) NormalizeEngines() {
+	line.Engine, line.IngressEngine, line.EgressEngine = NormalizeEngines(line.Engine, line.IngressEngine, line.EgressEngine, line.Mode)
+}
+
+func (rule *ForwardRule) NormalizeEngines() {
+	rule.Engine, rule.IngressEngine, rule.EgressEngine = NormalizeEngines(rule.Engine, rule.IngressEngine, rule.EgressEngine, rule.Mode)
+}
+
+// EngineForRole makes a mixed-engine line compatible with Agents that only
+// know the legacy Rule.Engine field.
+func (rule ForwardRule) EngineForRole(role NodeRole) string {
+	rule.NormalizeEngines()
+	if rule.Mode != ForwardModeExitOnly && role != NodeRoleEgress {
+		return rule.IngressEngine
+	}
+	return rule.EgressEngine
 }
 
 type Deployment struct {

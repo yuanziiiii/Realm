@@ -38,6 +38,111 @@ func TestSummarySupportsFreshEmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestDeploymentsUseIndependentIngressAndEgressEngines(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	combinations := []struct {
+		name, ingress, egress string
+	}{
+		{"nft-nft", "nftables", "nftables"},
+		{"nft-realm", "nftables", "realm"},
+		{"realm-nft", "realm", "nftables"},
+		{"realm-realm", "realm", "realm"},
+	}
+	for i, combination := range combinations {
+		_, err := st.SaveRule(ctx, domain.ForwardRule{
+			ID: combination.name, Mode: domain.ForwardModeDualManaged, Name: combination.name,
+			Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0",
+			ListenPort: 10000 + i, RelayPort: 30000 + i, TargetHost: "192.0.2.2", TargetPort: 80,
+			IngressEngine: combination.ingress, EgressEngine: combination.egress, Enabled: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, combination := range combinations {
+		for _, expected := range []struct {
+			nodeID, engine string
+		}{{"in", combination.ingress}, {"out", combination.egress}} {
+			deployments, err := st.DeploymentsForNode(ctx, expected.nodeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, deployment := range deployments {
+				if deployment.Rule.ID == combination.name {
+					found = true
+					if deployment.Rule.Engine != expected.engine {
+						t.Fatalf("%s on %s: expected %s, got %s", combination.name, expected.nodeID, expected.engine, deployment.Rule.Engine)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("deployment %s was not sent to %s", combination.name, expected.nodeID)
+			}
+		}
+	}
+}
+
+func TestMigrationBackfillsLegacySingleEngine(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now},
+		{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "旧线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", Engine: "realm", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", LineID: "line", Mode: domain.ForwardModeDualManaged, Name: "旧规则", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenPort: 10000, RelayPort: 30000, TargetHost: "origin.example.com", TargetPort: 443, Engine: "realm", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE lines SET ingress_engine='',egress_engine='' WHERE id='line'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE forward_rules SET ingress_engine='',egress_engine='' WHERE id='rule'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	line, err := st.GetLine(ctx, "line")
+	if err != nil || line.IngressEngine != "realm" || line.EgressEngine != "realm" {
+		t.Fatalf("legacy line engine was not backfilled: %+v, %v", line, err)
+	}
+	rule, err := st.GetRule(ctx, "rule")
+	if err != nil || rule.IngressEngine != "realm" || rule.EgressEngine != "realm" {
+		t.Fatalf("legacy rule engine was not backfilled: %+v, %v", rule, err)
+	}
+}
+
 func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

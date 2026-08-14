@@ -268,6 +268,16 @@ func TestValidateRuleRejectsHostnameForNFTablesButAllowsRealm(t *testing.T) {
 	if err := validateRule(rule); err != nil {
 		t.Fatalf("Realm should allow a hostname target: %v", err)
 	}
+	rule.IngressEngine = "nftables"
+	rule.EgressEngine = "realm"
+	if err := validateRule(rule); err != nil {
+		t.Fatalf("target validation must use the Realm egress engine: %v", err)
+	}
+	rule.IngressEngine = "realm"
+	rule.EgressEngine = "nftables"
+	if err := validateRule(rule); err == nil {
+		t.Fatal("nftables egress must reject a hostname even when ingress uses Realm")
+	}
 }
 
 func TestCompleteSimpleRuleSelectsNodesAndRelayPort(t *testing.T) {

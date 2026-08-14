@@ -56,7 +56,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			ingress_node_id TEXT NOT NULL REFERENCES nodes(id),
 			egress_node_id TEXT NOT NULL REFERENCES nodes(id),
 			listen_address TEXT NOT NULL DEFAULT '', relay_port_range TEXT NOT NULL DEFAULT '',
-			engine TEXT NOT NULL DEFAULT 'nftables', egress_node_ids TEXT NOT NULL DEFAULT '[]',
+			engine TEXT NOT NULL DEFAULT 'nftables', ingress_engine TEXT NOT NULL DEFAULT '',
+			egress_engine TEXT NOT NULL DEFAULT '', egress_node_ids TEXT NOT NULL DEFAULT '[]',
 			active_egress_node_id TEXT NOT NULL DEFAULT '', failover_enabled INTEGER NOT NULL DEFAULT 0,
 			enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 		)`,
@@ -76,7 +77,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			egress_node_id TEXT NOT NULL REFERENCES nodes(id),
 			listen_address TEXT NOT NULL DEFAULT '0.0.0.0', listen_port INTEGER NOT NULL,
 			relay_port INTEGER NOT NULL, target_host TEXT NOT NULL, target_port INTEGER NOT NULL,
-			engine TEXT NOT NULL DEFAULT 'nftables', upload_mbps INTEGER NOT NULL DEFAULT 0,
+			engine TEXT NOT NULL DEFAULT 'nftables', ingress_engine TEXT NOT NULL DEFAULT '',
+			egress_engine TEXT NOT NULL DEFAULT '', upload_mbps INTEGER NOT NULL DEFAULT 0,
 			download_mbps INTEGER NOT NULL DEFAULT 0, burst_kbytes INTEGER NOT NULL DEFAULT 512,
 			enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL,
 			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -141,7 +143,19 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "forward_rules", "line_id", `ALTER TABLE forward_rules ADD COLUMN line_id TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "forward_rules", "ingress_engine", `ALTER TABLE forward_rules ADD COLUMN ingress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "forward_rules", "egress_engine", `ALTER TABLE forward_rules ADD COLUMN egress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "lines", "relay_port_range", `ALTER TABLE lines ADD COLUMN relay_port_range TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "lines", "ingress_engine", `ALTER TABLE lines ADD COLUMN ingress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "lines", "egress_engine", `ALTER TABLE lines ADD COLUMN egress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "lines", "egress_node_ids", `ALTER TABLE lines ADD COLUMN egress_node_ids TEXT NOT NULL DEFAULT '[]'`); err != nil {
@@ -155,6 +169,20 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "link_probes", "has_succeeded", `ALTER TABLE link_probes ADD COLUMN has_succeeded INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
+	}
+	// Older releases stored a single engine. Preserve its exact value when the
+	// two per-hop columns are introduced.
+	if _, err := s.db.ExecContext(ctx, `UPDATE lines SET ingress_engine=engine WHERE ingress_engine=''`); err != nil {
+		return fmt.Errorf("backfill line ingress engine: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE lines SET egress_engine=engine WHERE egress_engine=''`); err != nil {
+		return fmt.Errorf("backfill line egress engine: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE forward_rules SET ingress_engine=engine WHERE ingress_engine=''`); err != nil {
+		return fmt.Errorf("backfill rule ingress engine: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE forward_rules SET egress_engine=engine WHERE egress_engine=''`); err != nil {
+		return fmt.Errorf("backfill rule egress engine: %w", err)
 	}
 	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key, value) VALUES ('revision', '1')`)
 	var dailyTimezone string
@@ -432,19 +460,20 @@ func scanLine(scanner interface{ Scan(...any) error }) (domain.Line, error) {
 	var egressJSON string
 	var failover, enabled int
 	var created, updated int64
-	err := scanner.Scan(&line.ID, &line.Name, &line.Mode, &line.IngressNodeID, &line.EgressNodeID, &line.ListenAddress, &line.RelayPortRange, &line.Engine, &egressJSON, &line.ActiveEgressNodeID, &failover, &enabled, &created, &updated)
+	err := scanner.Scan(&line.ID, &line.Name, &line.Mode, &line.IngressNodeID, &line.EgressNodeID, &line.ListenAddress, &line.RelayPortRange, &line.Engine, &line.IngressEngine, &line.EgressEngine, &egressJSON, &line.ActiveEgressNodeID, &failover, &enabled, &created, &updated)
 	if err == nil && egressJSON != "" {
 		_ = json.Unmarshal([]byte(egressJSON), &line.EgressNodeIDs)
 	}
 	line.FailoverEnabled = failover == 1
 	normalizeLineEgresses(&line)
+	line.NormalizeEngines()
 	line.Enabled = enabled == 1
 	line.CreatedAt = fromUnix(created)
 	line.UpdatedAt = fromUnix(updated)
 	return line, err
 }
 
-const lineColumns = `id,name,mode,ingress_node_id,egress_node_id,listen_address,relay_port_range,engine,egress_node_ids,active_egress_node_id,failover_enabled,enabled,created_at,updated_at`
+const lineColumns = `id,name,mode,ingress_node_id,egress_node_id,listen_address,relay_port_range,engine,ingress_engine,egress_engine,egress_node_ids,active_egress_node_id,failover_enabled,enabled,created_at,updated_at`
 
 func normalizeLineEgresses(line *domain.Line) {
 	seen := map[string]bool{}
@@ -467,8 +496,9 @@ func normalizeLineEgresses(line *domain.Line) {
 
 func lineArgs(line domain.Line) []any {
 	normalizeLineEgresses(&line)
+	line.NormalizeEngines()
 	egressJSON, _ := json.Marshal(line.EgressNodeIDs)
-	return []any{line.ID, line.Name, line.Mode, line.IngressNodeID, line.EgressNodeID, line.ListenAddress, line.RelayPortRange, line.Engine, string(egressJSON), line.ActiveEgressNodeID, boolInt(line.FailoverEnabled), boolInt(line.Enabled), unix(line.CreatedAt), unix(line.UpdatedAt)}
+	return []any{line.ID, line.Name, line.Mode, line.IngressNodeID, line.EgressNodeID, line.ListenAddress, line.RelayPortRange, line.Engine, line.IngressEngine, line.EgressEngine, string(egressJSON), line.ActiveEgressNodeID, boolInt(line.FailoverEnabled), boolInt(line.Enabled), unix(line.CreatedAt), unix(line.UpdatedAt)}
 }
 
 func (s *Store) ListLines(ctx context.Context) ([]domain.Line, error) {
@@ -503,7 +533,8 @@ func (s *Store) SaveLine(ctx context.Context, line domain.Line) (domain.Line, er
 		line.CreatedAt = now
 	}
 	normalizeLineEgresses(&line)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,egress_node_ids=excluded.egress_node_ids,active_egress_node_id=excluded.active_egress_node_id,failover_enabled=excluded.failover_enabled,enabled=excluded.enabled,updated_at=excluded.updated_at`, lineArgs(line)...)
+	line.NormalizeEngines()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,egress_node_ids=excluded.egress_node_ids,active_egress_node_id=excluded.active_egress_node_id,failover_enabled=excluded.failover_enabled,enabled=excluded.enabled,updated_at=excluded.updated_at`, lineArgs(line)...)
 	if err == nil {
 		s.audit(ctx, "save", "line", line.ID, line.Name)
 	}
@@ -525,7 +556,8 @@ func (s *Store) SaveLineRules(ctx context.Context, line domain.Line, rules []dom
 		line.CreatedAt = now
 	}
 	normalizeLineEgresses(&line)
-	_, err = tx.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,egress_node_ids=excluded.egress_node_ids,active_egress_node_id=excluded.active_egress_node_id,failover_enabled=excluded.failover_enabled,enabled=excluded.enabled,updated_at=excluded.updated_at`, lineArgs(line)...)
+	line.NormalizeEngines()
+	_, err = tx.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,egress_node_ids=excluded.egress_node_ids,active_egress_node_id=excluded.active_egress_node_id,failover_enabled=excluded.failover_enabled,enabled=excluded.enabled,updated_at=excluded.updated_at`, lineArgs(line)...)
 	if err != nil {
 		return line, err
 	}
@@ -537,7 +569,8 @@ func (s *Store) SaveLineRules(ctx context.Context, line domain.Line, rules []dom
 		for i := range rules {
 			rules[i].Revision = revision
 			rules[i].UpdatedAt = now
-			_, err = tx.ExecContext(ctx, `UPDATE forward_rules SET mode=?,ingress_node_id=?,egress_node_id=?,listen_address=?,relay_port=?,engine=?,revision=?,updated_at=? WHERE id=? AND line_id=?`, rules[i].Mode, rules[i].IngressNodeID, rules[i].EgressNodeID, rules[i].ListenAddress, rules[i].RelayPort, rules[i].Engine, revision, unix(now), rules[i].ID, line.ID)
+			rules[i].NormalizeEngines()
+			_, err = tx.ExecContext(ctx, `UPDATE forward_rules SET mode=?,ingress_node_id=?,egress_node_id=?,listen_address=?,relay_port=?,engine=?,ingress_engine=?,egress_engine=?,revision=?,updated_at=? WHERE id=? AND line_id=?`, rules[i].Mode, rules[i].IngressNodeID, rules[i].EgressNodeID, rules[i].ListenAddress, rules[i].RelayPort, rules[i].Engine, rules[i].IngressEngine, rules[i].EgressEngine, revision, unix(now), rules[i].ID, line.ID)
 			if err != nil {
 				return line, err
 			}
@@ -574,14 +607,15 @@ func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, erro
 	var r domain.ForwardRule
 	var enabled int
 	var created, updated int64
-	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &r.TargetHost, &r.TargetPort, &r.Engine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &enabled, &r.Revision, &created, &updated)
+	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &enabled, &r.Revision, &created, &updated)
+	r.NormalizeEngines()
 	r.Enabled = enabled == 1
 	r.CreatedAt = fromUnix(created)
 	r.UpdatedAt = fromUnix(updated)
 	return r, err
 }
 
-const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,target_host,target_port,engine,upload_mbps,download_mbps,burst_kbytes,enabled,revision,created_at,updated_at`
+const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,enabled,revision,created_at,updated_at`
 
 func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+ruleColumns+` FROM forward_rules ORDER BY created_at DESC`)
@@ -624,7 +658,8 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = now
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, r.TargetHost, r.TargetPort, r.Engine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt))
+	r.NormalizeEngines()
+	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt))
 	if err != nil {
 		return r, err
 	}
@@ -694,12 +729,14 @@ func (s *Store) DeploymentsForNode(ctx context.Context, nodeID string) ([]domain
 			if nodeID == rule.IngressNodeID {
 				ingressRule := rule
 				ingressRule.EgressNodeID = line.ActiveEgressNodeID
+				ingressRule.Engine = ingressRule.EngineForRole(domain.NodeRoleIngress)
 				out = append(out, domain.Deployment{Rule: ingressRule, Role: domain.NodeRoleIngress})
 			}
 			for _, egressID := range line.EgressNodeIDs {
 				if nodeID == egressID {
 					egressRule := rule
 					egressRule.EgressNodeID = egressID
+					egressRule.Engine = egressRule.EngineForRole(domain.NodeRoleEgress)
 					out = append(out, domain.Deployment{Rule: egressRule, Role: domain.NodeRoleEgress})
 					break
 				}
@@ -716,6 +753,7 @@ func (s *Store) DeploymentsForNode(ctx context.Context, nodeID string) ([]domain
 		if rule.Mode != domain.ForwardModeExitOnly && rule.IngressNodeID == nodeID && rule.EgressNodeID == nodeID {
 			role = domain.NodeRoleBoth
 		}
+		rule.Engine = rule.EngineForRole(role)
 		out = append(out, domain.Deployment{Rule: rule, Role: role})
 	}
 	return out, nil

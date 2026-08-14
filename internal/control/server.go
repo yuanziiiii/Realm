@@ -388,9 +388,7 @@ func (s *Server) saveLine(w http.ResponseWriter, r *http.Request) {
 	if line.Mode == "" {
 		line.Mode = domain.ForwardModeDualManaged
 	}
-	if line.Engine == "" {
-		line.Engine = "nftables"
-	}
+	line.NormalizeEngines()
 	if err := s.completeLine(r.Context(), &line); err != nil {
 		writeError(w, 422, err)
 		return
@@ -452,6 +450,9 @@ func (s *Server) rulesForLineUpdate(ctx context.Context, line domain.Line) ([]do
 		rule.EgressNodeID = line.EgressNodeID
 		rule.ListenAddress = line.ListenAddress
 		rule.Engine = line.Engine
+		rule.IngressEngine = line.IngressEngine
+		rule.EgressEngine = line.EgressEngine
+		rule.NormalizeEngines()
 		for _, other := range occupied {
 			if other.IngressNodeID == rule.IngressNodeID && other.ListenPort == rule.ListenPort && protocolsOverlap(other.Protocol, rule.Protocol) {
 				return nil, fmt.Errorf("入口服务器的端口 %d 已被规则 %q 使用", rule.ListenPort, other.Name)
@@ -603,9 +604,7 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 	if rule.Protocol == "" {
 		rule.Protocol = "both"
 	}
-	if rule.Engine == "" {
-		rule.Engine = "nftables"
-	}
+	rule.NormalizeEngines()
 	if rule.BurstKBytes == 0 {
 		rule.BurstKBytes = 512
 	}
@@ -626,6 +625,9 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		rule.EgressNodeID = line.EgressNodeID
 		rule.ListenAddress = line.ListenAddress
 		rule.Engine = line.Engine
+		rule.IngressEngine = line.IngressEngine
+		rule.EgressEngine = line.EgressEngine
+		rule.NormalizeEngines()
 	}
 	if err := s.completeSimpleRule(r.Context(), &rule); err != nil {
 		writeError(w, 422, err)
@@ -1108,6 +1110,7 @@ func validateNode(n domain.Node) error {
 	return nil
 }
 func validateLine(line domain.Line) error {
+	line.NormalizeEngines()
 	if strings.TrimSpace(line.Name) == "" {
 		return errors.New("线路名称不能为空")
 	}
@@ -1120,8 +1123,11 @@ func validateLine(line domain.Line) error {
 	if line.Mode == domain.ForwardModeDualManaged && line.IngressNodeID == line.EgressNodeID {
 		return errors.New("双端托管需要不同的入口和出口服务器")
 	}
-	if line.Engine != "nftables" && line.Engine != "realm" {
-		return errors.New("线路引擎必须为 nftables 或 realm")
+	if line.IngressEngine != "nftables" && line.IngressEngine != "realm" {
+		return errors.New("入口引擎必须为 nftables 或 realm")
+	}
+	if line.EgressEngine != "nftables" && line.EgressEngine != "realm" {
+		return errors.New("出口引擎必须为 nftables 或 realm")
 	}
 	if _, err := parsePortRanges(line.RelayPortRange); err != nil {
 		return err
@@ -1129,6 +1135,7 @@ func validateLine(line domain.Line) error {
 	return nil
 }
 func validateRule(r domain.ForwardRule) error {
+	r.NormalizeEngines()
 	if r.Mode != domain.ForwardModeDualManaged && r.Mode != domain.ForwardModeExitOnly {
 		return errors.New("转发模式无效")
 	}
@@ -1144,8 +1151,11 @@ func validateRule(r domain.ForwardRule) error {
 	if r.Protocol != "tcp" && r.Protocol != "udp" && r.Protocol != "both" {
 		return errors.New("协议必须为 tcp、udp 或 both")
 	}
-	if r.Engine != "nftables" && r.Engine != "realm" {
-		return errors.New("引擎必须为 nftables 或 realm")
+	if r.IngressEngine != "nftables" && r.IngressEngine != "realm" {
+		return errors.New("入口引擎必须为 nftables 或 realm")
+	}
+	if r.EgressEngine != "nftables" && r.EgressEngine != "realm" {
+		return errors.New("出口引擎必须为 nftables 或 realm")
 	}
 	for _, port := range []int{r.ListenPort, r.RelayPort, r.TargetPort} {
 		if port < 1 || port > 65535 {
@@ -1155,7 +1165,7 @@ func validateRule(r domain.ForwardRule) error {
 	if r.TargetHost == "" {
 		return errors.New("目标地址不能为空")
 	}
-	if r.Engine == "nftables" {
+	if r.EgressEngine == "nftables" {
 		ip := net.ParseIP(strings.TrimSpace(r.TargetHost))
 		if ip == nil || ip.To4() == nil {
 			return errors.New("nftables 的落地地址必须是 IPv4；域名请使用 Realm")
