@@ -244,9 +244,9 @@ func (s *Store) CreateNode(ctx context.Context, n domain.Node, tokenHash string)
 
 func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, error) {
 	var n domain.Node
-	var tokenHash, applyStatus string
+	var tokenHash string
 	var lastSeen, created int64
-	err := scanner.Scan(&n.ID, &n.Name, &n.Role, &n.PublicAddress, &n.PrivateAddress, &n.PublicInterface, &n.PrivateInterface, &tokenHash, &n.AgentVersion, &n.AppliedRevision, &applyStatus, &lastSeen, &created)
+	err := scanner.Scan(&n.ID, &n.Name, &n.Role, &n.PublicAddress, &n.PrivateAddress, &n.PublicInterface, &n.PrivateInterface, &tokenHash, &n.AgentVersion, &n.AppliedRevision, &n.ApplyStatus, &n.ApplyError, &lastSeen, &created)
 	n.LastSeenAt = fromUnix(lastSeen)
 	n.CreatedAt = fromUnix(created)
 	if time.Since(n.LastSeenAt) <= 45*time.Second {
@@ -257,7 +257,7 @@ func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, err
 	return n, tokenHash, err
 }
 
-const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,agent_version,applied_revision,apply_status,last_seen_at,created_at`
+const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,agent_version,applied_revision,apply_status,apply_error,last_seen_at,created_at`
 
 func (s *Store) ListNodes(ctx context.Context) ([]domain.Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeColumns+` FROM nodes ORDER BY created_at`)
@@ -582,6 +582,20 @@ func (s *Store) AddTraffic(ctx context.Context, nodeID string, deltas []domain.T
 	}
 	defer tx.Rollback()
 	for _, d := range deltas {
+		if d.UploadBytes < 0 || d.DownloadBytes < 0 || d.UploadPackets < 0 || d.DownloadPackets < 0 {
+			return errors.New("traffic counters cannot be negative")
+		}
+		var ruleExists int
+		err = tx.QueryRowContext(ctx, `SELECT 1 FROM forward_rules WHERE id=?`, d.RuleID).Scan(&ruleExists)
+		if errors.Is(err, sql.ErrNoRows) {
+			// An Agent can report one final counter sample after an administrator
+			// deletes a rule. Ignore it so the sync can continue and the Agent can
+			// receive the new revision that removes the stale local rule.
+			continue
+		}
+		if err != nil {
+			return err
+		}
 		if d.Cumulative {
 			rawUpBytes, rawDownBytes, rawUpPackets, rawDownPackets := d.UploadBytes, d.DownloadBytes, d.UploadPackets, d.DownloadPackets
 			var oldUpBytes, oldDownBytes, oldUpPackets, oldDownPackets int64
@@ -750,7 +764,7 @@ func (s *Store) Summary(ctx context.Context) (domain.DashboardSummary, error) {
 	}
 	now := time.Now().UTC()
 	today, week, month, quarter := trafficPeriodStarts(now)
-	_ = s.db.QueryRowContext(ctx, `SELECT
+	if err := s.db.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(CASE WHEN bucket>=? THEN upload_bytes ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN bucket>=? THEN download_bytes ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN bucket>=? THEN upload_bytes ELSE 0 END),0),
@@ -762,7 +776,9 @@ func (s *Store) Summary(ctx context.Context) (domain.DashboardSummary, error) {
 		FROM traffic_daily`, today, today, week, week, month, month, quarter, quarter).Scan(
 		&d.TodayUpload, &d.TodayDownload, &d.WeekUpload, &d.WeekDownload,
 		&d.MonthUpload, &d.MonthDownload, &d.QuarterUpload, &d.QuarterDownload,
-	)
+	); err != nil {
+		return d, err
+	}
 	points, err := s.Traffic(ctx, "", time.Now().UTC().Add(-24*time.Hour))
 	if points == nil {
 		points = []domain.TrafficPoint{}

@@ -37,7 +37,9 @@
 - 实时速率只在流量页面或规则详情打开时每 10 秒刷新
 - 分钟明细保留 7 天，长期数据按日汇总，避免数据库随运行时间快速增长
 - Agent 每 10 秒对账；控制端短暂离线不会删除已应用规则
+- Agent 启动或 Realm 异常退出后会核对 nftables、tc 和 Realm 实际状态，缺失时自动恢复，不只依赖旧 revision
 - nftables 应用前语法检查，后续步骤失败时恢复旧表
+- Agent 下发失败会在服务器卡片直接显示原因
 - Agent Token 只在创建节点时返回一次，数据库仅保存 SHA-256 摘要
 
 ## 组件
@@ -59,11 +61,10 @@
 
 ### 一键安装（推荐）
 
-当前新版位于 `agent/line-workflow` 分支。在一台全新的 Linux 控制端服务器运行：
+在一台全新的 Linux 控制端服务器运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/refs/heads/agent/line-workflow/scripts/install-control.sh \
-  | sudo env RELAY_PANEL_BRANCH=agent/line-workflow bash
+curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/install-control.sh | sudo bash
 ```
 
 脚本会安装 Docker、下载项目、生成随机管理员密码并启动控制端。系统没有默认用户名，只使用脚本生成的管理员密码登录；完成时会打印面板地址和密码，请立即保存。
@@ -71,8 +72,8 @@ curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/refs/heads/agent/l
 默认监听端口为 `8080`，安装时可以固定为其他端口，例如 `18080`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/refs/heads/agent/line-workflow/scripts/install-control.sh \
-  | sudo env RELAY_PANEL_BRANCH=agent/line-workflow RELAY_HTTP_PORT=18080 bash
+curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/install-control.sh \
+  | sudo env RELAY_HTTP_PORT=18080 bash
 ```
 
 默认安装到 `/opt/relay-panel`，SQLite 数据保存在 Docker volume 中。安装完成后需要修改面板端口时，编辑 `/opt/relay-panel/.env` 中的 `RELAY_HTTP_PORT`，再运行：
@@ -85,11 +86,13 @@ sudo docker compose --project-directory /opt/relay-panel up -d
 
 ### 更新控制端
 
-控制端可以直接更新 GitHub Release 中的最新程序，不重新构建网页、不修改数据库和登录密码：
+更新命令会同时更新网页端和 Go 控制端，不修改数据库、登录密码、端口或 HTTPS 反代配置。更新器先构建候选镜像并做健康检查，失败时会同时恢复旧网页端与旧控制端：
 
 ```bash
 curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update-control.sh | sudo bash
 ```
+
+网页端需要在本机完成一次 Docker 构建；1C1G 机器会自动复用安装时创建的交换空间，通常约 1 分钟。这样从旧版本升级后，页面修复也会真正生效，不会再出现“后端已更新、浏览器还是旧页面”的情况。
 
 ### 忘记或重置管理员密码
 
@@ -103,7 +106,7 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/reset-ad
 
 1 核 1 GB 可以运行个人面板。实机中控制端与网页端两个容器空闲时合计约 140 MB，实际占用会随规则数量和访问量变化。
 
-源码构建需要更多瞬时内存。安装器在物理内存低于 1.5 GB 且现有 Swap 不足时，会创建持久化的 2 GB `/var/lib/relay-panel/build.swap`，并串行构建 Go 控制端和网页端。该 Swap 主要用于安装和以后重新构建，不代表面板运行需要 2 GB 内存。
+源码构建需要更多瞬时内存。安装器和完整更新器在物理内存低于 1.5 GB 且现有 Swap 不足时，会创建持久化的 2 GB `/var/lib/relay-panel/build.swap`，并串行构建网页端。该 Swap 主要用于安装和以后更新，不代表面板运行需要 2 GB 内存。
 
 ### 手工安装
 

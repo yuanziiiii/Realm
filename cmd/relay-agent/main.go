@@ -15,7 +15,8 @@ import (
 	"relaypanel/internal/domain"
 )
 
-const version = "0.3.4"
+// version is replaced by release builds through -ldflags "-X main.version=...".
+var version = "dev"
 
 type state struct {
 	AppliedRevision int64    `json:"applied_revision"`
@@ -77,7 +78,7 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	if err != nil {
 		return err
 	}
-	if resp.Revision == st.AppliedRevision && st.ApplyStatus == "normal" {
+	if resp.Revision == st.AppliedRevision && st.ApplyStatus == "normal" && executor.Healthy(ctx) {
 		return nil
 	}
 	nodes := map[string]domain.Node{resp.Node.ID: resp.Node}

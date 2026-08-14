@@ -151,6 +151,38 @@ func TestRequestPublicAddressSupportsDirectAndHTTPSProxyRequests(t *testing.T) {
 	if got := requestPublicAddress(proxied); got != "203.0.113.88" {
 		t.Fatalf("unexpected proxied public address: %q", got)
 	}
+	spoofed := httptest.NewRequest(http.MethodPost, "/agent/v1/sync", nil)
+	spoofed.RemoteAddr = "198.51.100.20:43210"
+	spoofed.Header.Set("X-Forwarded-For", "203.0.113.99")
+	if got := requestPublicAddress(spoofed); got != "198.51.100.20" {
+		t.Fatalf("untrusted forwarding header was accepted: %q", got)
+	}
+}
+
+func TestRequestIsHTTPSOnlyTrustsLocalProxyHeaders(t *testing.T) {
+	proxied := httptest.NewRequest(http.MethodPost, "/api/v1/login", nil)
+	proxied.RemoteAddr = "172.18.0.2:1234"
+	proxied.Header.Set("X-Forwarded-Proto", "https")
+	if !requestIsHTTPS(proxied) {
+		t.Fatal("HTTPS reverse proxy request was not detected")
+	}
+	spoofed := httptest.NewRequest(http.MethodPost, "/api/v1/login", nil)
+	spoofed.RemoteAddr = "198.51.100.20:1234"
+	spoofed.Header.Set("X-Forwarded-Proto", "https")
+	if requestIsHTTPS(spoofed) {
+		t.Fatal("untrusted X-Forwarded-Proto header was accepted")
+	}
+}
+
+func TestValidateRuleRejectsHostnameForNFTablesButAllowsRealm(t *testing.T) {
+	rule := domain.ForwardRule{Mode: domain.ForwardModeDualManaged, Name: "域名目标", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenPort: 10000, RelayPort: 30000, TargetHost: "origin.example.com", TargetPort: 443, Engine: "nftables"}
+	if err := validateRule(rule); err == nil {
+		t.Fatal("nftables hostname should be rejected before deployment")
+	}
+	rule.Engine = "realm"
+	if err := validateRule(rule); err != nil {
+		t.Fatalf("Realm should allow a hostname target: %v", err)
+	}
 }
 
 func TestCompleteSimpleRuleSelectsNodesAndRelayPort(t *testing.T) {

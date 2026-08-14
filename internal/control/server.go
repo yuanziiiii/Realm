@@ -146,12 +146,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	expires := time.Now().Add(12 * time.Hour)
 	token := s.signSession(expires)
-	http.SetCookie(w, &http.Cookie{Name: "relay_session", Value: token, Path: "/", Expires: expires, HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: "relay_session", Value: token, Path: "/", Expires: expires, HttpOnly: true, Secure: s.secureCookies || requestIsHTTPS(r), SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "expires_at": expires})
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: "relay_session", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: "relay_session", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.secureCookies || requestIsHTTPS(r), SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -822,7 +822,11 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func requestPublicAddress(r *http.Request) string {
-	for _, candidate := range []string{strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0], r.Header.Get("X-Real-IP"), r.RemoteAddr} {
+	candidates := []string{r.RemoteAddr}
+	if trustedProxyRequest(r) {
+		candidates = append([]string{strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0], r.Header.Get("X-Real-IP")}, candidates...)
+	}
+	for _, candidate := range candidates {
 		candidate = strings.TrimSpace(candidate)
 		if host, _, err := net.SplitHostPort(candidate); err == nil {
 			candidate = host
@@ -833,6 +837,22 @@ func requestPublicAddress(r *http.Request) string {
 		}
 	}
 	return ""
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return trustedProxyRequest(r) && strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")
+}
+
+func trustedProxyRequest(r *http.Request) bool {
+	host := strings.TrimSpace(r.RemoteAddr)
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }
 
 func validateNode(n domain.Node) error {
@@ -891,6 +911,12 @@ func validateRule(r domain.ForwardRule) error {
 	}
 	if r.TargetHost == "" {
 		return errors.New("目标地址不能为空")
+	}
+	if r.Engine == "nftables" {
+		ip := net.ParseIP(strings.TrimSpace(r.TargetHost))
+		if ip == nil || ip.To4() == nil {
+			return errors.New("nftables 的落地地址必须是 IPv4；域名请使用 Realm")
+		}
 	}
 	if r.UploadMbps < 0 || r.DownloadMbps < 0 {
 		return errors.New("限速不能为负数")

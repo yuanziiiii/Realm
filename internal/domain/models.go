@@ -25,6 +25,8 @@ type Node struct {
 	Status           string    `json:"status"`
 	AgentVersion     string    `json:"agent_version,omitempty"`
 	AppliedRevision  int64     `json:"applied_revision"`
+	ApplyStatus      string    `json:"apply_status"`
+	ApplyError       string    `json:"apply_error,omitempty"`
 	LastSeenAt       time.Time `json:"last_seen_at,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }

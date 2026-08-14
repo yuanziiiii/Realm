@@ -135,6 +135,61 @@ func TestHeartbeatAutoFillsBlankNetworkWithoutOverwritingManualValues(t *testing
 	}
 }
 
+func TestHeartbeatExposesApplyFailureToThePanel(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	node := domain.Node{ID: "node", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: time.Now().UTC()}
+	if err := st.CreateNode(ctx, node, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateHeartbeat(ctx, node.ID, "0.3.6", "failed", "nft: port is already in use", 8, domain.NetworkInfo{}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := st.GetNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ApplyStatus != "failed" || got.ApplyError != "nft: port is already in use" || got.AppliedRevision != 8 {
+		t.Fatalf("apply failure was hidden from node API: %+v", got)
+	}
+}
+
+func TestTrafficIgnoresFinalSampleFromDeletedRule(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now}, {ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "deleted", Mode: domain.ForwardModeDualManaged, Name: "临时规则", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.2", TargetPort: 80, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteRule(ctx, "deleted"); err != nil {
+		t.Fatal(err)
+	}
+	stale := domain.TrafficDelta{RuleID: "deleted", CapturedAt: now, Cumulative: true, UploadBytes: 100, DownloadBytes: 200}
+	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{stale}); err != nil {
+		t.Fatalf("stale traffic must not block the Agent sync: %v", err)
+	}
+	var rows int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM traffic_minute`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("stale traffic was unexpectedly stored: %d rows", rows)
+	}
+}
+
 func TestTrafficKeepsDailyHistoryAndPrunesMinuteDetail(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

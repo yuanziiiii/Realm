@@ -23,9 +23,14 @@ jobs:
         run: |
           mkdir -p release
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "release/relay-agent-linux-$arch" ./cmd/relay-agent
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o "release/relay-agent-linux-$arch" ./cmd/relay-agent
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "release/relay-control-linux-$arch" ./cmd/relay-control
           done
+          tar -czf release/relay-panel-source.tar.gz \
+            app build db public worker .openai \
+            package.json package-lock.json \
+            drizzle.config.ts eslint.config.mjs next-env.d.ts next.config.ts postcss.config.mjs tsconfig.json vite.config.ts \
+            Dockerfile.web Dockerfile.control docker-compose.yml
           install -m 0755 scripts/update-agent.sh release/update-agent.sh
           install -m 0755 scripts/update-control.sh release/update-control.sh
           install -m 0755 scripts/reset-admin-password.sh release/reset-admin-password.sh

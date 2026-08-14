@@ -19,13 +19,17 @@ import (
 )
 
 type Executor struct {
-	Apply       bool
-	StateDir    string
-	RealmBinary string
-	log         *slog.Logger
-	mu          sync.Mutex
-	realm       *exec.Cmd
-	realmHash   [32]byte
+	Apply        bool
+	StateDir     string
+	RealmBinary  string
+	log          *slog.Logger
+	mu           sync.Mutex
+	realm        *exec.Cmd
+	realmDone    chan struct{}
+	realmHash    [32]byte
+	realmWanted  bool
+	tcInterfaces []string
+	reconciled   bool
 }
 
 func NewExecutor(apply bool, stateDir, realmBinary string, log *slog.Logger) *Executor {
@@ -38,6 +42,11 @@ func NewExecutor(apply bool, stateDir, realmBinary string, log *slog.Logger) *Ex
 func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 	if !e.Apply {
 		e.log.Info("dry-run plan", "nft_bytes", len(p.NFTScript), "tc_commands", len(p.TC), "realm", len(p.RealmConfig) > 0)
+		e.mu.Lock()
+		e.reconciled = true
+		e.realmWanted = len(p.RealmConfig) > 0
+		e.tcInterfaces = managedTCInterfaces(p.TC)
+		e.mu.Unlock()
 		return nil
 	}
 	if runtime.GOOS != "linux" {
@@ -87,7 +96,78 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 		rollbackNFT(ctx, previous, hadPrevious)
 		return err
 	}
+	e.mu.Lock()
+	e.reconciled = true
+	e.realmWanted = len(p.RealmConfig) > 0
+	e.tcInterfaces = managedTCInterfaces(p.TC)
+	e.mu.Unlock()
 	return nil
+}
+
+// Healthy verifies runtime state instead of trusting the revision persisted on
+// disk. nftables tables and Realm processes do not survive every reboot/crash,
+// so a matching controller revision alone is not proof that forwarding exists.
+func (e *Executor) Healthy(ctx context.Context) bool {
+	e.mu.Lock()
+	reconciled, realmWanted, realm, realmDone := e.reconciled, e.realmWanted, e.realm, e.realmDone
+	tcInterfaces := append([]string(nil), e.tcInterfaces...)
+	e.mu.Unlock()
+	if !reconciled {
+		return false
+	}
+	if !e.Apply {
+		return true
+	}
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	nftOutput, err := exec.CommandContext(ctx, "nft", "list", "table", "inet", "relay_panel").Output()
+	if err != nil {
+		return false
+	}
+	for _, chain := range []string{"chain prerouting", "chain postrouting", "chain forward_stats", "chain input_stats", "chain output_stats"} {
+		if !bytes.Contains(nftOutput, []byte(chain)) {
+			return false
+		}
+	}
+	if iptables, err := exec.LookPath("iptables"); err == nil && exec.CommandContext(ctx, iptables, "-w", "-C", "FORWARD", "-j", "RELAY-PANEL").Run() != nil {
+		return false
+	}
+	for _, iface := range tcInterfaces {
+		output, err := exec.CommandContext(ctx, "tc", "qdisc", "show", "dev", iface).Output()
+		if err != nil || !strings.Contains(string(output), "qdisc htb 7a1:") {
+			return false
+		}
+	}
+	if !realmWanted {
+		return true
+	}
+	if realm == nil || realmDone == nil {
+		return false
+	}
+	select {
+	case <-realmDone:
+		return false
+	default:
+		return true
+	}
+}
+
+func managedTCInterfaces(commands []Command) []string {
+	seen := map[string]bool{}
+	var interfaces []string
+	for _, command := range commands {
+		if command.Name != "tc" || len(command.Args) < 5 || command.Args[0] != "qdisc" {
+			continue
+		}
+		for i, arg := range command.Args {
+			if arg == "dev" && i+1 < len(command.Args) && !seen[command.Args[i+1]] {
+				seen[command.Args[i+1]] = true
+				interfaces = append(interfaces, command.Args[i+1])
+			}
+		}
+	}
+	return interfaces
 }
 
 // reconcileForwardingCompat inserts a narrowly scoped iptables chain ahead of
@@ -182,7 +262,10 @@ func captureNFT(ctx context.Context) ([]byte, bool) {
 }
 func rollbackNFT(ctx context.Context, previous []byte, hadPrevious bool) {
 	if hadPrevious {
-		_ = exec.CommandContext(ctx, "nft", "flush", "table", "inet", "relay_panel").Run()
+		// `nft list table` includes the table declaration. Delete the failed
+		// table before replaying that declaration; flushing leaves the table in
+		// place and makes restoration fail with "File exists".
+		_ = exec.CommandContext(ctx, "nft", "delete", "table", "inet", "relay_panel").Run()
 		cmd := exec.CommandContext(ctx, "nft", "-f", "-")
 		cmd.Stdin = bytes.NewReader(previous)
 		_ = cmd.Run()
@@ -225,15 +308,16 @@ func (e *Executor) reconcileRealm(config []byte) error {
 	defer e.mu.Unlock()
 	hash := sha256.Sum256(config)
 	if len(config) == 0 {
-		if e.realm != nil && e.realm.Process != nil {
-			_ = e.realm.Process.Kill()
-			_, _ = e.realm.Process.Wait()
-			e.realm = nil
-		}
+		e.stopRealmLocked()
 		return nil
 	}
-	if e.realm != nil && e.realm.ProcessState == nil && hash == e.realmHash {
-		return nil
+	if e.realm != nil && hash == e.realmHash && e.realmDone != nil {
+		select {
+		case <-e.realmDone:
+			// Realm exited unexpectedly; start it again below.
+		default:
+			return nil
+		}
 	}
 	if err := os.MkdirAll(e.StateDir, 0700); err != nil {
 		return err
@@ -242,10 +326,7 @@ func (e *Executor) reconcileRealm(config []byte) error {
 	if err := os.WriteFile(path, config, 0600); err != nil {
 		return err
 	}
-	if e.realm != nil && e.realm.Process != nil {
-		_ = e.realm.Process.Kill()
-		_, _ = e.realm.Process.Wait()
-	}
+	e.stopRealmLocked()
 	cmd := exec.Command(e.RealmBinary, "-c", path)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -253,9 +334,25 @@ func (e *Executor) reconcileRealm(config []byte) error {
 		return fmt.Errorf("start realm: %w", err)
 	}
 	e.realm = cmd
+	e.realmDone = make(chan struct{})
 	e.realmHash = hash
-	go func() { _ = cmd.Wait() }()
+	done := e.realmDone
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
 	return nil
+}
+
+func (e *Executor) stopRealmLocked() {
+	if e.realm != nil && e.realm.Process != nil {
+		_ = e.realm.Process.Kill()
+		if e.realmDone != nil {
+			<-e.realmDone
+		}
+	}
+	e.realm = nil
+	e.realmDone = nil
 }
 
 type nftCounterDoc struct {
