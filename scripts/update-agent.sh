@@ -61,6 +61,16 @@ actual="$(sha256sum "${tmp_dir}/relay-agent" | awk '{print $1}')"
 [[ -n "${expected}" && "${actual}" == "${expected}" ]] || fail "Agent SHA-256 校验失败"
 chmod 0755 "${tmp_dir}/relay-agent"
 
+zf_available=false
+if curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh" -o "${tmp_dir}/zf" \
+  && curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; then
+  zf_expected="$(awk '{print $1}' "${tmp_dir}/zf.sha256")"
+  zf_actual="$(sha256sum "${tmp_dir}/zf" | awk '{print $1}')"
+  [[ -n "${zf_expected}" && "${zf_actual}" == "${zf_expected}" ]] || fail "zf 管理工具的 SHA-256 校验失败"
+  chmod 0755 "${tmp_dir}/zf"
+  zf_available=true
+fi
+
 if [[ -x "${binary_path}" ]]; then
   cp -a "${binary_path}" "${tmp_dir}/relay-agent.previous"
 fi
@@ -69,7 +79,9 @@ say "保留现有 Node ID、Token 和控制端地址，更新 Agent"
 systemctl stop "${service_name}"
 install -m 0755 "${tmp_dir}/relay-agent" "${binary_path}"
 if systemctl start "${service_name}" && sleep 2 && systemctl is-active --quiet "${service_name}"; then
+  [[ "${zf_available}" == true ]] && install -m 0755 "${tmp_dir}/zf" /usr/local/bin/zf
   say "更新完成，原 Agent Token 和配置未改动"
+  [[ "${zf_available}" == true ]] && say "SSH 管理工具已更新，输入 zf 即可使用"
   exit 0
 fi
 

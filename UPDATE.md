@@ -20,6 +20,8 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.s
 
 更新器会校验下载文件，构建候选镜像并检查网页端和控制端健康状态。新版启动失败时会自动恢复原镜像。
 
+更新完成后会同时安装或刷新 `/usr/local/bin/zf`。以后登录主控 SSH，直接输入 `zf` 即可通过交互菜单完成更新、启停、日志检查、健康检查和密码重置。
+
 ## 更新 Agent
 
 在对应的入口或出口服务器执行：
@@ -30,13 +32,15 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update-a
 
 Agent 更新会保留 `/etc/relay-agent/config.json` 中的主控地址、Node ID 和 Token，失败时恢复旧二进制。
 
+Agent 更新也会安装或刷新同一个 `zf` 命令，但菜单会自动切换为 Agent 状态、日志、连通性和转发环境检查等节点功能。
+
 ## 指定版本
 
 需要固定版本时，可以通过环境变量指定，例如：
 
 ```bash
 curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh \
-  | sudo env RELAY_PANEL_VERSION=v0.3.9 bash
+  | sudo env RELAY_PANEL_VERSION=v0.3.10 bash
 ```
 
-数据库会自动迁移。升级前仍建议备份 `/opt/relay-panel/data` 数据目录。
+数据库会自动迁移。升级前仍建议备份控制端容器挂载到 `/data` 的 Docker volume。

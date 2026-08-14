@@ -111,6 +111,14 @@ actual="$(sha256sum "${tmp_dir}/relay-agent" | awk '{print $1}')"
 [[ "${actual}" == "${expected}" ]] || fail "Agent SHA-256 校验失败"
 install -m 0755 "${tmp_dir}/relay-agent" /usr/local/bin/relay-agent
 
+if curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh" -o "${tmp_dir}/zf" \
+  && curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; then
+  zf_expected="$(awk '{print $1}' "${tmp_dir}/zf.sha256")"
+  zf_actual="$(sha256sum "${tmp_dir}/zf" | awk '{print $1}')"
+  [[ -n "${zf_expected}" && "${zf_actual}" == "${zf_expected}" ]] || fail "zf 管理工具的 SHA-256 校验失败"
+  install -m 0755 "${tmp_dir}/zf" /usr/local/bin/zf
+fi
+
 if [[ "${install_realm}" == true ]]; then
   say "安装 Realm"
   realm_archive="realm-${realm_target}.tar.gz"
@@ -163,3 +171,4 @@ systemctl is-active --quiet relay-agent || {
   fail "Agent 启动失败"
 }
 say "安装完成，Agent 已连接 ${controller_url%/}"
+[[ -x /usr/local/bin/zf ]] && say "以后在 SSH 中输入 zf，即可进入 Agent 维护菜单"

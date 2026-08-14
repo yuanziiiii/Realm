@@ -80,10 +80,24 @@ download_checked() {
   [[ -n "${expected}" && "${actual}" == "${expected}" ]] || fail "${name} 的 SHA-256 校验失败"
 }
 
+download_optional_checked() {
+  local name="$1" target="$2" expected actual
+  curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${name}" -o "${target}" || return 1
+  curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${name}.sha256" -o "${target}.sha256" || return 1
+  expected="$(awk '{print $1}' "${target}.sha256")"
+  actual="$(sha256sum "${target}" | awk '{print $1}')"
+  [[ -n "${expected}" && "${actual}" == "${expected}" ]] || fail "${name} 的 SHA-256 校验失败"
+}
+
 binary_name="relay-control-linux-${control_arch}"
 say "下载并校验控制端、网页端完整更新包"
 download_checked "${binary_name}" "${tmp_dir}/relay-control"
 download_checked "relay-panel-source.tar.gz" "${tmp_dir}/source.tar.gz"
+zf_available=false
+if download_optional_checked "zf.sh" "${tmp_dir}/zf"; then
+  chmod 0755 "${tmp_dir}/zf"
+  zf_available=true
+fi
 chmod 0755 "${tmp_dir}/relay-control"
 mkdir -p "${tmp_dir}/source"
 tar -xzf "${tmp_dir}/source.tar.gz" -C "${tmp_dir}/source"
@@ -138,8 +152,12 @@ if [[ "${healthy}" == "true" ]]; then
   # Keep deployment files in sync for the next update while preserving .env
   # and the named database volume.
   tar -C "${tmp_dir}/source" -cf - . | tar -C "${install_dir}" -xf -
+  if [[ "${zf_available}" == true ]]; then
+    install -m 0755 "${tmp_dir}/zf" /usr/local/bin/zf
+  fi
   say "完整更新完成：网页端、控制端、数据库兼容层均已更新"
   say "管理员密码、HTTPS 反代配置和数据库均未改动"
+  [[ "${zf_available}" == true ]] && say "SSH 管理工具已更新，输入 zf 即可使用"
   exit 0
 fi
 

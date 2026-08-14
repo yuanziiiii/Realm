@@ -94,9 +94,11 @@ say "低内存模式：串行构建网页端"
 COMPOSE_PARALLEL_LIMIT=1 docker compose --project-directory "${install_dir}" build web
 say "启动控制端"
 docker compose --project-directory "${install_dir}" up -d --no-build
+install -m 0755 "${install_dir}/scripts/zf.sh" /usr/local/bin/zf
 
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 host_ip="${host_ip:-服务器IP}"
 say "安装完成"
 printf '\n面板地址：http://%s:%s\n管理员密码：%s\n安装目录：%s\n\n' "${host_ip}" "${http_port}" "${admin_password}" "${install_dir}"
 printf '请立即保存密码。公网使用时，请在面板前配置 HTTPS 反向代理。\n'
+printf '以后在 SSH 中输入 zf，即可进入主控维护菜单。\n'

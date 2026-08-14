@@ -17,6 +17,9 @@ fi
 install -D -m 0755 "${agent_binary}" /usr/local/bin/relay-agent
 install -D -m 0600 "${agent_config}" /etc/relay-agent/config.json
 install -D -m 0644 ./deploy/relay-agent.service /etc/systemd/system/relay-agent.service
+if [[ -f ./scripts/zf.sh ]]; then
+  install -D -m 0755 ./scripts/zf.sh /usr/local/bin/zf
+fi
 install -D -m 0644 ./deploy/99-relay-panel.conf /etc/sysctl.d/99-relay-panel.conf
 install -d -m 0700 /var/lib/relay-agent
 

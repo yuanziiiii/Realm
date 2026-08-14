@@ -43,6 +43,7 @@
 - nftables 应用前语法检查，后续步骤失败时恢复旧表
 - Agent 下发失败会在服务器卡片直接显示原因
 - Agent Token 只在创建节点时返回一次，数据库仅保存 SHA-256 摘要
+- 主控和 Agent 安装后提供 `zf` SSH 交互管理菜单，并按机器角色显示对应维护功能
 
 ## 组件
 
@@ -105,6 +106,18 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.s
 ```bash
 curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/reset-admin-password.sh | sudo bash
 ```
+
+### SSH 交互管理菜单
+
+安装或更新主控、Agent 后，在对应服务器 SSH 中直接输入：
+
+```bash
+zf
+```
+
+工具会自动识别当前机器角色。主控端菜单包含状态、在线更新、启停/重启、日志、健康检查、密码重置和访问配置；Agent 菜单包含状态、在线更新、启停/重启、日志、主控连通性、节点信息和转发环境检查。Agent Token 只显示“已配置/缺失”，不会输出明文。
+
+停止服务和密码重置均需要二次确认。工具不会提供容易误删数据库与现有转发的一键卸载入口。
 
 ### 1C1G 低内存服务器
 
