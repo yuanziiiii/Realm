@@ -192,11 +192,11 @@ function LineModal({nodes,probes,initial,busy,onClose,onSave}:{nodes:Node[];prob
   const field=(key:keyof typeof line)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setLine({...line,[key]:e.target.value} as typeof line);
   const ingress=nodes.find(n=>n.id===line.ingress_node_id);
   const primary=nodes.find(n=>n.id===line.egress_node_id);
-  const availableEgresses=nodes.filter(n=>n.role!=="ingress"&&n.id!==line.ingress_node_id);
+  const availableEgresses=nodes.filter(n=>n.role!=="ingress"&&(line.mode==="exit_only"||n.id!==line.ingress_node_id));
   const orderedEgresses=[line.egress_node_id,...line.egress_node_ids.filter(id=>id!==line.egress_node_id)].filter(Boolean);
   const setMode=(mode:Mode)=>setLine(current=>{
     const primaryID=current.egress_node_id||firstEgress?.id||"";
-    return {...current,mode,ingress_node_id:mode==="exit_only"?primaryID:(current.ingress_node_id===primaryID?(firstIngress?.id||""):current.ingress_node_id),egress_node_ids:primaryID?[primaryID]:[],active_egress_node_id:primaryID,failover_enabled:false,listen_address:mode==="exit_only"?(nodes.find(n=>n.id===primaryID)?.private_address||current.listen_address||""):"0.0.0.0"};
+    return {...current,mode,ingress_node_id:mode==="exit_only"?primaryID:(current.ingress_node_id===primaryID?(firstIngress?.id||""):current.ingress_node_id),egress_node_ids:primaryID?[primaryID]:[],active_egress_node_id:primaryID,failover_enabled:false,listen_address:mode==="exit_only"?(nodes.find(n=>n.id===primaryID)?.private_address||""):"0.0.0.0"};
   });
   const setPrimary=(id:string)=>setLine(current=>{
     const node=nodes.find(n=>n.id===id);
@@ -209,7 +209,7 @@ function LineModal({nodes,probes,initial,busy,onClose,onSave}:{nodes:Node[];prob
     const ordered=[current.egress_node_id,...ids.filter(value=>value!==current.egress_node_id)].filter(Boolean);
     return {...current,egress_node_ids:ordered,active_egress_node_id:ordered.includes(current.active_egress_node_id)?current.active_egress_node_id:current.egress_node_id,failover_enabled:ordered.length>1?current.failover_enabled:false};
   });
-  const ready=Boolean(line.name&&primary&&(line.mode==="exit_only"||ingress&&ingress.id!==primary.id)&&(!line.failover_enabled||orderedEgresses.length>1));
+  const ready=Boolean(line.name&&primary&&(line.mode==="exit_only"?line.listen_address:ingress&&ingress.id!==primary.id)&&(!line.failover_enabled||orderedEgresses.length>1));
   return <Modal title={initial?"修改线路":"创建线路"} kicker={initial?"调整拓扑":"线路拓扑"} onClose={onClose}><form className="form-grid" onSubmit={e=>{e.preventDefault();const ids=line.mode==="exit_only"?[line.egress_node_id]:orderedEgresses;onSave({...line,ingress_node_id:line.mode==="exit_only"?line.egress_node_id:line.ingress_node_id,egress_node_ids:ids,active_egress_node_id:ids.includes(line.active_egress_node_id)?line.active_egress_node_id:line.egress_node_id,failover_enabled:line.mode==="dual_managed"&&line.failover_enabled&&ids.length>1})}}>
     <div className="mode-picker full"><button type="button" className={line.mode==="dual_managed"?"selected":""} onClick={()=>setMode("dual_managed")}><b>双端托管</b><span>入口、出口都由面板管理</span><small>客户端 → 入口 Agent → 出口 Agent → 落地</small></button><button type="button" className={line.mode==="exit_only"?"selected":""} onClick={()=>setMode("exit_only")}><b>仅出口接管</b><span>第一跳已经自行配置</span><small>已有入口转发 → 出口 Agent → 落地</small></button></div>
     <label className="full">线路名称<input required value={line.name} onChange={field("name")} placeholder="例如：入口 A → 出口 B"/></label>

@@ -427,7 +427,7 @@ func (s *Server) completeLine(ctx context.Context, line *domain.Line) error {
 		line.ActiveEgressNodeID = line.EgressNodeID
 		line.FailoverEnabled = false
 		line.IngressNodeID = line.EgressNodeID
-		if line.ListenAddress == "" {
+		if line.ListenAddress == "" || line.ListenAddress == "0.0.0.0" {
 			line.ListenAddress = egress.PrivateAddress
 		}
 		if line.ListenAddress == "" {

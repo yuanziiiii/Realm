@@ -260,7 +260,7 @@ func TestCompleteLineValidatesRolesAndFillsListener(t *testing.T) {
 		t.Fatalf("unexpected dual listener: %q", dual.ListenAddress)
 	}
 
-	exitOnly := domain.Line{Mode: domain.ForwardModeExitOnly, EgressNodeID: "egress"}
+	exitOnly := domain.Line{Mode: domain.ForwardModeExitOnly, EgressNodeID: "egress", ListenAddress: "0.0.0.0"}
 	if err := s.completeLine(ctx, &exitOnly); err != nil {
 		t.Fatal(err)
 	}
