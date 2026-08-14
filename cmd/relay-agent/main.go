@@ -19,10 +19,11 @@ import (
 var version = "dev"
 
 type state struct {
-	AppliedRevision int64    `json:"applied_revision"`
-	ApplyStatus     string   `json:"apply_status"`
-	ApplyError      string   `json:"apply_error"`
-	IngressRuleIDs  []string `json:"ingress_rule_ids"`
+	AppliedRevision int64              `json:"applied_revision"`
+	ApplyStatus     string             `json:"apply_status"`
+	ApplyError      string             `json:"apply_error"`
+	IngressRuleIDs  []string           `json:"ingress_rule_ids"`
+	Probes          []domain.LinkProbe `json:"probes,omitempty"`
 }
 
 func main() {
@@ -74,10 +75,11 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 			}
 		}
 	}
-	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic})
+	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes})
 	if err != nil {
 		return err
 	}
+	st.Probes = agent.ProbeLinks(ctx, resp.Node, resp.ProbeTargets)
 	if resp.Revision == st.AppliedRevision && st.ApplyStatus == "normal" && executor.Healthy(ctx) {
 		return nil
 	}

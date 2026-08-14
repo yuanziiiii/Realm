@@ -58,17 +58,20 @@ type ForwardRule struct {
 // A user chooses the servers and forwarding engine once on a line, then every
 // rule on that line only needs a listen port and destination.
 type Line struct {
-	ID             string      `json:"id"`
-	Name           string      `json:"name"`
-	Mode           ForwardMode `json:"mode"`
-	IngressNodeID  string      `json:"ingress_node_id"`
-	EgressNodeID   string      `json:"egress_node_id"`
-	ListenAddress  string      `json:"listen_address"`
-	RelayPortRange string      `json:"relay_port_range"`
-	Engine         string      `json:"engine"`
-	Enabled        bool        `json:"enabled"`
-	CreatedAt      time.Time   `json:"created_at"`
-	UpdatedAt      time.Time   `json:"updated_at"`
+	ID                 string      `json:"id"`
+	Name               string      `json:"name"`
+	Mode               ForwardMode `json:"mode"`
+	IngressNodeID      string      `json:"ingress_node_id"`
+	EgressNodeID       string      `json:"egress_node_id"`
+	EgressNodeIDs      []string    `json:"egress_node_ids"`
+	ActiveEgressNodeID string      `json:"active_egress_node_id"`
+	FailoverEnabled    bool        `json:"failover_enabled"`
+	ListenAddress      string      `json:"listen_address"`
+	RelayPortRange     string      `json:"relay_port_range"`
+	Engine             string      `json:"engine"`
+	Enabled            bool        `json:"enabled"`
+	CreatedAt          time.Time   `json:"created_at"`
+	UpdatedAt          time.Time   `json:"updated_at"`
 }
 
 type Deployment struct {
@@ -117,6 +120,19 @@ type NetworkInfo struct {
 	PrivateInterface string `json:"private_interface,omitempty"`
 }
 
+type LinkProbe struct {
+	IngressNodeID string    `json:"ingress_node_id"`
+	EgressNodeID  string    `json:"egress_node_id"`
+	Address       string    `json:"address"`
+	LatencyMS     float64   `json:"latency_ms"`
+	PacketLoss    float64   `json:"packet_loss"`
+	Success       bool      `json:"success"`
+	HasSucceeded  bool      `json:"has_succeeded"`
+	FailureCount  int       `json:"failure_count"`
+	SuccessCount  int       `json:"success_count"`
+	CheckedAt     time.Time `json:"checked_at"`
+}
+
 type SyncRequest struct {
 	NodeID          string         `json:"node_id"`
 	AgentVersion    string         `json:"agent_version"`
@@ -125,14 +141,16 @@ type SyncRequest struct {
 	ApplyError      string         `json:"apply_error,omitempty"`
 	Network         NetworkInfo    `json:"network,omitempty"`
 	Traffic         []TrafficDelta `json:"traffic,omitempty"`
+	Probes          []LinkProbe    `json:"probes,omitempty"`
 }
 
 type SyncResponse struct {
-	Revision    int64        `json:"revision"`
-	GeneratedAt time.Time    `json:"generated_at"`
-	Node        Node         `json:"node"`
-	Peers       []Node       `json:"peers"`
-	Deployments []Deployment `json:"deployments"`
+	Revision     int64        `json:"revision"`
+	GeneratedAt  time.Time    `json:"generated_at"`
+	Node         Node         `json:"node"`
+	Peers        []Node       `json:"peers"`
+	ProbeTargets []Node       `json:"probe_targets"`
+	Deployments  []Deployment `json:"deployments"`
 }
 
 type DashboardSummary struct {

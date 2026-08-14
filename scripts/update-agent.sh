@@ -18,6 +18,25 @@ command -v sha256sum >/dev/null 2>&1 || fail "缺少 sha256sum"
 [[ -s "${config_path}" ]] || fail "没有找到现有 Agent 配置 ${config_path}，请先从面板安装 Agent"
 systemctl cat "${service_name}" >/dev/null 2>&1 || fail "没有找到 ${service_name}"
 
+if ! command -v ping >/dev/null 2>&1; then
+  say "安装线路延迟探测工具"
+  probe_package_installed=true
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y iputils-ping || probe_package_installed=false
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y iputils || probe_package_installed=false
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y iputils || probe_package_installed=false
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache iputils || probe_package_installed=false
+  else
+    probe_package_installed=false
+  fi
+  if [[ "${probe_package_installed}" != true ]]; then
+    say "未能安装 ping，将继续更新 Agent；该节点暂时不提供 ICMP 延迟探测"
+  fi
+fi
+
 case "$(uname -m)" in
   x86_64|amd64) agent_arch="amd64" ;;
   aarch64|arm64) agent_arch="arm64" ;;

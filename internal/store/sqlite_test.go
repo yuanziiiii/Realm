@@ -357,3 +357,170 @@ func TestLineGroupsRulesAndCannotBeDeletedWhileReferenced(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestManagedLineDeploysStandbyAndFailsOverAfterStableProbes(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out-a", Name: "主出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+		{ID: "out-b", Name: "备用出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.4", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateHeartbeat(ctx, node.ID, "test", "normal", "", 1, domain.NetworkInfo{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{
+		ID: "line", Name: "主备线路", Mode: domain.ForwardModeDualManaged,
+		IngressNodeID: "in", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"},
+		ActiveEgressNodeID: "out-a", FailoverEnabled: true, ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(line.EgressNodeIDs) != 2 || line.ActiveEgressNodeID != "out-a" || !line.FailoverEnabled {
+		t.Fatalf("line failover fields were not saved: %+v", line)
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{
+		ID: "rule", LineID: line.ID, Mode: line.Mode, Name: "服务", Protocol: "tcp",
+		IngressNodeID: "in", EgressNodeID: "out-a", ListenAddress: "0.0.0.0", ListenPort: 10000,
+		RelayPort: 30000, TargetHost: "192.0.2.10", TargetPort: 80, Engine: "nftables", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ingressDeployments, err := st.DeploymentsForNode(ctx, "in")
+	if err != nil || len(ingressDeployments) != 1 || ingressDeployments[0].Rule.EgressNodeID != "out-a" {
+		t.Fatalf("ingress did not target primary egress: %+v, %v", ingressDeployments, err)
+	}
+	for _, id := range []string{"out-a", "out-b"} {
+		deployments, err := st.DeploymentsForNode(ctx, id)
+		if err != nil || len(deployments) != 1 || deployments[0].Role != domain.NodeRoleEgress {
+			t.Fatalf("egress %s was not preconfigured: %+v, %v", id, deployments, err)
+		}
+	}
+
+	// Establish that both paths support ICMP, then fail the primary three times.
+	if err := st.UpsertLinkProbes(ctx, "in", []domain.LinkProbe{
+		{EgressNodeID: "out-a", Address: "10.0.0.3", LatencyMS: 8, PacketLoss: 0, Success: true, CheckedAt: now},
+		{EgressNodeID: "out-b", Address: "10.0.0.4", LatencyMS: 15, PacketLoss: 0, Success: true, CheckedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		at := now.Add(time.Duration(i+1) * time.Second)
+		if err := st.UpsertLinkProbes(ctx, "in", []domain.LinkProbe{
+			{EgressNodeID: "out-a", Address: "10.0.0.3", PacketLoss: 100, Success: false, CheckedAt: at},
+			{EgressNodeID: "out-b", Address: "10.0.0.4", LatencyMS: 15, PacketLoss: 0, Success: true, CheckedAt: at},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ReconcileFailover(ctx, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.GetLine(ctx, "line")
+	if err != nil || got.ActiveEgressNodeID != "out-b" {
+		t.Fatalf("line did not fail over to backup: %+v, %v", got, err)
+	}
+	ingressDeployments, err = st.DeploymentsForNode(ctx, "in")
+	if err != nil || ingressDeployments[0].Rule.EgressNodeID != "out-b" {
+		t.Fatalf("ingress deployment did not follow failover: %+v, %v", ingressDeployments, err)
+	}
+
+	// The higher-priority primary must recover three times before failback.
+	for i := 0; i < 3; i++ {
+		at := now.Add(time.Duration(i+4) * time.Second)
+		if err := st.UpsertLinkProbes(ctx, "in", []domain.LinkProbe{
+			{EgressNodeID: "out-a", Address: "10.0.0.3", LatencyMS: 8, PacketLoss: 0, Success: true, CheckedAt: at},
+			{EgressNodeID: "out-b", Address: "10.0.0.4", LatencyMS: 15, PacketLoss: 0, Success: true, CheckedAt: at},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ReconcileFailover(ctx, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err = st.GetLine(ctx, "line")
+	if err != nil || got.ActiveEgressNodeID != "out-a" {
+		t.Fatalf("line did not fail back to primary: %+v, %v", got, err)
+	}
+	probes, err := st.ListLinkProbes(ctx)
+	if err != nil || len(probes) != 2 || !probes[0].HasSucceeded || !probes[1].HasSucceeded {
+		t.Fatalf("probe history was not retained: %+v, %v", probes, err)
+	}
+}
+
+func TestICMPBlockedDoesNotTriggerAutomaticFailover(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now},
+		{ID: "out-a", Name: "主出口", Role: domain.NodeRoleEgress, CreatedAt: now},
+		{ID: "out-b", Name: "备用出口", Role: domain.NodeRoleEgress, CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateHeartbeat(ctx, node.ID, "test", "normal", "", 1, domain.NetworkInfo{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"}, ActiveEgressNodeID: "out-a", FailoverEnabled: true, ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		if err := st.UpsertLinkProbes(ctx, "in", []domain.LinkProbe{
+			{EgressNodeID: "out-a", PacketLoss: 100, CheckedAt: at},
+			{EgressNodeID: "out-b", PacketLoss: 100, CheckedAt: at},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ReconcileFailover(ctx, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.GetLine(ctx, "line")
+	if err != nil || got.ActiveEgressNodeID != "out-a" {
+		t.Fatalf("ICMP-blocked path caused a false switch: %+v, %v", got, err)
+	}
+}
+
+func TestBackupEgressNodeCannotBeDeletedWhileReferenced(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now},
+		{ID: "out-a", Name: "主出口", Role: domain.NodeRoleEgress, CreatedAt: now},
+		{ID: "out-b", Name: "备用出口", Role: domain.NodeRoleEgress, CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"}, ActiveEgressNodeID: "out-a", FailoverEnabled: true, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteNode(ctx, "out-b"); err == nil {
+		t.Fatal("backup egress was deleted while still referenced by a line")
+	}
+}

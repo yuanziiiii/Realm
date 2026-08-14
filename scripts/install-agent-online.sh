@@ -50,13 +50,13 @@ fi
 install_packages() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq kmod nftables iproute2 tar
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq kmod nftables iproute2 iputils-ping tar
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl jq kmod nftables iproute tar
+    dnf install -y ca-certificates curl jq kmod nftables iproute iputils tar
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl jq kmod nftables iproute tar
+    yum install -y ca-certificates curl jq kmod nftables iproute iputils tar
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl jq kmod nftables iproute2 tar
+    apk add --no-cache ca-certificates curl jq kmod nftables iproute2 iputils tar
   else
     fail "不支持当前包管理器"
   fi
@@ -71,6 +71,31 @@ esac
 install_packages
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
+
+check_controller() {
+  local base_url health_code sync_code payload response_file error_file
+  base_url="${controller_url%/}"
+  response_file="${tmp_dir}/controller-response"
+  error_file="${tmp_dir}/controller-error"
+  say "检查控制端地址、端口、HTTPS 证书和反向代理"
+  if ! health_code="$(curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -sS --connect-timeout 8 --max-time 20 -o "${response_file}" -w '%{http_code}' "${base_url}/healthz" 2>"${error_file}")"; then
+    fail "无法连接 ${base_url}：$(tr '\n' ' ' < "${error_file}")。Agent 只需出站访问该地址；请检查域名解析、控制端端口/安全组、防火墙和 HTTPS 证书"
+  fi
+  [[ "${health_code}" == "200" ]] || fail "${base_url}/healthz 返回 HTTP ${health_code}。请确认反向代理把 /healthz 和 /agent/v1/* 一并转发到控制端，而不只是转发网页"
+
+  payload="$(jq -n --arg node_id "${node_id}" '{node_id:$node_id,agent_version:"installer-check",applied_revision:0,apply_status:"pending"}')"
+  if ! sync_code="$(curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -sS --connect-timeout 8 --max-time 20 -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' --data "${payload}" "${base_url}/agent/v1/sync" 2>"${error_file}")"; then
+    fail "控制端健康检查通过，但 Agent 接口连接失败：$(tr '\n' ' ' < "${error_file}")"
+  fi
+  case "${sync_code}" in
+    200) say "控制端连通且 Node ID / Agent Token 验证成功" ;;
+    401) fail "Agent 鉴权失败：请确认安装命令中的 Node ID 与刚复制的一次性 Agent Token 属于同一台服务器" ;;
+    404) fail "找不到 /agent/v1/sync：HTTPS 反向代理没有把 Agent API 转发到 Relay Control" ;;
+    *) fail "Agent 接口返回 HTTP ${sync_code}：$(head -c 500 "${response_file}")" ;;
+  esac
+}
+
+check_controller
 
 if [[ "${version}" == "latest" ]]; then
   download_base="https://github.com/${repo}/releases/latest/download"

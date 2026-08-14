@@ -22,6 +22,8 @@
 - 单管理员登录，SQLite 本地持久化
 - 服务器一键接入、Agent 在线状态和网络参数维护
 - 可复用线路，支持双端托管、仅出口接管两种拓扑
+- 双端托管支持一个主出口和多个备用出口；入口 Agent 按出口内网 IP 上报延迟、丢包和在线状态
+- 可选自动故障切换：连续 3 次失败后切到健康备用出口，主出口连续 3 次恢复后按优先级回切
 - 线路可修改入口、出口、接入 IP、NAT 端口池和转发引擎，已有规则自动迁移并重新下发
 - 出口 NAT 机器支持端口或端口范围，例如 `20000-20999,25000`
 - Agent 首次上线自动回填公网 IP、默认出口网卡、内网 IP 和内网网卡；面板手工配置优先且不会被覆盖
@@ -137,7 +139,19 @@ curl -fsSL https://raw.githubusercontent.com/yuanziiiii/Realm/main/scripts/insta
       --node-id 面板显示的ServerID
 ```
 
-脚本随后会在终端中隐式询问 Agent Token，避免 Token 留在 shell 历史。安装器支持 Debian、Ubuntu、Alpine、RHEL 系发行版，以及 x86_64、ARM64；自动安装 nftables、`tc`、systemd 服务和 Realm。只使用 nftables 时可添加 `--skip-realm`。
+脚本随后会在终端中隐式询问 Agent Token，避免 Token 留在 shell 历史。正式安装前，脚本会先检查主控健康接口并用 Node ID、Token 完成一次真实鉴权；域名解析、端口/安全组、HTTPS 证书、反向代理路径或 Token 有问题时会直接指出原因。安装器支持 Debian、Ubuntu、Alpine、RHEL 系发行版，以及 x86_64、ARM64；自动安装 nftables、`tc`、`ping`、systemd 服务和 Realm。只使用 nftables 时可添加 `--skip-realm`。
+
+Agent 是主动连接主控，不需要在被控服务器开放 Agent 入站端口。直连 `http://主控IP:18080` 时，需要在主控服务器和云安全组放行 `18080/TCP`；使用 `https://面板域名` 反代时，外部通常只需放行 `443/TCP`，但反代必须同时覆盖网页、`/healthz` 和 `/agent/v1/sync`，不能只代理网页。
+
+如果已安装但面板仍显示“等待连接”，在被控服务器检查：
+
+```bash
+sudo systemctl status relay-agent --no-pager
+sudo journalctl -u relay-agent -n 80 --no-pager
+curl -v --connect-timeout 8 https://你的面板域名/healthz
+```
+
+其中 `Could not resolve host` 是 DNS 问题，`Connection refused/timeout` 通常是监听端口、安全组或防火墙问题，证书报错是 HTTPS 证书链问题，日志中的 `401` 则是 Node ID 与 Agent Token 不匹配。不要把 Token 粘贴到公开日志或工单。
 
 ### 更新已安装的 Agent
 
@@ -187,12 +201,16 @@ Realm 模式还需将 Realm 二进制安装到 `/usr/local/bin/realm`，或者�
 ```text
 模式：双端托管
 入口服务器：已安装 Agent 的入口机器
-出口服务器：已安装 Agent 的出口机器
-出口可用中继端口：NAT 机器可填 20000-20999,25000；留空不限制
+主出口服务器：已安装 Agent 的首选出口机器
+备用出口：可选择多个，并按选择顺序作为切换优先级
+自动故障切换：可选；入口 Agent 连续探测后自动切换并回切
+所有出口共同可用的中继端口：NAT 机器可填 20000-20999,25000；留空不限制
 转发引擎：nftables / Realm
 ```
 
-随后在这条线路中新增转发，填写入口公网端口和落地 IP/端口。面板自动从出口端口池分配内网中继端口，你不需要再登录两台机器手工创建规则。入口监听端口仍可使用 1-65535。
+随后在这条线路中新增转发，填写入口公网端口和落地 IP/端口。面板自动从共同端口池分配内网中继端口，并提前把出口段下发到全部主备出口；发生切换时只需更新入口的目标出口。入口监听端口仍可使用 1-65535。所有主备 NAT 出口必须都能使用该线路配置的中继端口；若两个线路共享同一备用出口，面板也会检查并避开端口冲突。
+
+延迟和丢包由入口 Agent 对每个出口的内网 IP 进行 ICMP 探测。某些服务商会屏蔽 ICMP：此时面板仍以 Agent 心跳判断服务器在线，但不会把一条从未成功回应 ICMP 的路径当作可自动切换的备用线路，从而避免误切换。
 
 ### 2. 仅出口接管
 
@@ -272,6 +290,6 @@ make test
 
 ## MVP 边界
 
-当前版本适合个人部署和小规模节点。尚未实现 IPv6 nftables NAT、多出口自动健康检查、线路延迟探测、WebSSH、通知告警和自动升级。
+当前版本适合个人部署和小规模节点。尚未实现 IPv6 nftables NAT、WebSSH、通知告警和全自动无人工升级。
 
 项目采用 MIT License。Realm 本身遵循其上游项目许可证。

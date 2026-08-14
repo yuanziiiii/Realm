@@ -120,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
 	mux.HandleFunc("GET /api/v1/traffic/rules", s.requireAdmin(s.ruleTraffic))
+	mux.HandleFunc("GET /api/v1/probes", s.requireAdmin(s.listProbes))
 	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if s.webProxy != nil {
@@ -284,12 +285,14 @@ func (s *Server) saveLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isCreate := r.PathValue("id") == ""
+	var existing domain.Line
 	if isCreate {
 		line.ID = randomID("line")
 		line.Enabled = true
 	} else {
 		line.ID = r.PathValue("id")
-		existing, err := s.store.GetLine(r.Context(), line.ID)
+		var err error
+		existing, err = s.store.GetLine(r.Context(), line.ID)
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, 404, err)
 			return
@@ -299,6 +302,14 @@ func (s *Server) saveLine(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		line.CreatedAt = existing.CreatedAt
+		if line.ActiveEgressNodeID == "" {
+			for _, candidate := range line.EgressNodeIDs {
+				if candidate == existing.ActiveEgressNodeID {
+					line.ActiveEgressNodeID = existing.ActiveEgressNodeID
+					break
+				}
+			}
+		}
 	}
 	if line.Mode == "" {
 		line.Mode = domain.ForwardModeDualManaged
@@ -332,6 +343,15 @@ func (s *Server) rulesForLineUpdate(ctx context.Context, line domain.Line) ([]do
 	if err != nil {
 		return nil, err
 	}
+	lines, err := s.store.ListLines(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lineByID := make(map[string]domain.Line, len(lines)+1)
+	for _, existingLine := range lines {
+		lineByID[existingLine.ID] = existingLine
+	}
+	lineByID[line.ID] = line
 	ranges, err := parsePortRanges(line.RelayPortRange)
 	if err != nil {
 		return nil, err
@@ -368,8 +388,8 @@ func (s *Server) rulesForLineUpdate(ctx context.Context, line domain.Line) ([]do
 			if !portInRanges(rule.RelayPort, ranges) {
 				return nil, fmt.Errorf("规则 %q 的接入端口 %d 不在出口可用端口范围 %s 内", rule.Name, rule.RelayPort, displayPortRange(line.RelayPortRange))
 			}
-		} else if !portInRanges(rule.RelayPort, ranges) || relayPortUsed(occupied, rule.EgressNodeID, rule.RelayPort, rule.Protocol, rule.ID) {
-			rule.RelayPort = allocateRelayPort(ranges, occupied, rule.EgressNodeID, rule.Protocol, rule.ID)
+		} else if !portInRanges(rule.RelayPort, ranges) || relayPortUsedAcross(occupied, lineByID, line.EgressNodeIDs, rule.RelayPort, rule.Protocol, rule.ID) {
+			rule.RelayPort = allocateRelayPortAcross(ranges, occupied, lineByID, line.EgressNodeIDs, rule.Protocol, rule.ID)
 			if rule.RelayPort == 0 {
 				return nil, errors.New("出口可用端口范围内没有剩余的中继端口")
 			}
@@ -397,11 +417,15 @@ func (s *Server) deleteLine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) completeLine(ctx context.Context, line *domain.Line) error {
+	normalizeLineEgressIDs(line)
 	egress, _, err := s.store.GetNode(ctx, line.EgressNodeID)
 	if err != nil || (egress.Role != domain.NodeRoleEgress && egress.Role != domain.NodeRoleBoth) {
 		return errors.New("请选择有效的出口服务器")
 	}
 	if line.Mode == domain.ForwardModeExitOnly {
+		line.EgressNodeIDs = []string{line.EgressNodeID}
+		line.ActiveEgressNodeID = line.EgressNodeID
+		line.FailoverEnabled = false
 		line.IngressNodeID = line.EgressNodeID
 		if line.ListenAddress == "" {
 			line.ListenAddress = egress.PrivateAddress
@@ -421,10 +445,44 @@ func (s *Server) completeLine(ctx context.Context, line *domain.Line) error {
 	if egress.PrivateAddress == "" {
 		return errors.New("出口服务器还没有配置内网 IP")
 	}
+	for _, egressID := range line.EgressNodeIDs {
+		candidate, _, err := s.store.GetNode(ctx, egressID)
+		if err != nil || (candidate.Role != domain.NodeRoleEgress && candidate.Role != domain.NodeRoleBoth) {
+			return fmt.Errorf("备用出口 %s 不存在或用途不是出口", egressID)
+		}
+		if candidate.ID == ingress.ID {
+			return errors.New("入口服务器不能同时作为该线路的出口")
+		}
+		if candidate.PrivateAddress == "" {
+			return fmt.Errorf("出口服务器 %s 还没有配置内网 IP", candidate.Name)
+		}
+	}
+	if line.FailoverEnabled && len(line.EgressNodeIDs) < 2 {
+		return errors.New("自动故障切换至少需要两个出口服务器")
+	}
 	if line.ListenAddress == "" {
 		line.ListenAddress = "0.0.0.0"
 	}
 	return nil
+}
+
+func normalizeLineEgressIDs(line *domain.Line) {
+	seen := map[string]bool{}
+	ids := make([]string, 0, len(line.EgressNodeIDs)+1)
+	if line.EgressNodeID != "" {
+		seen[line.EgressNodeID] = true
+		ids = append(ids, line.EgressNodeID)
+	}
+	for _, id := range line.EgressNodeIDs {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	line.EgressNodeIDs = ids
+	if !seen[line.ActiveEgressNodeID] {
+		line.ActiveEgressNodeID = line.EgressNodeID
+	}
 }
 func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
 	v, err := s.store.ListRules(r.Context())
@@ -528,6 +586,15 @@ func (s *Server) ensureRulePortsAvailable(ctx context.Context, rule domain.Forwa
 	if err != nil {
 		return err
 	}
+	lines, err := s.store.ListLines(ctx)
+	if err != nil {
+		return err
+	}
+	lineByID := make(map[string]domain.Line, len(lines))
+	for _, line := range lines {
+		lineByID[line.ID] = line
+	}
+	targetEgresses := ruleEgressIDs(rule, lineByID)
 	for _, other := range rules {
 		if other.ID == rule.ID || !protocolsOverlap(other.Protocol, rule.Protocol) {
 			continue
@@ -535,11 +602,60 @@ func (s *Server) ensureRulePortsAvailable(ctx context.Context, rule domain.Forwa
 		if other.IngressNodeID == rule.IngressNodeID && other.ListenPort == rule.ListenPort {
 			return fmt.Errorf("入口端口 %d 已被规则 %q 占用", rule.ListenPort, other.Name)
 		}
-		if other.EgressNodeID == rule.EgressNodeID && other.RelayPort == rule.RelayPort {
+		if other.RelayPort == rule.RelayPort && egressSetsOverlap(targetEgresses, ruleEgressIDs(other, lineByID)) {
 			return fmt.Errorf("出口中继端口 %d 已被规则 %q 占用", rule.RelayPort, other.Name)
 		}
 	}
 	return nil
+}
+
+func ruleEgressIDs(rule domain.ForwardRule, lines map[string]domain.Line) []string {
+	if line, ok := lines[rule.LineID]; ok && len(line.EgressNodeIDs) > 0 {
+		return line.EgressNodeIDs
+	}
+	return []string{rule.EgressNodeID}
+}
+
+func egressSetsOverlap(a, b []string) bool {
+	seen := make(map[string]bool, len(a))
+	for _, id := range a {
+		seen[id] = true
+	}
+	for _, id := range b {
+		if seen[id] {
+			return true
+		}
+	}
+	return false
+}
+
+func relayPortUsedAcross(rules []domain.ForwardRule, lines map[string]domain.Line, egressIDs []string, port int, protocol, ignoreID string) bool {
+	for _, rule := range rules {
+		if rule.ID != ignoreID && rule.RelayPort == port && protocolsOverlap(rule.Protocol, protocol) && egressSetsOverlap(egressIDs, ruleEgressIDs(rule, lines)) {
+			return true
+		}
+	}
+	return false
+}
+
+func allocateRelayPortAcross(ranges []portInterval, rules []domain.ForwardRule, lines map[string]domain.Line, egressIDs []string, protocol, ignoreID string) int {
+	for _, interval := range ranges {
+		start := interval.first
+		if interval.first <= 30000 && interval.last >= 30000 {
+			start = 30000
+		}
+		for port := start; port <= interval.last; port++ {
+			if !relayPortUsedAcross(rules, lines, egressIDs, port, protocol, ignoreID) {
+				return port
+			}
+		}
+		for port := interval.first; port < start; port++ {
+			if !relayPortUsedAcross(rules, lines, egressIDs, port, protocol, ignoreID) {
+				return port
+			}
+		}
+	}
+	return 0
 }
 
 func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRule) error {
@@ -548,12 +664,14 @@ func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRul
 		return err
 	}
 	portRange := ""
+	var selectedLine *domain.Line
 	if rule.LineID != "" {
 		line, err := s.store.GetLine(ctx, rule.LineID)
 		if err != nil {
 			return errors.New("线路不存在")
 		}
 		portRange = line.RelayPortRange
+		selectedLine = &line
 	}
 	ranges, err := parsePortRanges(portRange)
 	if err != nil {
@@ -617,11 +735,23 @@ func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRul
 	if err != nil {
 		return err
 	}
-	if rule.RelayPort == 0 || !portInRanges(rule.RelayPort, ranges) || relayPortUsed(rules, rule.EgressNodeID, rule.RelayPort, rule.Protocol, rule.ID) {
-		rule.RelayPort = allocateRelayPort(ranges, rules, rule.EgressNodeID, rule.Protocol, rule.ID)
-		if rule.RelayPort == 0 {
-			return errors.New("出口可用端口范围内没有剩余的中继端口")
+	if selectedLine != nil && len(selectedLine.EgressNodeIDs) > 1 {
+		lines, err := s.store.ListLines(ctx)
+		if err != nil {
+			return err
 		}
+		lineByID := make(map[string]domain.Line, len(lines))
+		for _, line := range lines {
+			lineByID[line.ID] = line
+		}
+		if rule.RelayPort == 0 || !portInRanges(rule.RelayPort, ranges) || relayPortUsedAcross(rules, lineByID, selectedLine.EgressNodeIDs, rule.RelayPort, rule.Protocol, rule.ID) {
+			rule.RelayPort = allocateRelayPortAcross(ranges, rules, lineByID, selectedLine.EgressNodeIDs, rule.Protocol, rule.ID)
+		}
+	} else if rule.RelayPort == 0 || !portInRanges(rule.RelayPort, ranges) || relayPortUsed(rules, rule.EgressNodeID, rule.RelayPort, rule.Protocol, rule.ID) {
+		rule.RelayPort = allocateRelayPort(ranges, rules, rule.EgressNodeID, rule.Protocol, rule.ID)
+	}
+	if rule.RelayPort == 0 {
+		return errors.New("出口可用端口范围内没有剩余的中继端口")
 	}
 	return nil
 }
@@ -756,6 +886,15 @@ func (s *Server) ruleTraffic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, nonNil(items))
 }
 
+func (s *Server) listProbes(w http.ResponseWriter, r *http.Request) {
+	probes, err := s.store.ListLinkProbes(r.Context())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(probes))
+}
+
 func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	var req domain.SyncRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -793,6 +932,16 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if len(req.Probes) > 0 {
+		if err := s.store.UpsertLinkProbes(r.Context(), req.NodeID, req.Probes); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if _, err := s.store.ReconcileFailover(r.Context(), time.Now().UTC()); err != nil {
+		writeError(w, 500, err)
+		return
+	}
 	revision, err := s.store.Revision(r.Context())
 	if err != nil {
 		writeError(w, 500, err)
@@ -816,9 +965,14 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 			peers = append(peers, peer)
 		}
 	}
+	probeTargets, err := s.store.ProbeTargetsForIngress(r.Context(), req.NodeID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
 	node.Status = "online"
 	node.LastSeenAt = time.Now().UTC()
-	writeJSON(w, 200, domain.SyncResponse{Revision: revision, GeneratedAt: time.Now().UTC(), Node: node, Peers: peers, Deployments: deployments})
+	writeJSON(w, 200, domain.SyncResponse{Revision: revision, GeneratedAt: time.Now().UTC(), Node: node, Peers: peers, ProbeTargets: probeTargets, Deployments: deployments})
 }
 
 func requestPublicAddress(r *http.Request) string {

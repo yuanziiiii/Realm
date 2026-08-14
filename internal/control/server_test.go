@@ -55,6 +55,7 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 		"/api/v1/rules",
 		"/api/v1/traffic?period=day",
 		"/api/v1/traffic/rules",
+		"/api/v1/probes",
 	}
 	for _, path := range paths {
 		req, err := http.NewRequest(http.MethodGet, httpServer.URL+path, nil)
@@ -315,6 +316,46 @@ func TestDiscreteProviderPortsAreAcceptedAndAllocated(t *testing.T) {
 	rules := []domain.ForwardRule{{ID: "used", EgressNodeID: "out", RelayPort: 12001, Protocol: "both"}}
 	if got := allocateRelayPort(ranges, rules, "out", "tcp", ""); got != 16388 {
 		t.Fatalf("expected first unused provider port 16388, got %d", got)
+	}
+}
+
+func TestRelayPortAllocationChecksEveryFailoverEgress(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in-a", Name: "入口 A", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "in-b", Name: "入口 B", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.1.2", CreatedAt: now},
+		{ID: "out-a", Name: "出口 A", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+		{ID: "out-b", Name: "共享备用出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.4", CreatedAt: now},
+		{ID: "out-c", Name: "出口 C", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.1.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lineA, err := st.SaveLine(ctx, domain.Line{ID: "line-a", Name: "线路 A", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in-a", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"}, ActiveEgressNodeID: "out-a", FailoverEnabled: true, ListenAddress: "0.0.0.0", RelayPortRange: "20000-20001", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineB, err := st.SaveLine(ctx, domain.Line{ID: "line-b", Name: "线路 B", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in-b", EgressNodeID: "out-c", EgressNodeIDs: []string{"out-c", "out-b"}, ActiveEgressNodeID: "out-c", FailoverEnabled: true, ListenAddress: "0.0.0.0", RelayPortRange: "20000-20001", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "used", LineID: lineA.ID, Name: "已占用", Mode: lineA.Mode, Protocol: "tcp", IngressNodeID: "in-a", EgressNodeID: "out-a", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 20000, TargetHost: "192.0.2.1", TargetPort: 80, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: st}
+	rule := domain.ForwardRule{LineID: lineB.ID, Mode: lineB.Mode, Protocol: "tcp", IngressNodeID: "in-b", EgressNodeID: "out-c", ListenPort: 10001, TargetHost: "192.0.2.2", TargetPort: 80}
+	if err := s.completeSimpleRule(ctx, &rule); err != nil {
+		t.Fatal(err)
+	}
+	if rule.RelayPort != 20001 {
+		t.Fatalf("shared standby port conflict was missed: got %d, want 20001", rule.RelayPort)
 	}
 }
 
