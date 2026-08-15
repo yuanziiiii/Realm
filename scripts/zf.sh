@@ -42,6 +42,7 @@ confirm() {
 }
 run_release_script() {
   local name="$1" tmp_file checksum_file expected actual
+  shift
   command -v curl >/dev/null 2>&1 || { warn '缺少 curl，无法在线执行'; return 1; }
   command -v sha256sum >/dev/null 2>&1 || { warn '缺少 sha256sum，无法校验更新文件'; return 1; }
   tmp_file="$(mktemp)" || return 1
@@ -59,7 +60,7 @@ run_release_script() {
     warn "${name} 的 SHA-256 校验失败，已停止执行"
     return 1
   fi
-  bash "${tmp_file}"
+  bash "${tmp_file}" "$@"
   local result=$?
   rm -f "${tmp_file}" "${checksum_file}"
   return "${result}"
@@ -138,6 +139,10 @@ control_info() {
     "${current_version:-未记录}" "${install_dir}" "${host_ip:-服务器IP}" "${http_port:-8080}" "${secure:-false}"
   warn 'HTTPS 域名由你的 1Panel、宝塔或其他反向代理管理，zf 不会覆盖反代配置。'
 }
+control_uninstall() {
+  warn '卸载主控会停止面板；卸载脚本将要求输入大写 YES，并默认保留数据库卷与可恢复目录。'
+  run_release_script uninstall.sh --control && exit 0
+}
 
 agent_status() { systemctl status "${agent_service}" --no-pager -l || true; }
 agent_update() {
@@ -208,6 +213,10 @@ agent_environment() {
     || { printf '%b✗%b Agent 服务 未运行\n' "${red}" "${reset}"; failed=1; }
   return "${failed}"
 }
+agent_uninstall() {
+  warn '卸载 Agent 会停止同步并清理本面板创建的转发；卸载脚本将要求输入大写 YES。'
+  run_release_script uninstall.sh --agent && exit 0
+}
 
 print_header() {
   local role="$1"
@@ -220,15 +229,15 @@ control_menu() {
   local choice
   while true; do
     clear_screen; print_header '主控端'
-    printf ' %b1.%b 查看主控状态\n %b2.%b 检测并更新主控\n %b3.%b 重启主控\n %b4.%b 启动主控\n %b5.%b 停止主控\n %b6.%b 查看主控日志\n %b7.%b 运行健康检查\n %b8.%b 重置管理员密码\n %b9.%b 显示访问配置\n %b0.%b 退出\n\n请选择：' \
+    printf ' %b1.%b 查看主控状态\n %b2.%b 检测并更新主控\n %b3.%b 重启主控\n %b4.%b 启动主控\n %b5.%b 停止主控\n %b6.%b 查看主控日志\n %b7.%b 运行健康检查\n %b8.%b 重置管理员密码\n %b9.%b 显示访问配置\n %b10.%b 安全卸载主控\n %b0.%b 退出\n\n请选择：' \
       "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" \
-      "${green}" "${reset}" "${green}" "${reset}" "${yellow}" "${reset}" "${green}" "${reset}" "${cyan}" "${reset}" > /dev/tty
+      "${green}" "${reset}" "${green}" "${reset}" "${yellow}" "${reset}" "${green}" "${reset}" "${red}" "${reset}" "${cyan}" "${reset}" > /dev/tty
     IFS= read -r choice < /dev/tty || break
     printf '\n'
     case "${choice}" in
       1) control_status ;; 2) control_update ;; 3) control_restart ;; 4) control_start ;; 5) control_stop ;;
-      6) control_logs ;; 7) control_health ;; 8) control_password ;; 9) control_info ;; 0) break ;;
-      *) warn '请输入 0-9' ;;
+      6) control_logs ;; 7) control_health ;; 8) control_password ;; 9) control_info ;; 10) control_uninstall ;; 0) break ;;
+      *) warn '请输入 0-10' ;;
     esac
     [[ "${choice}" == '0' ]] || pause_menu
   done
@@ -237,15 +246,15 @@ agent_menu() {
   local choice
   while true; do
     clear_screen; print_header 'Agent 被控端'
-    printf ' %b1.%b 查看 Agent 状态\n %b2.%b 在线更新 Agent\n %b3.%b 重启 Agent\n %b4.%b 启动 Agent\n %b5.%b 停止 Agent\n %b6.%b 查看 Agent 日志\n %b7.%b 测试主控连通性\n %b8.%b 显示节点信息\n %b9.%b 检查转发环境\n %b0.%b 退出\n\n请选择：' \
+    printf ' %b1.%b 查看 Agent 状态\n %b2.%b 在线更新 Agent\n %b3.%b 重启 Agent\n %b4.%b 启动 Agent\n %b5.%b 停止 Agent\n %b6.%b 查看 Agent 日志\n %b7.%b 测试主控连通性\n %b8.%b 显示节点信息\n %b9.%b 检查转发环境\n %b10.%b 安全卸载 Agent\n %b0.%b 退出\n\n请选择：' \
       "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" \
-      "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${cyan}" "${reset}" > /dev/tty
+      "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${red}" "${reset}" "${cyan}" "${reset}" > /dev/tty
     IFS= read -r choice < /dev/tty || break
     printf '\n'
     case "${choice}" in
       1) agent_status ;; 2) agent_update ;; 3) agent_restart ;; 4) agent_start ;; 5) agent_stop ;;
-      6) agent_logs ;; 7) agent_connectivity ;; 8) agent_info ;; 9) agent_environment ;; 0) break ;;
-      *) warn '请输入 0-9' ;;
+      6) agent_logs ;; 7) agent_connectivity ;; 8) agent_info ;; 9) agent_environment ;; 10) agent_uninstall ;; 0) break ;;
+      *) warn '请输入 0-10' ;;
     esac
     [[ "${choice}" == '0' ]] || pause_menu
   done
@@ -257,9 +266,11 @@ run_command() {
     control:status) control_status ;; control:update) control_update ;; control:restart) control_restart ;;
     control:start) control_start ;; control:stop) control_stop ;; control:logs) control_logs ;;
     control:doctor) control_health ;; control:password) control_password ;; control:info) control_info ;;
+    control:uninstall) control_uninstall ;;
     agent:status) agent_status ;; agent:update) agent_update ;; agent:restart) agent_restart ;;
     agent:start) agent_start ;; agent:stop) agent_stop ;; agent:logs) agent_logs ;;
     agent:doctor) agent_connectivity; agent_environment ;; agent:info) agent_info ;;
+    agent:uninstall) agent_uninstall ;;
     *) warn "未知命令：${command_name}"; return 2 ;;
   esac
 }

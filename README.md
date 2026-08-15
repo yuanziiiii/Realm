@@ -123,11 +123,11 @@ zf
 
 工具会自动识别当前机器角色。存在有效 Agent 配置和 `relay-agent.service` 时只显示被控端菜单，不会因残留的主控目录误显示主控功能；主控端则需要完整的 Docker Compose 与环境配置。主控菜单包含状态、在线更新、启停/重启、日志、健康检查、密码重置和访问配置；Agent 菜单包含状态、在线更新、启停/重启、日志、主控连通性、节点信息和转发环境检查。Agent Token 只显示“已配置/缺失”，不会输出明文。
 
-停止服务和密码重置均需要二次确认。工具不会提供容易误删数据库与现有转发的一键卸载入口。
+停止服务和密码重置均需要二次确认。主控端和 Agent 端菜单都提供 `10. 安全卸载`：选择后会下载并校验正式版卸载脚本，仍需输入大写 `YES` 才会执行，不提供容易误触的免确认卸载。
 
 ### 卸载
 
-卸载是独立脚本，不放进 `zf` 菜单，避免误触。脚本会自动识别当前机器是主控还是 Agent，并要求输入 `YES`。默认卸载会保留可恢复数据：Agent 配置备份到 `/var/backups/relay-panel/`；主控目录移动为 `/opt/relay-panel.backup-时间`，Docker 数据卷不会删除。
+可以直接运行 `zf` 并选择 `10. 安全卸载`，也可以执行下面的独立命令。脚本会自动识别当前机器是主控还是 Agent，并要求输入 `YES`。默认卸载会保留可恢复数据：Agent 配置备份到 `/var/backups/relay-panel/`；主控目录移动为 `/opt/relay-panel.backup-时间`，Docker 数据卷不会删除。
 
 ```bash
 curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/uninstall.sh | sudo bash
