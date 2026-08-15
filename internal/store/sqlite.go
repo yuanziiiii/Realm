@@ -717,6 +717,40 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	return r, nil
 }
 
+// ImportRules creates a validated batch under one revision and one
+// transaction, so Agents never observe a partially imported rule set.
+func (s *Store) ImportRules(ctx context.Context, rules []domain.ForwardRule) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	revision, err := s.bumpRevision(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	for i := range rules {
+		rule := rules[i]
+		rule.NormalizeEngines()
+		rule.NormalizeRelayPorts()
+		rule.Revision = revision
+		rule.UpdatedAt = now
+		if rule.CreatedAt.IsZero() {
+			rule.CreatedAt = now
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.audit(ctx, "import", "rules", "batch", fmt.Sprintf("%d rules", len(rules)))
+	return revision, nil
+}
+
 // ImportTopology merges a validated configuration package atomically. Lines
 // are written before rules, while one shared revision makes every affected
 // Agent observe the restored topology as a single change.

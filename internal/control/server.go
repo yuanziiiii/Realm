@@ -63,6 +63,31 @@ type configurationImportResult struct {
 	Revision int64 `json:"revision,omitempty"`
 }
 
+type ruleBatchItem struct {
+	Name         string `json:"name"`
+	Protocol     string `json:"protocol"`
+	ListenPort   int    `json:"listen_port"`
+	TargetHost   string `json:"target_host"`
+	TargetPort   int    `json:"target_port"`
+	UploadMbps   int    `json:"upload_mbps"`
+	DownloadMbps int    `json:"download_mbps"`
+	BurstKBytes  int    `json:"burst_kbytes"`
+	Enabled      *bool  `json:"enabled,omitempty"`
+}
+
+type ruleBatchImport struct {
+	Format        string          `json:"format"`
+	SchemaVersion int             `json:"schema_version"`
+	LineID        string          `json:"line_id"`
+	Rules         []ruleBatchItem `json:"rules"`
+}
+
+type ruleBatchImportResult struct {
+	DryRun   bool  `json:"dry_run"`
+	Rules    int   `json:"rules"`
+	Revision int64 `json:"revision,omitempty"`
+}
+
 func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -146,6 +171,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/lines/{id}", s.requireAdmin(s.deleteLine))
 	mux.HandleFunc("GET /api/v1/rules", s.requireAdmin(s.listRules))
 	mux.HandleFunc("POST /api/v1/rules", s.requireAdmin(s.saveRule))
+	mux.HandleFunc("POST /api/v1/rules/import", s.requireAdmin(s.importRules))
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
@@ -890,6 +916,110 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, saved)
 }
 
+func (s *Server) importRules(w http.ResponseWriter, r *http.Request) {
+	var batch ruleBatchImport
+	if err := decodeJSON(r, &batch); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("批量规则文件不是有效的 Relay Panel JSON"))
+		return
+	}
+	rules, err := s.prepareRuleBatch(r.Context(), batch)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	dryRun := r.URL.Query().Get("dry_run") == "1"
+	result := ruleBatchImportResult{DryRun: dryRun, Rules: len(rules)}
+	if !dryRun {
+		result.Revision, err = s.store.ImportRules(r.Context(), rules)
+		if err != nil {
+			writeError(w, http.StatusConflict, fmt.Errorf("批量导入失败，未写入任何规则：%w", err))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) prepareRuleBatch(ctx context.Context, batch ruleBatchImport) ([]domain.ForwardRule, error) {
+	if batch.Format != "relay-panel-rule-batch" || batch.SchemaVersion != 1 {
+		return nil, errors.New("批量规则文件格式或版本不受支持")
+	}
+	if len(batch.Rules) == 0 {
+		return nil, errors.New("批量规则文件中没有规则")
+	}
+	if len(batch.Rules) > 500 {
+		return nil, errors.New("一次最多导入 500 条规则")
+	}
+	line, err := s.store.GetLine(ctx, strings.TrimSpace(batch.LineID))
+	if err != nil || !line.Enabled {
+		return nil, errors.New("请选择可用线路")
+	}
+	lines, err := s.store.ListLines(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lineByID := make(map[string]domain.Line, len(lines))
+	for _, existingLine := range lines {
+		lineByID[existingLine.ID] = existingLine
+	}
+	lineByID[line.ID] = line
+	occupied, err := s.store.ListRules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	prepared := make([]domain.ForwardRule, 0, len(batch.Rules))
+	for index, item := range batch.Rules {
+		protocol := strings.ToLower(strings.TrimSpace(item.Protocol))
+		if protocol == "" {
+			protocol = "both"
+		}
+		targetPort := item.TargetPort
+		if targetPort == 0 {
+			targetPort = item.ListenPort
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" && strings.TrimSpace(item.TargetHost) != "" {
+			name = fmt.Sprintf("%s:%d", strings.TrimSpace(item.TargetHost), targetPort)
+		}
+		enabled := true
+		if item.Enabled != nil {
+			enabled = *item.Enabled
+		}
+		burst := item.BurstKBytes
+		if burst == 0 {
+			burst = 512
+		}
+		rule := domain.ForwardRule{
+			ID: randomID("rule"), LineID: line.ID, Mode: line.Mode, Name: name, Protocol: protocol,
+			IngressNodeID: line.IngressNodeID, EgressNodeID: line.EgressNodeID, ListenAddress: line.ListenAddress,
+			ListenPort: item.ListenPort, TargetHost: strings.TrimSpace(item.TargetHost), TargetPort: targetPort,
+			Engine: line.Engine, IngressEngine: line.IngressEngine, EgressEngine: line.EgressEngine,
+			UploadMbps: item.UploadMbps, DownloadMbps: item.DownloadMbps, BurstKBytes: burst, Enabled: enabled,
+		}
+		if line.Mode == domain.ForwardModeExitOnly {
+			ranges, rangeErr := parsePortRanges(line.RelayPortRangeFor(line.EgressNodeID))
+			if rangeErr != nil {
+				return nil, rangeErr
+			}
+			rule.RelayPort = rule.ListenPort
+			rule.RelayPorts = map[string]int{line.EgressNodeID: rule.ListenPort}
+			if !portInRanges(rule.ListenPort, ranges) {
+				return nil, fmt.Errorf("第 %d 条规则：接入端口 %d 不在出口可用端口范围 %s 内", index+1, rule.ListenPort, displayPortRange(line.RelayPortRangeFor(line.EgressNodeID)))
+			}
+		} else if err := allocateRulePortsForLine(&rule, line, occupied, lineByID); err != nil {
+			return nil, fmt.Errorf("第 %d 条规则：%w", index+1, err)
+		}
+		if err := validateRule(rule); err != nil {
+			return nil, fmt.Errorf("第 %d 条规则：%w", index+1, err)
+		}
+		if err := ensureRulePortsAvailableAgainst(rule, occupied, lineByID); err != nil {
+			return nil, fmt.Errorf("第 %d 条规则：%w", index+1, err)
+		}
+		prepared = append(prepared, rule)
+		occupied = append(occupied, rule)
+	}
+	return prepared, nil
+}
+
 func (s *Server) ensureRulePortsAvailable(ctx context.Context, rule domain.ForwardRule) error {
 	rules, err := s.store.ListRules(ctx)
 	if err != nil {
@@ -903,6 +1033,10 @@ func (s *Server) ensureRulePortsAvailable(ctx context.Context, rule domain.Forwa
 	for _, line := range lines {
 		lineByID[line.ID] = line
 	}
+	return ensureRulePortsAvailableAgainst(rule, rules, lineByID)
+}
+
+func ensureRulePortsAvailableAgainst(rule domain.ForwardRule, rules []domain.ForwardRule, lineByID map[string]domain.Line) error {
 	targetEgresses := ruleEgressIDs(rule, lineByID)
 	for _, other := range rules {
 		if other.ID == rule.ID || !protocolsOverlap(other.Protocol, rule.Protocol) {

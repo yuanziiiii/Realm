@@ -168,6 +168,83 @@ func TestConfigurationExportDryRunAndImportRestoreTopology(t *testing.T) {
 	}
 }
 
+func TestRuleBatchImportDryRunCreatesRulesAtomically(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now},
+		{ID: "out-a", Name: "出口 A", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out-b", Name: "出口 B", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{
+		ID: "line", Name: "批量线路", Mode: domain.ForwardModeDualManaged,
+		IngressNodeID: "in", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"}, ActiveEgressNodeID: "out-a",
+		ListenAddress: "0.0.0.0", RelayPortRange: "1301-1349", EgressPortRanges: map[string]string{"out-a": "1301-1349", "out-b": "2301-2349"},
+		Engine: "nftables", IngressEngine: "nftables", EgressEngine: "nftables", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	batch := ruleBatchImport{
+		Format: "relay-panel-rule-batch", SchemaVersion: 1, LineID: line.ID,
+		Rules: []ruleBatchItem{
+			{Name: "落地一", Protocol: "both", ListenPort: 11301, TargetHost: "38.49.57.74", TargetPort: 36666},
+			{Name: "落地二", Protocol: "tcp", ListenPort: 11302, TargetHost: "38.49.57.75", TargetPort: 36667},
+		},
+	}
+	payload, _ := json.Marshal(batch)
+	dryRun := httptest.NewRecorder()
+	server.importRules(dryRun, httptest.NewRequest(http.MethodPost, "/api/v1/rules/import?dry_run=1", bytes.NewReader(payload)))
+	if dryRun.Code != http.StatusOK || !bytes.Contains(dryRun.Body.Bytes(), []byte(`"rules":2`)) {
+		t.Fatalf("unexpected dry run: %d %s", dryRun.Code, dryRun.Body.String())
+	}
+	if rules, _ := st.ListRules(ctx); len(rules) != 0 {
+		t.Fatal("dry run wrote rules")
+	}
+
+	actual := httptest.NewRecorder()
+	server.importRules(actual, httptest.NewRequest(http.MethodPost, "/api/v1/rules/import", bytes.NewReader(payload)))
+	if actual.Code != http.StatusOK {
+		t.Fatalf("unexpected import response: %d %s", actual.Code, actual.Body.String())
+	}
+	rules, err := st.ListRules(ctx)
+	if err != nil || len(rules) != 2 {
+		t.Fatalf("unexpected imported rules: %+v, %v", rules, err)
+	}
+	byListen := map[int]domain.ForwardRule{}
+	for _, rule := range rules {
+		byListen[rule.ListenPort] = rule
+	}
+	if byListen[11301].RelayPortFor("out-a") != 1301 || byListen[11301].RelayPortFor("out-b") != 2301 || byListen[11302].RelayPortFor("out-a") != 1302 || byListen[11302].RelayPortFor("out-b") != 2302 {
+		t.Fatalf("batch ports were not allocated independently: %+v", byListen)
+	}
+
+	invalid := batch
+	invalid.Rules = []ruleBatchItem{
+		{Name: "本应回滚", Protocol: "tcp", ListenPort: 11303, TargetHost: "38.49.57.76", TargetPort: 36668},
+		{Name: "冲突", Protocol: "tcp", ListenPort: 11301, TargetHost: "38.49.57.77", TargetPort: 36669},
+	}
+	invalidPayload, _ := json.Marshal(invalid)
+	failed := httptest.NewRecorder()
+	server.importRules(failed, httptest.NewRequest(http.MethodPost, "/api/v1/rules/import", bytes.NewReader(invalidPayload)))
+	if failed.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("conflicting batch should fail validation: %d %s", failed.Code, failed.Body.String())
+	}
+	if rules, _ := st.ListRules(ctx); len(rules) != 2 {
+		t.Fatalf("failed batch partially wrote rules: %+v", rules)
+	}
+}
+
 func TestChangePasswordVerifiesCurrentPasswordAndInvalidatesSessions(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
