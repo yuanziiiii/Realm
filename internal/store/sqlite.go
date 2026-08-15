@@ -689,6 +689,56 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	return r, nil
 }
 
+// ImportTopology merges a validated configuration package atomically. Lines
+// are written before rules, while one shared revision makes every affected
+// Agent observe the restored topology as a single change.
+func (s *Store) ImportTopology(ctx context.Context, lines []domain.Line, rules []domain.ForwardRule) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	revision, err := s.bumpRevision(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	for i := range lines {
+		line := lines[i]
+		line.NormalizeEngines()
+		normalizeLineEgresses(&line)
+		line.UpdatedAt = now
+		if line.CreatedAt.IsZero() {
+			line.CreatedAt = now
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO lines(`+lineColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,relay_port_range=excluded.relay_port_range,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,egress_node_ids=excluded.egress_node_ids,active_egress_node_id=excluded.active_egress_node_id,failover_enabled=excluded.failover_enabled,enabled=excluded.enabled,updated_at=excluded.updated_at`, lineArgs(line)...)
+		if err != nil {
+			return 0, err
+		}
+	}
+	for i := range rules {
+		rule := rules[i]
+		rule.NormalizeEngines()
+		rule.Revision = revision
+		rule.UpdatedAt = now
+		if rule.CreatedAt.IsZero() {
+			rule.CreatedAt = now
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, rule.ID, rule.LineID, rule.Mode, rule.Name, rule.Protocol, rule.IngressNodeID, rule.EgressNodeID, rule.ListenAddress, rule.ListenPort, rule.RelayPort, rule.TargetHost, rule.TargetPort, rule.Engine, rule.IngressEngine, rule.EgressEngine, rule.UploadMbps, rule.DownloadMbps, rule.BurstKBytes, boolInt(rule.Enabled), rule.Revision, unix(rule.CreatedAt), unix(rule.UpdatedAt))
+		if err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM target_probes WHERE rule_id=?`, rule.ID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.audit(ctx, "import", "topology", "configuration", fmt.Sprintf("%d lines, %d rules", len(lines), len(rules)))
+	return revision, nil
+}
+
 func (s *Store) DeleteRule(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

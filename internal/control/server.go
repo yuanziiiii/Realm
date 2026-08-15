@@ -41,6 +41,28 @@ type Options struct {
 	Logger        *slog.Logger
 }
 
+type configNodeReference struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Role domain.NodeRole `json:"role"`
+}
+
+type configurationBackup struct {
+	Format        string                `json:"format"`
+	SchemaVersion int                   `json:"schema_version"`
+	ExportedAt    time.Time             `json:"exported_at"`
+	Nodes         []configNodeReference `json:"required_nodes"`
+	Lines         []domain.Line         `json:"lines"`
+	Rules         []domain.ForwardRule  `json:"rules"`
+}
+
+type configurationImportResult struct {
+	DryRun   bool  `json:"dry_run"`
+	Lines    int   `json:"lines"`
+	Rules    int   `json:"rules"`
+	Revision int64 `json:"revision,omitempty"`
+}
+
 func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -130,6 +152,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/traffic/rules", s.requireAdmin(s.ruleTraffic))
 	mux.HandleFunc("GET /api/v1/probes", s.requireAdmin(s.listProbes))
 	mux.HandleFunc("GET /api/v1/target-probes", s.requireAdmin(s.listTargetProbes))
+	mux.HandleFunc("GET /api/v1/config/export", s.requireAdmin(s.exportConfiguration))
+	mux.HandleFunc("POST /api/v1/config/import", s.requireAdmin(s.importConfiguration))
 	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if s.webProxy != nil {
@@ -139,6 +163,194 @@ func (s *Server) Handler() http.Handler {
 		http.NotFound(w, r)
 	})
 	return requestLog(s.log, mux)
+}
+
+func (s *Server) exportConfiguration(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.store.ListNodes(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	lines, err := s.store.ListLines(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	rules, err := s.store.ListRules(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	required := map[string]bool{}
+	for _, line := range lines {
+		required[line.IngressNodeID] = true
+		for _, id := range line.EgressNodeIDs {
+			required[id] = true
+		}
+	}
+	for _, rule := range rules {
+		required[rule.IngressNodeID] = true
+		required[rule.EgressNodeID] = true
+	}
+	references := make([]configNodeReference, 0, len(required))
+	for _, node := range nodes {
+		if required[node.ID] {
+			references = append(references, configNodeReference{ID: node.ID, Name: node.Name, Role: node.Role})
+		}
+	}
+	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
+	backup := configurationBackup{Format: "relay-panel-configuration", SchemaVersion: 1, ExportedAt: now, Nodes: references, Lines: nonNil(lines), Rules: nonNil(rules)}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="relay-panel-config-%s.json"`, now.Format("20060102-150405")))
+	writeJSON(w, http.StatusOK, backup)
+}
+
+func (s *Server) importConfiguration(w http.ResponseWriter, r *http.Request) {
+	var backup configurationBackup
+	if err := decodeJSON(r, &backup); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("配置文件不是有效的 Relay Panel JSON"))
+		return
+	}
+	lines, rules, err := s.prepareConfigurationImport(r.Context(), backup)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	dryRun := r.URL.Query().Get("dry_run") == "1"
+	result := configurationImportResult{DryRun: dryRun, Lines: len(lines), Rules: len(rules)}
+	if !dryRun {
+		result.Revision, err = s.store.ImportTopology(r.Context(), lines, rules)
+		if err != nil {
+			writeError(w, http.StatusConflict, fmt.Errorf("导入失败，未写入任何配置：%w", err))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) prepareConfigurationImport(ctx context.Context, backup configurationBackup) ([]domain.Line, []domain.ForwardRule, error) {
+	if backup.Format != "relay-panel-configuration" || backup.SchemaVersion != 1 {
+		return nil, nil, errors.New("配置文件格式或版本不受支持")
+	}
+	if len(backup.Lines) > 200 || len(backup.Rules) > 2000 {
+		return nil, nil, errors.New("配置文件包含过多线路或规则")
+	}
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodeByID := make(map[string]domain.Node, len(nodes))
+	for _, node := range nodes {
+		nodeByID[node.ID] = node
+	}
+	existingLines, err := s.store.ListLines(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	lineByID := make(map[string]domain.Line, len(existingLines)+len(backup.Lines))
+	for _, line := range existingLines {
+		lineByID[line.ID] = line
+	}
+	importedLineIDs := make(map[string]bool, len(backup.Lines))
+	for i := range backup.Lines {
+		line := backup.Lines[i]
+		if line.ID == "" || importedLineIDs[line.ID] {
+			return nil, nil, errors.New("配置文件包含空线路 ID 或重复线路")
+		}
+		importedLineIDs[line.ID] = true
+		line.NormalizeEngines()
+		if err := s.completeLine(ctx, &line); err != nil {
+			return nil, nil, fmt.Errorf("线路 %q 无法导入：%w", line.Name, err)
+		}
+		if err := validateLine(line); err != nil {
+			return nil, nil, fmt.Errorf("线路 %q 无法导入：%w", line.Name, err)
+		}
+		backup.Lines[i] = line
+		lineByID[line.ID] = line
+	}
+	existingRules, err := s.store.ListRules(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	importedRuleIDs := make(map[string]bool, len(backup.Rules))
+	for _, rule := range backup.Rules {
+		if rule.ID == "" || importedRuleIDs[rule.ID] {
+			return nil, nil, errors.New("配置文件包含空规则 ID 或重复规则")
+		}
+		importedRuleIDs[rule.ID] = true
+	}
+	for _, existing := range existingRules {
+		if importedLineIDs[existing.LineID] && !importedRuleIDs[existing.ID] {
+			return nil, nil, fmt.Errorf("线路 %q 的备份不完整，缺少当前规则 %q", lineByID[existing.LineID].Name, existing.Name)
+		}
+	}
+	for i := range backup.Rules {
+		rule := backup.Rules[i]
+		if rule.BurstKBytes == 0 {
+			rule.BurstKBytes = 512
+		}
+		if rule.LineID != "" {
+			line, ok := lineByID[rule.LineID]
+			if !ok || !importedLineIDs[rule.LineID] {
+				return nil, nil, fmt.Errorf("规则 %q 缺少对应的线路备份", rule.Name)
+			}
+			rule.Mode = line.Mode
+			rule.IngressNodeID = line.IngressNodeID
+			rule.EgressNodeID = line.EgressNodeID
+			rule.ListenAddress = line.ListenAddress
+			rule.Engine = line.Engine
+			rule.IngressEngine = line.IngressEngine
+			rule.EgressEngine = line.EgressEngine
+			ranges, rangeErr := parsePortRanges(line.RelayPortRange)
+			if rangeErr != nil {
+				return nil, nil, rangeErr
+			}
+			if line.Mode == domain.ForwardModeExitOnly {
+				rule.RelayPort = rule.ListenPort
+			}
+			if !portInRanges(rule.RelayPort, ranges) {
+				return nil, nil, fmt.Errorf("规则 %q 的中继端口不在线路端口范围内", rule.Name)
+			}
+		} else if err := s.completeSimpleRule(ctx, &rule); err != nil {
+			return nil, nil, fmt.Errorf("规则 %q 无法导入：%w", rule.Name, err)
+		}
+		rule.NormalizeEngines()
+		if _, ok := nodeByID[rule.IngressNodeID]; !ok {
+			return nil, nil, fmt.Errorf("规则 %q 引用的入口服务器不存在", rule.Name)
+		}
+		if _, ok := nodeByID[rule.EgressNodeID]; !ok {
+			return nil, nil, fmt.Errorf("规则 %q 引用的出口服务器不存在", rule.Name)
+		}
+		if err := validateRule(rule); err != nil {
+			return nil, nil, fmt.Errorf("规则 %q 无法导入：%w", rule.Name, err)
+		}
+		backup.Rules[i] = rule
+	}
+	finalRuleByID := make(map[string]domain.ForwardRule, len(existingRules)+len(backup.Rules))
+	for _, rule := range existingRules {
+		finalRuleByID[rule.ID] = rule
+	}
+	for _, rule := range backup.Rules {
+		finalRuleByID[rule.ID] = rule
+	}
+	finalRules := make([]domain.ForwardRule, 0, len(finalRuleByID))
+	for _, rule := range finalRuleByID {
+		finalRules = append(finalRules, rule)
+	}
+	for i := 0; i < len(finalRules); i++ {
+		for j := i + 1; j < len(finalRules); j++ {
+			a, b := finalRules[i], finalRules[j]
+			if !protocolsOverlap(a.Protocol, b.Protocol) {
+				continue
+			}
+			if a.IngressNodeID == b.IngressNodeID && a.ListenPort == b.ListenPort {
+				return nil, nil, fmt.Errorf("规则 %q 与 %q 的入口端口冲突", a.Name, b.Name)
+			}
+			if a.RelayPort == b.RelayPort && egressSetsOverlap(ruleEgressIDs(a, lineByID), ruleEgressIDs(b, lineByID)) {
+				return nil, nil, fmt.Errorf("规则 %q 与 %q 的出口中继端口冲突", a.Name, b.Name)
+			}
+		}
+	}
+	return backup.Lines, backup.Rules, nil
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,72 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 		if path != "/api/v1/me" && path != "/api/v1/dashboard" && !bytes.Equal(bytes.TrimSpace(body), []byte("[]")) {
 			t.Fatalf("GET %s must return [] on a fresh install: %s", path, body)
 		}
+	}
+}
+
+func TestConfigurationExportDryRunAndImportRestoreTopology(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: time.Now().UTC()},
+		{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.2", CreatedAt: time.Now().UTC()},
+	} {
+		if err := st.CreateNode(ctx, node, "secret-token-hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "测试线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", EgressNodeIDs: []string{"out"}, ActiveEgressNodeID: "out", ListenAddress: "0.0.0.0", Engine: "nftables", IngressEngine: "nftables", EgressEngine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.SaveRule(ctx, domain.ForwardRule{ID: "rule", LineID: line.ID, Name: "网站", Mode: line.Mode, Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.8", TargetPort: 443, Engine: "nftables", IngressEngine: "nftables", EgressEngine: "nftables", BurstKBytes: 512, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	exportResponse := httptest.NewRecorder()
+	server.exportConfiguration(exportResponse, httptest.NewRequest(http.MethodGet, "/api/v1/config/export", nil))
+	if exportResponse.Code != http.StatusOK || !strings.Contains(exportResponse.Header().Get("Content-Disposition"), ".json") {
+		t.Fatalf("unexpected export response: %d %s", exportResponse.Code, exportResponse.Body.String())
+	}
+	if bytes.Contains(exportResponse.Body.Bytes(), []byte("secret-token-hash")) || bytes.Contains(exportResponse.Body.Bytes(), []byte("agent_token")) {
+		t.Fatal("configuration export leaked Agent credentials")
+	}
+	var backup configurationBackup
+	if err := json.Unmarshal(exportResponse.Body.Bytes(), &backup); err != nil {
+		t.Fatal(err)
+	}
+	if len(backup.Lines) != 1 || len(backup.Rules) != 1 || len(backup.Nodes) != 2 {
+		t.Fatalf("unexpected export: %+v", backup)
+	}
+	if err := st.DeleteRule(ctx, "rule"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteLine(ctx, "line"); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(backup)
+	dryRunResponse := httptest.NewRecorder()
+	server.importConfiguration(dryRunResponse, httptest.NewRequest(http.MethodPost, "/api/v1/config/import?dry_run=1", bytes.NewReader(payload)))
+	if dryRunResponse.Code != http.StatusOK || !bytes.Contains(dryRunResponse.Body.Bytes(), []byte(`"dry_run":true`)) {
+		t.Fatalf("unexpected dry-run response: %d %s", dryRunResponse.Code, dryRunResponse.Body.String())
+	}
+	if lines, _ := st.ListLines(ctx); len(lines) != 0 {
+		t.Fatal("dry run unexpectedly wrote lines")
+	}
+	importResponse := httptest.NewRecorder()
+	server.importConfiguration(importResponse, httptest.NewRequest(http.MethodPost, "/api/v1/config/import", bytes.NewReader(payload)))
+	if importResponse.Code != http.StatusOK {
+		t.Fatalf("unexpected import response: %d %s", importResponse.Code, importResponse.Body.String())
+	}
+	lines, _ := st.ListLines(ctx)
+	rules, _ := st.ListRules(ctx)
+	if len(lines) != 1 || lines[0].ID != "line" || len(rules) != 1 || rules[0].ID != "rule" {
+		t.Fatalf("topology was not restored: lines=%+v rules=%+v", lines, rules)
 	}
 }
 

@@ -300,6 +300,34 @@ func TestTargetProbesAreStoredForEgressDeployments(t *testing.T) {
 	}
 }
 
+func TestImportTopologyRollsBackOnRuleConflict(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now}, {ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line := domain.Line{ID: "line", Name: "线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", EgressNodeIDs: []string{"out"}, ActiveEgressNodeID: "out", ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true}
+	rules := []domain.ForwardRule{
+		{ID: "a", LineID: "line", Name: "A", Mode: domain.ForwardModeDualManaged, Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.1", TargetPort: 80, Engine: "nftables", Enabled: true},
+		{ID: "b", LineID: "line", Name: "B", Mode: domain.ForwardModeDualManaged, Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30001, TargetHost: "192.0.2.2", TargetPort: 80, Engine: "nftables", Enabled: true},
+	}
+	if _, err := st.ImportTopology(ctx, []domain.Line{line}, rules); err == nil {
+		t.Fatal("expected unique port conflict")
+	}
+	lines, _ := st.ListLines(ctx)
+	storedRules, _ := st.ListRules(ctx)
+	if len(lines) != 0 || len(storedRules) != 0 {
+		t.Fatalf("failed import was not atomic: lines=%+v rules=%+v", lines, storedRules)
+	}
+}
+
 func TestHeartbeatExposesApplyFailureToThePanel(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
