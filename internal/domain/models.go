@@ -42,8 +42,11 @@ type ForwardRule struct {
 	ListenAddress string      `json:"listen_address"`
 	ListenPort    int         `json:"listen_port"`
 	RelayPort     int         `json:"relay_port"`
-	TargetHost    string      `json:"target_host"`
-	TargetPort    int         `json:"target_port"`
+	// RelayPorts stores the independently allocated relay port for each egress.
+	// RelayPort remains the primary egress value for older Agents and clients.
+	RelayPorts map[string]int `json:"relay_ports"`
+	TargetHost string         `json:"target_host"`
+	TargetPort int            `json:"target_port"`
 	// Engine is retained as a compatibility field for older Agents and API
 	// clients. The controller rewrites it to the engine for each deployment.
 	Engine        string    `json:"engine"`
@@ -72,6 +75,10 @@ type Line struct {
 	FailoverEnabled    bool        `json:"failover_enabled"`
 	ListenAddress      string      `json:"listen_address"`
 	RelayPortRange     string      `json:"relay_port_range"`
+	// EgressPortRanges allows NAT exits on the same managed line to use
+	// different provider-assigned port ranges. RelayPortRange mirrors the
+	// primary exit range for compatibility.
+	EgressPortRanges map[string]string `json:"egress_port_ranges"`
 	// Engine mirrors EgressEngine for compatibility with older clients.
 	Engine        string    `json:"engine"`
 	IngressEngine string    `json:"ingress_engine"`
@@ -109,8 +116,60 @@ func (line *Line) NormalizeEngines() {
 	line.Engine, line.IngressEngine, line.EgressEngine = NormalizeEngines(line.Engine, line.IngressEngine, line.EgressEngine, line.Mode)
 }
 
+func (line *Line) NormalizeEgressPortRanges() {
+	if line.EgressPortRanges == nil {
+		line.EgressPortRanges = map[string]string{}
+	}
+	if line.EgressNodeID != "" {
+		if _, ok := line.EgressPortRanges[line.EgressNodeID]; !ok {
+			line.EgressPortRanges[line.EgressNodeID] = line.RelayPortRange
+		}
+		line.RelayPortRange = line.EgressPortRanges[line.EgressNodeID]
+	}
+}
+
+func (line Line) RelayPortRangeFor(egressNodeID string) string {
+	if value, ok := line.EgressPortRanges[egressNodeID]; ok {
+		return value
+	}
+	return line.RelayPortRange
+}
+
 func (rule *ForwardRule) NormalizeEngines() {
 	rule.Engine, rule.IngressEngine, rule.EgressEngine = NormalizeEngines(rule.Engine, rule.IngressEngine, rule.EgressEngine, rule.Mode)
+}
+
+func (rule *ForwardRule) NormalizeRelayPorts() {
+	if rule.RelayPorts == nil {
+		rule.RelayPorts = map[string]int{}
+	}
+	if rule.EgressNodeID != "" {
+		if _, ok := rule.RelayPorts[rule.EgressNodeID]; !ok && rule.RelayPort > 0 {
+			rule.RelayPorts[rule.EgressNodeID] = rule.RelayPort
+		}
+		if value := rule.RelayPorts[rule.EgressNodeID]; value > 0 {
+			rule.RelayPort = value
+		}
+	}
+}
+
+func (rule ForwardRule) RelayPortFor(egressNodeID string) int {
+	if value := rule.RelayPorts[egressNodeID]; value > 0 {
+		return value
+	}
+	// A rule created before per-egress ports used the same RelayPort on every
+	// managed exit. Keep that behavior until the controller next saves it.
+	return rule.RelayPort
+}
+
+func (rule *ForwardRule) SetRelayPortFor(egressNodeID string, port int) {
+	if rule.RelayPorts == nil {
+		rule.RelayPorts = map[string]int{}
+	}
+	rule.RelayPorts[egressNodeID] = port
+	if egressNodeID == rule.EgressNodeID {
+		rule.RelayPort = port
+	}
 }
 
 // EngineForRole makes a mixed-engine line compatible with Agents that only

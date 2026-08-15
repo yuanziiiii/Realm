@@ -124,6 +124,9 @@ func TestConfigurationExportDryRunAndImportRestoreTopology(t *testing.T) {
 	if err := json.Unmarshal(exportResponse.Body.Bytes(), &backup); err != nil {
 		t.Fatal(err)
 	}
+	if backup.SchemaVersion != 2 {
+		t.Fatalf("unexpected configuration schema version: %d", backup.SchemaVersion)
+	}
 	if len(backup.Lines) != 1 || len(backup.Rules) != 1 || len(backup.Nodes) != 2 {
 		t.Fatalf("unexpected export: %+v", backup)
 	}
@@ -133,15 +136,26 @@ func TestConfigurationExportDryRunAndImportRestoreTopology(t *testing.T) {
 	if err := st.DeleteLine(ctx, "line"); err != nil {
 		t.Fatal(err)
 	}
-	payload, _ := json.Marshal(backup)
+	legacyBackup := backup
+	legacyBackup.SchemaVersion = 1
+	legacyBackup.Lines = append([]domain.Line(nil), backup.Lines...)
+	legacyBackup.Rules = append([]domain.ForwardRule(nil), backup.Rules...)
+	for i := range legacyBackup.Lines {
+		legacyBackup.Lines[i].EgressPortRanges = nil
+	}
+	for i := range legacyBackup.Rules {
+		legacyBackup.Rules[i].RelayPorts = nil
+	}
+	legacyPayload, _ := json.Marshal(legacyBackup)
 	dryRunResponse := httptest.NewRecorder()
-	server.importConfiguration(dryRunResponse, httptest.NewRequest(http.MethodPost, "/api/v1/config/import?dry_run=1", bytes.NewReader(payload)))
+	server.importConfiguration(dryRunResponse, httptest.NewRequest(http.MethodPost, "/api/v1/config/import?dry_run=1", bytes.NewReader(legacyPayload)))
 	if dryRunResponse.Code != http.StatusOK || !bytes.Contains(dryRunResponse.Body.Bytes(), []byte(`"dry_run":true`)) {
 		t.Fatalf("unexpected dry-run response: %d %s", dryRunResponse.Code, dryRunResponse.Body.String())
 	}
 	if lines, _ := st.ListLines(ctx); len(lines) != 0 {
 		t.Fatal("dry run unexpectedly wrote lines")
 	}
+	payload, _ := json.Marshal(backup)
 	importResponse := httptest.NewRecorder()
 	server.importConfiguration(importResponse, httptest.NewRequest(http.MethodPost, "/api/v1/config/import", bytes.NewReader(payload)))
 	if importResponse.Code != http.StatusOK {
@@ -515,8 +529,43 @@ func TestRelayPortAllocationChecksEveryFailoverEgress(t *testing.T) {
 	if err := s.completeSimpleRule(ctx, &rule); err != nil {
 		t.Fatal(err)
 	}
-	if rule.RelayPort != 20001 {
-		t.Fatalf("shared standby port conflict was missed: got %d, want 20001", rule.RelayPort)
+	if rule.RelayPortFor("out-c") != 20000 || rule.RelayPortFor("out-b") != 20001 {
+		t.Fatalf("per-egress allocation is wrong: %+v", rule.RelayPorts)
+	}
+}
+
+func TestRelayPortAllocationUsesEachEgressNATRange(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PrivateAddress: "10.0.0.2", CreatedAt: now},
+		{ID: "out-a", Name: "出口 A", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+		{ID: "out-b", Name: "出口 B", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.4", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{
+		ID: "line", Name: "独立 NAT 端口", Mode: domain.ForwardModeDualManaged,
+		IngressNodeID: "in", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"},
+		ActiveEgressNodeID: "out-a", FailoverEnabled: true, ListenAddress: "0.0.0.0",
+		RelayPortRange: "1301-1349", EgressPortRanges: map[string]string{"out-a": "1301-1349", "out-b": "2301-2349"}, Engine: "nftables", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := domain.ForwardRule{LineID: line.ID, Mode: line.Mode, Protocol: "both", IngressNodeID: "in", EgressNodeID: "out-a", ListenPort: 11301, TargetHost: "38.49.57.74", TargetPort: 36666}
+	if err := (&Server{store: st}).completeSimpleRule(ctx, &rule); err != nil {
+		t.Fatal(err)
+	}
+	if rule.RelayPort != 1301 || rule.RelayPortFor("out-a") != 1301 || rule.RelayPortFor("out-b") != 2301 {
+		t.Fatalf("independent NAT ports were not allocated: %+v", rule)
 	}
 }
 

@@ -585,18 +585,19 @@ func TestManagedLineDeploysStandbyAndFailsOverAfterStableProbes(t *testing.T) {
 	if _, err := st.SaveRule(ctx, domain.ForwardRule{
 		ID: "rule", LineID: line.ID, Mode: line.Mode, Name: "服务", Protocol: "tcp",
 		IngressNodeID: "in", EgressNodeID: "out-a", ListenAddress: "0.0.0.0", ListenPort: 10000,
-		RelayPort: 30000, TargetHost: "192.0.2.10", TargetPort: 80, Engine: "nftables", Enabled: true,
+		RelayPort: 30000, RelayPorts: map[string]int{"out-a": 30000, "out-b": 31000}, TargetHost: "192.0.2.10", TargetPort: 80, Engine: "nftables", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	ingressDeployments, err := st.DeploymentsForNode(ctx, "in")
-	if err != nil || len(ingressDeployments) != 1 || ingressDeployments[0].Rule.EgressNodeID != "out-a" {
+	if err != nil || len(ingressDeployments) != 1 || ingressDeployments[0].Rule.EgressNodeID != "out-a" || ingressDeployments[0].Rule.RelayPort != 30000 {
 		t.Fatalf("ingress did not target primary egress: %+v, %v", ingressDeployments, err)
 	}
 	for _, id := range []string{"out-a", "out-b"} {
 		deployments, err := st.DeploymentsForNode(ctx, id)
-		if err != nil || len(deployments) != 1 || deployments[0].Role != domain.NodeRoleEgress {
+		wantPort := map[string]int{"out-a": 30000, "out-b": 31000}[id]
+		if err != nil || len(deployments) != 1 || deployments[0].Role != domain.NodeRoleEgress || deployments[0].Rule.RelayPort != wantPort {
 			t.Fatalf("egress %s was not preconfigured: %+v, %v", id, deployments, err)
 		}
 	}
@@ -625,7 +626,7 @@ func TestManagedLineDeploysStandbyAndFailsOverAfterStableProbes(t *testing.T) {
 		t.Fatalf("line did not fail over to backup: %+v, %v", got, err)
 	}
 	ingressDeployments, err = st.DeploymentsForNode(ctx, "in")
-	if err != nil || ingressDeployments[0].Rule.EgressNodeID != "out-b" {
+	if err != nil || ingressDeployments[0].Rule.EgressNodeID != "out-b" || ingressDeployments[0].Rule.RelayPort != 31000 {
 		t.Fatalf("ingress deployment did not follow failover: %+v, %v", ingressDeployments, err)
 	}
 

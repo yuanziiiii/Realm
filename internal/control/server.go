@@ -199,7 +199,7 @@ func (s *Server) exportConfiguration(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
-	backup := configurationBackup{Format: "relay-panel-configuration", SchemaVersion: 1, ExportedAt: now, Nodes: references, Lines: nonNil(lines), Rules: nonNil(rules)}
+	backup := configurationBackup{Format: "relay-panel-configuration", SchemaVersion: 2, ExportedAt: now, Nodes: references, Lines: nonNil(lines), Rules: nonNil(rules)}
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="relay-panel-config-%s.json"`, now.Format("20060102-150405")))
 	writeJSON(w, http.StatusOK, backup)
 }
@@ -228,7 +228,7 @@ func (s *Server) importConfiguration(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) prepareConfigurationImport(ctx context.Context, backup configurationBackup) ([]domain.Line, []domain.ForwardRule, error) {
-	if backup.Format != "relay-panel-configuration" || backup.SchemaVersion != 1 {
+	if backup.Format != "relay-panel-configuration" || (backup.SchemaVersion != 1 && backup.SchemaVersion != 2) {
 		return nil, nil, errors.New("配置文件格式或版本不受支持")
 	}
 	if len(backup.Lines) > 200 || len(backup.Rules) > 2000 {
@@ -300,16 +300,24 @@ func (s *Server) prepareConfigurationImport(ctx context.Context, backup configur
 			rule.Engine = line.Engine
 			rule.IngressEngine = line.IngressEngine
 			rule.EgressEngine = line.EgressEngine
-			ranges, rangeErr := parsePortRanges(line.RelayPortRange)
-			if rangeErr != nil {
-				return nil, nil, rangeErr
-			}
 			if line.Mode == domain.ForwardModeExitOnly {
 				rule.RelayPort = rule.ListenPort
+				rule.RelayPorts = map[string]int{line.EgressNodeID: rule.ListenPort}
 			}
-			if !portInRanges(rule.RelayPort, ranges) {
-				return nil, nil, fmt.Errorf("规则 %q 的中继端口不在线路端口范围内", rule.Name)
+			ports := make(map[string]int, len(line.EgressNodeIDs))
+			for _, egressID := range line.EgressNodeIDs {
+				ranges, rangeErr := parsePortRanges(line.RelayPortRangeFor(egressID))
+				if rangeErr != nil {
+					return nil, nil, rangeErr
+				}
+				port := rule.RelayPortFor(egressID)
+				if !portInRanges(port, ranges) {
+					return nil, nil, fmt.Errorf("规则 %q 在出口 %s 的中继端口不在线路端口范围内", rule.Name, egressID)
+				}
+				ports[egressID] = port
 			}
+			rule.RelayPorts = ports
+			rule.RelayPort = ports[line.EgressNodeID]
 		} else if err := s.completeSimpleRule(ctx, &rule); err != nil {
 			return nil, nil, fmt.Errorf("规则 %q 无法导入：%w", rule.Name, err)
 		}
@@ -345,8 +353,10 @@ func (s *Server) prepareConfigurationImport(ctx context.Context, backup configur
 			if a.IngressNodeID == b.IngressNodeID && a.ListenPort == b.ListenPort {
 				return nil, nil, fmt.Errorf("规则 %q 与 %q 的入口端口冲突", a.Name, b.Name)
 			}
-			if a.RelayPort == b.RelayPort && egressSetsOverlap(ruleEgressIDs(a, lineByID), ruleEgressIDs(b, lineByID)) {
-				return nil, nil, fmt.Errorf("规则 %q 与 %q 的出口中继端口冲突", a.Name, b.Name)
+			for _, egressID := range ruleEgressIDs(a, lineByID) {
+				if ruleUsesEgress(b, egressID, lineByID) && a.RelayPortFor(egressID) == b.RelayPortFor(egressID) {
+					return nil, nil, fmt.Errorf("规则 %q 与 %q 在出口 %s 的中继端口冲突", a.Name, b.Name, egressID)
+				}
 			}
 		}
 	}
@@ -623,6 +633,7 @@ func (s *Server) saveLine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rulesForLineUpdate(ctx context.Context, line domain.Line) ([]domain.ForwardRule, error) {
+	normalizeLineEgressIDs(&line)
 	all, err := s.store.ListRules(ctx)
 	if err != nil {
 		return nil, err
@@ -636,10 +647,6 @@ func (s *Server) rulesForLineUpdate(ctx context.Context, line domain.Line) ([]do
 		lineByID[existingLine.ID] = existingLine
 	}
 	lineByID[line.ID] = line
-	ranges, err := parsePortRanges(line.RelayPortRange)
-	if err != nil {
-		return nil, err
-	}
 	owned := make(map[string]bool)
 	for _, rule := range all {
 		if rule.LineID == line.ID {
@@ -671,14 +678,18 @@ func (s *Server) rulesForLineUpdate(ctx context.Context, line domain.Line) ([]do
 			}
 		}
 		if line.Mode == domain.ForwardModeExitOnly {
+			ranges, rangeErr := parsePortRanges(line.RelayPortRangeFor(line.EgressNodeID))
+			if rangeErr != nil {
+				return nil, rangeErr
+			}
+			rule.RelayPorts = map[string]int{line.EgressNodeID: rule.ListenPort}
 			rule.RelayPort = rule.ListenPort
 			if !portInRanges(rule.RelayPort, ranges) {
-				return nil, fmt.Errorf("规则 %q 的接入端口 %d 不在出口可用端口范围 %s 内", rule.Name, rule.RelayPort, displayPortRange(line.RelayPortRange))
+				return nil, fmt.Errorf("规则 %q 的接入端口 %d 不在出口可用端口范围 %s 内", rule.Name, rule.RelayPort, displayPortRange(line.RelayPortRangeFor(line.EgressNodeID)))
 			}
-		} else if !portInRanges(rule.RelayPort, ranges) || relayPortUsedAcross(occupied, lineByID, line.EgressNodeIDs, rule.RelayPort, rule.Protocol, rule.ID) {
-			rule.RelayPort = allocateRelayPortAcross(ranges, occupied, lineByID, line.EgressNodeIDs, rule.Protocol, rule.ID)
-			if rule.RelayPort == 0 {
-				return nil, errors.New("出口可用端口范围内没有剩余的中继端口")
+		} else {
+			if err := allocateRulePortsForLine(&rule, line, occupied, lineByID); err != nil {
+				return nil, fmt.Errorf("规则 %q：%w", rule.Name, err)
 			}
 		}
 		if err := validateRule(rule); err != nil {
@@ -705,6 +716,7 @@ func (s *Server) deleteLine(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) completeLine(ctx context.Context, line *domain.Line) error {
 	normalizeLineEgressIDs(line)
+	line.NormalizeEgressPortRanges()
 	egress, _, err := s.store.GetNode(ctx, line.EgressNodeID)
 	if err != nil || (egress.Role != domain.NodeRoleEgress && egress.Role != domain.NodeRoleBoth) {
 		return errors.New("请选择有效的出口服务器")
@@ -767,6 +779,12 @@ func normalizeLineEgressIDs(line *domain.Line) {
 		}
 	}
 	line.EgressNodeIDs = ids
+	line.NormalizeEgressPortRanges()
+	for id := range line.EgressPortRanges {
+		if !seen[id] {
+			delete(line.EgressPortRanges, id)
+		}
+	}
 	if !seen[line.ActiveEgressNodeID] {
 		line.ActiveEgressNodeID = line.EgressNodeID
 	}
@@ -802,6 +820,9 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		}
 		if rule.RelayPort == 0 {
 			rule.RelayPort = existing.RelayPort
+		}
+		if len(rule.RelayPorts) == 0 {
+			rule.RelayPorts = existing.RelayPorts
 		}
 		rule.CreatedAt = existing.CreatedAt
 	} else {
@@ -890,8 +911,10 @@ func (s *Server) ensureRulePortsAvailable(ctx context.Context, rule domain.Forwa
 		if other.IngressNodeID == rule.IngressNodeID && other.ListenPort == rule.ListenPort {
 			return fmt.Errorf("入口端口 %d 已被规则 %q 占用", rule.ListenPort, other.Name)
 		}
-		if other.RelayPort == rule.RelayPort && egressSetsOverlap(targetEgresses, ruleEgressIDs(other, lineByID)) {
-			return fmt.Errorf("出口中继端口 %d 已被规则 %q 占用", rule.RelayPort, other.Name)
+		for _, egressID := range targetEgresses {
+			if ruleUsesEgress(other, egressID, lineByID) && other.RelayPortFor(egressID) == rule.RelayPortFor(egressID) {
+				return fmt.Errorf("出口 %s 的中继端口 %d 已被规则 %q 占用", egressID, rule.RelayPortFor(egressID), other.Name)
+			}
 		}
 	}
 	return nil
@@ -917,10 +940,80 @@ func egressSetsOverlap(a, b []string) bool {
 	return false
 }
 
+func ruleUsesEgress(rule domain.ForwardRule, egressID string, lines map[string]domain.Line) bool {
+	for _, id := range ruleEgressIDs(rule, lines) {
+		if id == egressID {
+			return true
+		}
+	}
+	return false
+}
+
+func relayPortUsedOnEgress(rules []domain.ForwardRule, lines map[string]domain.Line, egressID string, port int, protocol, ignoreID string) bool {
+	for _, rule := range rules {
+		if rule.ID != ignoreID && protocolsOverlap(rule.Protocol, protocol) && ruleUsesEgress(rule, egressID, lines) && rule.RelayPortFor(egressID) == port {
+			return true
+		}
+	}
+	return false
+}
+
+func allocateRelayPortOnEgress(ranges []portInterval, rules []domain.ForwardRule, lines map[string]domain.Line, egressID, protocol, ignoreID string) int {
+	for _, interval := range ranges {
+		start := interval.first
+		if interval.first <= 30000 && interval.last >= 30000 {
+			start = 30000
+		}
+		for port := start; port <= interval.last; port++ {
+			if !relayPortUsedOnEgress(rules, lines, egressID, port, protocol, ignoreID) {
+				return port
+			}
+		}
+		for port := interval.first; port < start; port++ {
+			if !relayPortUsedOnEgress(rules, lines, egressID, port, protocol, ignoreID) {
+				return port
+			}
+		}
+	}
+	return 0
+}
+
+func allocateRulePortsForLine(rule *domain.ForwardRule, line domain.Line, rules []domain.ForwardRule, lines map[string]domain.Line) error {
+	line.NormalizeEgressPortRanges()
+	ports := make(map[string]int, len(line.EgressNodeIDs))
+	for _, egressID := range line.EgressNodeIDs {
+		ranges, err := parsePortRanges(line.RelayPortRangeFor(egressID))
+		if err != nil {
+			return fmt.Errorf("出口 %s 的端口范围无效：%w", egressID, err)
+		}
+		port := rule.RelayPorts[egressID]
+		if port == 0 {
+			// Preserve the shared port used by rules created before per-egress
+			// allocation whenever it is valid on this exit.
+			port = rule.RelayPort
+		}
+		if !portInRanges(port, ranges) || relayPortUsedOnEgress(rules, lines, egressID, port, rule.Protocol, rule.ID) {
+			port = allocateRelayPortOnEgress(ranges, rules, lines, egressID, rule.Protocol, rule.ID)
+		}
+		if port == 0 {
+			return fmt.Errorf("出口 %s 的可用端口范围 %s 已用完", egressID, displayPortRange(line.RelayPortRangeFor(egressID)))
+		}
+		ports[egressID] = port
+	}
+	rule.RelayPorts = ports
+	rule.RelayPort = ports[line.EgressNodeID]
+	return nil
+}
+
 func relayPortUsedAcross(rules []domain.ForwardRule, lines map[string]domain.Line, egressIDs []string, port int, protocol, ignoreID string) bool {
 	for _, rule := range rules {
-		if rule.ID != ignoreID && rule.RelayPort == port && protocolsOverlap(rule.Protocol, protocol) && egressSetsOverlap(egressIDs, ruleEgressIDs(rule, lines)) {
-			return true
+		if rule.ID == ignoreID || !protocolsOverlap(rule.Protocol, protocol) {
+			continue
+		}
+		for _, egressID := range egressIDs {
+			if ruleUsesEgress(rule, egressID, lines) && rule.RelayPortFor(egressID) == port {
+				return true
+			}
 		}
 	}
 	return false
@@ -958,7 +1051,8 @@ func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRul
 		if err != nil {
 			return errors.New("线路不存在")
 		}
-		portRange = line.RelayPortRange
+		line.NormalizeEgressPortRanges()
+		portRange = line.RelayPortRangeFor(line.EgressNodeID)
 		selectedLine = &line
 	}
 	ranges, err := parsePortRanges(portRange)
@@ -992,6 +1086,7 @@ func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRul
 		}
 		rule.IngressNodeID = rule.EgressNodeID
 		rule.RelayPort = rule.ListenPort
+		rule.RelayPorts = map[string]int{rule.EgressNodeID: rule.ListenPort}
 		if !portInRanges(rule.RelayPort, ranges) {
 			return fmt.Errorf("接入端口 %d 不在出口可用端口范围 %s 内", rule.RelayPort, displayPortRange(portRange))
 		}
@@ -1023,7 +1118,7 @@ func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRul
 	if err != nil {
 		return err
 	}
-	if selectedLine != nil && len(selectedLine.EgressNodeIDs) > 1 {
+	if selectedLine != nil {
 		lines, err := s.store.ListLines(ctx)
 		if err != nil {
 			return err
@@ -1032,14 +1127,18 @@ func (s *Server) completeSimpleRule(ctx context.Context, rule *domain.ForwardRul
 		for _, line := range lines {
 			lineByID[line.ID] = line
 		}
-		if rule.RelayPort == 0 || !portInRanges(rule.RelayPort, ranges) || relayPortUsedAcross(rules, lineByID, selectedLine.EgressNodeIDs, rule.RelayPort, rule.Protocol, rule.ID) {
-			rule.RelayPort = allocateRelayPortAcross(ranges, rules, lineByID, selectedLine.EgressNodeIDs, rule.Protocol, rule.ID)
+		lineByID[selectedLine.ID] = *selectedLine
+		if err := allocateRulePortsForLine(rule, *selectedLine, rules, lineByID); err != nil {
+			return err
 		}
 	} else if rule.RelayPort == 0 || !portInRanges(rule.RelayPort, ranges) || relayPortUsed(rules, rule.EgressNodeID, rule.RelayPort, rule.Protocol, rule.ID) {
 		rule.RelayPort = allocateRelayPort(ranges, rules, rule.EgressNodeID, rule.Protocol, rule.ID)
 	}
 	if rule.RelayPort == 0 {
 		return errors.New("出口可用端口范围内没有剩余的中继端口")
+	}
+	if selectedLine == nil {
+		rule.RelayPorts = map[string]int{rule.EgressNodeID: rule.RelayPort}
 	}
 	return nil
 }
@@ -1093,7 +1192,7 @@ func protocolsOverlap(a, b string) bool { return a == "both" || b == "both" || a
 
 func relayPortUsed(rules []domain.ForwardRule, nodeID string, port int, protocol, excludeID string) bool {
 	for _, existing := range rules {
-		if existing.ID != excludeID && existing.EgressNodeID == nodeID && existing.RelayPort == port && protocolsOverlap(existing.Protocol, protocol) {
+		if existing.ID != excludeID && existing.EgressNodeID == nodeID && existing.RelayPortFor(nodeID) == port && protocolsOverlap(existing.Protocol, protocol) {
 			return true
 		}
 	}
@@ -1323,6 +1422,7 @@ func validateNode(n domain.Node) error {
 }
 func validateLine(line domain.Line) error {
 	line.NormalizeEngines()
+	line.NormalizeEgressPortRanges()
 	if strings.TrimSpace(line.Name) == "" {
 		return errors.New("线路名称不能为空")
 	}
@@ -1341,8 +1441,10 @@ func validateLine(line domain.Line) error {
 	if line.EgressEngine != "nftables" && line.EgressEngine != "realm" {
 		return errors.New("出口引擎必须为 nftables 或 realm")
 	}
-	if _, err := parsePortRanges(line.RelayPortRange); err != nil {
-		return err
+	for _, egressID := range line.EgressNodeIDs {
+		if _, err := parsePortRanges(line.RelayPortRangeFor(egressID)); err != nil {
+			return fmt.Errorf("出口 %s 的端口范围无效：%w", egressID, err)
+		}
 	}
 	return nil
 }
