@@ -92,6 +92,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			latency_ms REAL NOT NULL DEFAULT 0, packet_loss REAL NOT NULL DEFAULT 100,
 			success INTEGER NOT NULL DEFAULT 0, has_succeeded INTEGER NOT NULL DEFAULT 0,
 			failure_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
+			tcp_checked INTEGER NOT NULL DEFAULT 0, tcp_success INTEGER NOT NULL DEFAULT 0,
+			tcp_latency_ms REAL NOT NULL DEFAULT 0, tcp_error TEXT NOT NULL DEFAULT '',
 			checked_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(rule_id, node_id)
 		)`,
@@ -168,6 +170,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "link_probes", "has_succeeded", `ALTER TABLE link_probes ADD COLUMN has_succeeded INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "target_probes", "tcp_checked", `ALTER TABLE target_probes ADD COLUMN tcp_checked INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "target_probes", "tcp_success", `ALTER TABLE target_probes ADD COLUMN tcp_success INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "target_probes", "tcp_latency_ms", `ALTER TABLE target_probes ADD COLUMN tcp_latency_ms REAL NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "target_probes", "tcp_error", `ALTER TABLE target_probes ADD COLUMN tcp_error TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	// Older releases stored a single engine. Preserve its exact value when the
@@ -859,7 +873,7 @@ func (s *Store) UpsertTargetProbes(ctx context.Context, nodeID string, probes []
 	defer tx.Rollback()
 	for _, probe := range probes {
 		rule, ok := allowed[probe.RuleID]
-		if !ok || probe.Address != rule.TargetHost || probe.Port != rule.TargetPort || probe.PacketLoss < 0 || probe.PacketLoss > 100 || probe.LatencyMS < 0 {
+		if !ok || probe.Address != rule.TargetHost || probe.Port != rule.TargetPort || probe.PacketLoss < 0 || probe.PacketLoss > 100 || probe.LatencyMS < 0 || probe.TCPLatencyMS < 0 {
 			continue
 		}
 		// Reject delayed results for a previous rule destination. Values written
@@ -867,6 +881,26 @@ func (s *Store) UpsertTargetProbes(ctx context.Context, nodeID string, probes []
 		probe.NodeID = nodeID
 		probe.Address = rule.TargetHost
 		probe.Port = rule.TargetPort
+		if rule.Protocol == "udp" || !probe.TCPChecked {
+			probe.TCPChecked = false
+			probe.TCPSuccess = false
+			probe.TCPLatencyMS = 0
+			probe.TCPError = ""
+		} else {
+			switch probe.TCPError {
+			case "", "timeout", "refused", "unreachable", "dns", "error":
+			default:
+				probe.TCPError = "error"
+			}
+			if probe.TCPSuccess {
+				probe.TCPError = ""
+			} else {
+				probe.TCPLatencyMS = 0
+				if probe.TCPError == "" {
+					probe.TCPError = "error"
+				}
+			}
+		}
 		var failures, successes, hasSucceeded int
 		err = tx.QueryRowContext(ctx, `SELECT failure_count,success_count,has_succeeded FROM target_probes WHERE rule_id=? AND node_id=?`, probe.RuleID, nodeID).Scan(&failures, &successes, &hasSucceeded)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -884,7 +918,7 @@ func (s *Store) UpsertTargetProbes(ctx context.Context, nodeID string, probes []
 		if checkedAt.IsZero() {
 			checkedAt = time.Now().UTC()
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO target_probes(rule_id,node_id,address,port,latency_ms,packet_loss,success,has_succeeded,failure_count,success_count,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id) DO UPDATE SET address=excluded.address,port=excluded.port,latency_ms=excluded.latency_ms,packet_loss=excluded.packet_loss,success=excluded.success,has_succeeded=excluded.has_succeeded,failure_count=excluded.failure_count,success_count=excluded.success_count,checked_at=excluded.checked_at`, probe.RuleID, nodeID, probe.Address, probe.Port, probe.LatencyMS, probe.PacketLoss, boolInt(probe.Success), hasSucceeded, failures, successes, unix(checkedAt))
+		_, err = tx.ExecContext(ctx, `INSERT INTO target_probes(rule_id,node_id,address,port,latency_ms,packet_loss,success,has_succeeded,failure_count,success_count,tcp_checked,tcp_success,tcp_latency_ms,tcp_error,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id) DO UPDATE SET address=excluded.address,port=excluded.port,latency_ms=excluded.latency_ms,packet_loss=excluded.packet_loss,success=excluded.success,has_succeeded=excluded.has_succeeded,failure_count=excluded.failure_count,success_count=excluded.success_count,tcp_checked=excluded.tcp_checked,tcp_success=excluded.tcp_success,tcp_latency_ms=excluded.tcp_latency_ms,tcp_error=excluded.tcp_error,checked_at=excluded.checked_at`, probe.RuleID, nodeID, probe.Address, probe.Port, probe.LatencyMS, probe.PacketLoss, boolInt(probe.Success), hasSucceeded, failures, successes, boolInt(probe.TCPChecked), boolInt(probe.TCPSuccess), probe.TCPLatencyMS, probe.TCPError, unix(checkedAt))
 		if err != nil {
 			return err
 		}
@@ -893,7 +927,7 @@ func (s *Store) UpsertTargetProbes(ctx context.Context, nodeID string, probes []
 }
 
 func (s *Store) ListTargetProbes(ctx context.Context) ([]domain.TargetProbe, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT rule_id,node_id,address,port,latency_ms,packet_loss,success,has_succeeded,failure_count,success_count,checked_at FROM target_probes ORDER BY rule_id,node_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT rule_id,node_id,address,port,latency_ms,packet_loss,success,has_succeeded,failure_count,success_count,tcp_checked,tcp_success,tcp_latency_ms,tcp_error,checked_at FROM target_probes ORDER BY rule_id,node_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -901,13 +935,15 @@ func (s *Store) ListTargetProbes(ctx context.Context) ([]domain.TargetProbe, err
 	var probes []domain.TargetProbe
 	for rows.Next() {
 		var probe domain.TargetProbe
-		var success, hasSucceeded int
+		var success, hasSucceeded, tcpChecked, tcpSuccess int
 		var checkedAt int64
-		if err := rows.Scan(&probe.RuleID, &probe.NodeID, &probe.Address, &probe.Port, &probe.LatencyMS, &probe.PacketLoss, &success, &hasSucceeded, &probe.FailureCount, &probe.SuccessCount, &checkedAt); err != nil {
+		if err := rows.Scan(&probe.RuleID, &probe.NodeID, &probe.Address, &probe.Port, &probe.LatencyMS, &probe.PacketLoss, &success, &hasSucceeded, &probe.FailureCount, &probe.SuccessCount, &tcpChecked, &tcpSuccess, &probe.TCPLatencyMS, &probe.TCPError, &checkedAt); err != nil {
 			return nil, err
 		}
 		probe.Success = success == 1
 		probe.HasSucceeded = hasSucceeded == 1
+		probe.TCPChecked = tcpChecked == 1
+		probe.TCPSuccess = tcpSuccess == 1
 		probe.CheckedAt = fromUnix(checkedAt)
 		probes = append(probes, probe)
 	}

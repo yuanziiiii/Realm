@@ -196,6 +196,10 @@ type TargetProbe struct {
 	HasSucceeded bool      `json:"has_succeeded"`
 	FailureCount int       `json:"failure_count"`
 	SuccessCount int       `json:"success_count"`
+	TCPChecked   bool      `json:"tcp_checked"`
+	TCPSuccess   bool      `json:"tcp_success"`
+	TCPLatencyMS float64   `json:"tcp_latency_ms"`
+	TCPError     string    `json:"tcp_error,omitempty"`
 	CheckedAt    time.Time `json:"checked_at"`
 }
 

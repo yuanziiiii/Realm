@@ -23,7 +23,7 @@
 - 服务器一键接入、Agent 在线状态和网络参数维护
 - 可复用线路，支持双端托管、仅出口接管两种拓扑
 - 双端托管支持一个主出口和多个备用出口；入口 Agent 按出口内网 IP 上报延迟、丢包和在线状态
-- 出口 Agent 按每条规则的落地地址上报“出口 → 落地”ICMP 延迟和丢包；相同落地地址只探测一次，并限制并发探测数量
+- 出口 Agent 自动检查“出口 → 落地”：全部规则上报 ICMP 延迟和丢包，TCP / TCP+UDP 规则额外检查真实业务端口的 TCP 握手状态；探测共享最多 8 个并发，不发送业务数据
 - 可选自动故障切换：连续 3 次失败后切到健康备用出口，主出口连续 3 次恢复后按优先级回切
 - 双端线路的入口、出口引擎可独立选择，支持 nftables → Realm、Realm → nftables 等混合组合；仅出口接管只配置出口引擎
 - 线路可修改入口、出口、接入 IP、NAT 端口池和两段转发引擎，已有规则自动迁移并重新下发
@@ -124,6 +124,32 @@ zf
 工具会自动识别当前机器角色。存在有效 Agent 配置和 `relay-agent.service` 时只显示被控端菜单，不会因残留的主控目录误显示主控功能；主控端则需要完整的 Docker Compose 与环境配置。主控菜单包含状态、在线更新、启停/重启、日志、健康检查、密码重置和访问配置；Agent 菜单包含状态、在线更新、启停/重启、日志、主控连通性、节点信息和转发环境检查。Agent Token 只显示“已配置/缺失”，不会输出明文。
 
 停止服务和密码重置均需要二次确认。工具不会提供容易误删数据库与现有转发的一键卸载入口。
+
+### 卸载
+
+卸载是独立脚本，不放进 `zf` 菜单，避免误触。脚本会自动识别当前机器是主控还是 Agent，并要求输入 `YES`。默认卸载会保留可恢复数据：Agent 配置备份到 `/var/backups/relay-panel/`；主控目录移动为 `/opt/relay-panel.backup-时间`，Docker 数据卷不会删除。
+
+```bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/uninstall.sh | sudo bash
+```
+
+如果同一台机器同时装有主控和 Agent，需要明确选择：
+
+```bash
+# 只卸载 Agent
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/uninstall.sh | sudo bash -s -- --agent
+
+# 只卸载主控
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/uninstall.sh | sudo bash -s -- --control
+```
+
+只有确认不再需要数据库、规则、流量记录和备份时，才使用永久清除：
+
+```bash
+curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/uninstall.sh | sudo bash -s -- --control --purge
+```
+
+卸载不会移除 Docker、nftables、`tc`、`ping` 或 Realm 软件包，因为它们可能同时被其他服务使用。
 
 ### 1C1G 低内存服务器
 
@@ -236,7 +262,7 @@ Realm 模式还需将 Realm 二进制安装到 `/usr/local/bin/realm`，或者�
 
 延迟和丢包由入口 Agent 对每个出口的内网 IP 进行 ICMP 探测。某些服务商会屏蔽 ICMP：此时面板仍以 Agent 心跳判断服务器在线，但不会把一条从未成功回应 ICMP 的路径当作可自动切换的备用线路，从而避免误切换。
 
-每个实际出口 Agent 还会对已下发规则的落地地址做 ICMP 探测，结果显示在“转发规则”的“出口 → 落地”一列。该数据反映网络路径延迟和丢包，不等同于目标 TCP/UDP 端口健康检查；落地屏蔽 ICMP 时会明确显示“ICMP 不可用”，不能据此判断业务端口已断开。双端托管中的“入口 → 出口”仍使用出口服务器配置的内网 IP 探测，两段数据互不混用。
+每个实际出口 Agent 还会自动探测已下发规则的落地。所有协议都保留 ICMP 网络延迟和丢包；TCP 与 TCP+UDP 规则会再连接真实落地端口，面板显示“TCP 正常、连接超时、拒绝连接、网络不可达”等状态、握手耗时和北京时间最后检查时间。TCP 探测只完成握手并立即断开，不发送业务数据；TCP+UDP 的结果只代表 TCP 部分，UDP-only 仍需用实际业务验证。双端托管中的“入口 → 出口”继续按出口服务器的内网 IP 探测，两段数据互不混用。
 
 ### 2. 仅出口接管
 

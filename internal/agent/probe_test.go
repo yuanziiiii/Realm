@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	"relaypanel/internal/domain"
@@ -21,17 +22,37 @@ rtt min/avg/max/mdev = 12.100/13.250/14.800/0.700 ms`
 	}
 }
 
+func TestProbeTCPReportsHandshakeAndRefusal(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	latency, ok, code := probeTCP(context.Background(), "127.0.0.1", port)
+	if !ok || code != "" || latency < 0 {
+		t.Fatalf("unexpected healthy TCP probe: latency=%v ok=%v code=%q", latency, ok, code)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, ok, code = probeTCP(context.Background(), "127.0.0.1", port)
+	if ok || code != "refused" {
+		t.Fatalf("closed TCP port should be refused: ok=%v code=%q", ok, code)
+	}
+}
+
 func TestProbeRuleTargetsOnlyUsesEgressDeployments(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	deployments := []domain.Deployment{
 		{Role: domain.NodeRoleIngress, Rule: domain.ForwardRule{ID: "ingress-only", Enabled: true, TargetHost: "192.0.2.1", TargetPort: 80}},
-		{Role: domain.NodeRoleEgress, Rule: domain.ForwardRule{ID: "egress", Enabled: true, TargetHost: "192.0.2.2", TargetPort: 443}},
+		{Role: domain.NodeRoleEgress, Rule: domain.ForwardRule{ID: "egress", Protocol: "tcp", Enabled: true, TargetHost: "192.0.2.2", TargetPort: 443}},
 		{Role: domain.NodeRoleEgress, Rule: domain.ForwardRule{ID: "realm-hostname", Enabled: true, TargetHost: "origin.example.com", TargetPort: 443}},
+		{Role: domain.NodeRoleEgress, Rule: domain.ForwardRule{ID: "udp-only", Protocol: "udp", Enabled: true, TargetHost: "192.0.2.4", TargetPort: 53}},
 		{Role: domain.NodeRoleEgress, Rule: domain.ForwardRule{ID: "disabled", Enabled: false, TargetHost: "192.0.2.3", TargetPort: 53}},
 	}
 	probes := ProbeRuleTargets(ctx, domain.Node{ID: "exit"}, deployments)
-	if len(probes) != 2 || probes[0].RuleID != "egress" || probes[0].NodeID != "exit" || probes[0].Address != "192.0.2.2" || probes[0].Port != 443 || probes[1].Address != "origin.example.com" {
+	if len(probes) != 3 || probes[0].RuleID != "egress" || probes[0].NodeID != "exit" || probes[0].Address != "192.0.2.2" || probes[0].Port != 443 || !probes[0].TCPChecked || probes[1].Address != "origin.example.com" || probes[2].TCPChecked {
 		t.Fatalf("unexpected target probes: %+v", probes)
 	}
 }

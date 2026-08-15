@@ -285,7 +285,7 @@ func TestTargetProbesAreStoredForEgressDeployments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertTargetProbes(ctx, "out", []domain.TargetProbe{{RuleID: "rule", Address: "38.49.57.74", Port: 36666, LatencyMS: 18.4, PacketLoss: 0, Success: true, CheckedAt: now}}); err != nil {
+	if err := st.UpsertTargetProbes(ctx, "out", []domain.TargetProbe{{RuleID: "rule", Address: "38.49.57.74", Port: 36666, LatencyMS: 18.4, PacketLoss: 0, Success: true, TCPChecked: true, TCPSuccess: true, TCPLatencyMS: 21.7, CheckedAt: now}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpsertTargetProbes(ctx, "out", []domain.TargetProbe{{RuleID: "rule", Address: "old-target.example", Port: 1, LatencyMS: 1, PacketLoss: 0, Success: true, CheckedAt: now.Add(time.Second)}}); err != nil {
@@ -295,7 +295,7 @@ func TestTargetProbesAreStoredForEgressDeployments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(probes) != 1 || probes[0].RuleID != "rule" || probes[0].NodeID != "out" || probes[0].Address != "38.49.57.74" || probes[0].Port != 36666 || probes[0].LatencyMS != 18.4 || !probes[0].HasSucceeded {
+	if len(probes) != 1 || probes[0].RuleID != "rule" || probes[0].NodeID != "out" || probes[0].Address != "38.49.57.74" || probes[0].Port != 36666 || probes[0].LatencyMS != 18.4 || !probes[0].HasSucceeded || !probes[0].TCPChecked || !probes[0].TCPSuccess || probes[0].TCPLatencyMS != 21.7 {
 		t.Fatalf("unexpected stored target probe: %+v", probes)
 	}
 }

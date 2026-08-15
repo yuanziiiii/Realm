@@ -36,6 +36,7 @@ jobs:
           install -m 0755 scripts/update.sh release/update.sh
           install -m 0755 scripts/zf.sh release/zf.sh
           install -m 0755 scripts/reset-admin-password.sh release/reset-admin-password.sh
+          install -m 0755 scripts/uninstall.sh release/uninstall.sh
           for file in release/*; do
             sha256sum "$file" > "$file.sha256"
           done
