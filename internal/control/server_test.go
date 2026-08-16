@@ -211,6 +211,14 @@ func TestRuleBatchImportDryRunCreatesRulesAtomically(t *testing.T) {
 	if rules, _ := st.ListRules(ctx); len(rules) != 0 {
 		t.Fatal("dry run wrote rules")
 	}
+	textDryRun := httptest.NewRecorder()
+	server.importTextRules(textDryRun, httptest.NewRequest(http.MethodPost, "/api/v1/rules/import-text?line_id=line&dry_run=1", strings.NewReader("# 入口端口 落地 IP 落地端口\n11301 38.49.57.74 36666\n11302,38.49.57.75,36667,tcp,落地二\n")))
+	if textDryRun.Code != http.StatusOK || !bytes.Contains(textDryRun.Body.Bytes(), []byte(`"rules":2`)) {
+		t.Fatalf("unexpected TXT dry run: %d %s", textDryRun.Code, textDryRun.Body.String())
+	}
+	if rules, _ := st.ListRules(ctx); len(rules) != 0 {
+		t.Fatal("TXT dry run wrote rules")
+	}
 
 	actual := httptest.NewRecorder()
 	server.importRules(actual, httptest.NewRequest(http.MethodPost, "/api/v1/rules/import", bytes.NewReader(payload)))
@@ -242,6 +250,22 @@ func TestRuleBatchImportDryRunCreatesRulesAtomically(t *testing.T) {
 	}
 	if rules, _ := st.ListRules(ctx); len(rules) != 2 {
 		t.Fatalf("failed batch partially wrote rules: %+v", rules)
+	}
+}
+
+func TestParseRuleBatchText(t *testing.T) {
+	items, err := parseRuleBatchText("# comment\n11301 38.49.57.74 36666\n11302\texample.com\t36667\tudp\t游戏 UDP\n")
+	if err != nil || len(items) != 2 {
+		t.Fatalf("unexpected parsed TXT: %+v, %v", items, err)
+	}
+	if items[0].Protocol != "both" || items[0].ListenPort != 11301 || items[0].TargetHost != "38.49.57.74" || items[0].TargetPort != 36666 {
+		t.Fatalf("unexpected default TXT rule: %+v", items[0])
+	}
+	if items[1].Protocol != "udp" || items[1].Name != "游戏 UDP" {
+		t.Fatalf("unexpected optional TXT fields: %+v", items[1])
+	}
+	if _, err := parseRuleBatchText("bad-line"); err == nil || !strings.Contains(err.Error(), "第 1 行") {
+		t.Fatalf("invalid TXT line should include its number: %v", err)
 	}
 }
 

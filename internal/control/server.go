@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -172,6 +173,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/rules", s.requireAdmin(s.listRules))
 	mux.HandleFunc("POST /api/v1/rules", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("POST /api/v1/rules/import", s.requireAdmin(s.importRules))
+	mux.HandleFunc("POST /api/v1/rules/import-text", s.requireAdmin(s.importTextRules))
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
@@ -937,6 +939,90 @@ func (s *Server) importRules(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) importTextRules(w http.ResponseWriter, r *http.Request) {
+	const maxTextBytes = 1024 * 1024
+	payload, err := io.ReadAll(io.LimitReader(r.Body, maxTextBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("无法读取 TXT 批量规则文件"))
+		return
+	}
+	if len(payload) > maxTextBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, errors.New("批量规则文件不能超过 1 MB"))
+		return
+	}
+	items, err := parseRuleBatchText(string(payload))
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	batch := ruleBatchImport{
+		Format: "relay-panel-rule-batch", SchemaVersion: 1,
+		LineID: strings.TrimSpace(r.URL.Query().Get("line_id")), Rules: items,
+	}
+	rules, err := s.prepareRuleBatch(r.Context(), batch)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	dryRun := r.URL.Query().Get("dry_run") == "1"
+	result := ruleBatchImportResult{DryRun: dryRun, Rules: len(rules)}
+	if !dryRun {
+		result.Revision, err = s.store.ImportRules(r.Context(), rules)
+		if err != nil {
+			writeError(w, http.StatusConflict, fmt.Errorf("批量添加失败，未写入任何规则：%w", err))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func parseRuleBatchText(text string) ([]ruleBatchItem, error) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	items := make([]ruleBatchItem, 0, len(lines))
+	for lineNumber, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if comment := strings.IndexByte(line, '#'); comment >= 0 {
+			line = strings.TrimSpace(line[:comment])
+		}
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(strings.ReplaceAll(line, ",", " "))
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("TXT 第 %d 行格式错误：应填写入口端口、落地 IP、落地端口", lineNumber+1)
+		}
+		listenPort, err := strconv.Atoi(fields[0])
+		if err != nil || listenPort < 1 || listenPort > 65535 {
+			return nil, fmt.Errorf("TXT 第 %d 行入口端口无效", lineNumber+1)
+		}
+		targetPort, err := strconv.Atoi(fields[2])
+		if err != nil || targetPort < 1 || targetPort > 65535 {
+			return nil, fmt.Errorf("TXT 第 %d 行落地端口无效", lineNumber+1)
+		}
+		protocol := "both"
+		nameStart := 3
+		if len(fields) > 3 {
+			candidate := strings.ToLower(fields[3])
+			if candidate == "tcp" || candidate == "udp" || candidate == "both" {
+				protocol = candidate
+				nameStart = 4
+			}
+		}
+		name := ""
+		if len(fields) > nameStart {
+			name = strings.Join(fields[nameStart:], " ")
+		}
+		items = append(items, ruleBatchItem{
+			Name: name, Protocol: protocol, ListenPort: listenPort,
+			TargetHost: fields[1], TargetPort: targetPort,
+		})
+	}
+	if len(items) == 0 {
+		return nil, errors.New("TXT 中没有可导入的规则")
+	}
+	return items, nil
 }
 
 func (s *Server) prepareRuleBatch(ctx context.Context, batch ruleBatchImport) ([]domain.ForwardRule, error) {
