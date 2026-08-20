@@ -284,6 +284,43 @@ func TestHeartbeatAutoFillsBlankNetworkWithoutOverwritingManualValues(t *testing
 	}
 }
 
+func TestNodeDefaultRelayPortRangePersistsAndUpdates(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	node := domain.Node{
+		ID:                    "out",
+		Name:                  "NAT 出口",
+		Role:                  domain.NodeRoleEgress,
+		DefaultRelayPortRange: "1301-1349",
+		CreatedAt:             time.Now().UTC(),
+	}
+	if err := st.CreateNode(ctx, node, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := st.GetNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DefaultRelayPortRange != "1301-1349" {
+		t.Fatalf("unexpected default relay port range after create: %q", got.DefaultRelayPortRange)
+	}
+	got.DefaultRelayPortRange = "2301-2349,25000"
+	if err := st.UpdateNode(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	updated, _, err := st.GetNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DefaultRelayPortRange != "2301-2349,25000" {
+		t.Fatalf("unexpected default relay port range after update: %q", updated.DefaultRelayPortRange)
+	}
+}
+
 func TestUpdateNodeBumpsRevisionForRuleReconciliation(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

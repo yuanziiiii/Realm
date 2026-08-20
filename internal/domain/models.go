@@ -15,20 +15,21 @@ const (
 )
 
 type Node struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Role             NodeRole  `json:"role"`
-	PublicAddress    string    `json:"public_address"`
-	PrivateAddress   string    `json:"private_address"`
-	PublicInterface  string    `json:"public_interface"`
-	PrivateInterface string    `json:"private_interface"`
-	Status           string    `json:"status"`
-	AgentVersion     string    `json:"agent_version,omitempty"`
-	AppliedRevision  int64     `json:"applied_revision"`
-	ApplyStatus      string    `json:"apply_status"`
-	ApplyError       string    `json:"apply_error,omitempty"`
-	LastSeenAt       time.Time `json:"last_seen_at,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID                    string    `json:"id"`
+	Name                  string    `json:"name"`
+	Role                  NodeRole  `json:"role"`
+	PublicAddress         string    `json:"public_address"`
+	PrivateAddress        string    `json:"private_address"`
+	PublicInterface       string    `json:"public_interface"`
+	PrivateInterface      string    `json:"private_interface"`
+	DefaultRelayPortRange string    `json:"default_relay_port_range"`
+	Status                string    `json:"status"`
+	AgentVersion          string    `json:"agent_version,omitempty"`
+	AppliedRevision       int64     `json:"applied_revision"`
+	ApplyStatus           string    `json:"apply_status"`
+	ApplyError            string    `json:"apply_error,omitempty"`
+	LastSeenAt            time.Time `json:"last_seen_at,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 type ForwardRule struct {

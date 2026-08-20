@@ -46,6 +46,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
 			public_address TEXT NOT NULL DEFAULT '', private_address TEXT NOT NULL DEFAULT '',
 			public_interface TEXT NOT NULL DEFAULT '', private_interface TEXT NOT NULL DEFAULT '',
+			default_relay_port_range TEXT NOT NULL DEFAULT '',
 			agent_token_hash TEXT NOT NULL, agent_version TEXT NOT NULL DEFAULT '',
 			applied_revision INTEGER NOT NULL DEFAULT 0, apply_status TEXT NOT NULL DEFAULT 'pending',
 			apply_error TEXT NOT NULL DEFAULT '', last_seen_at INTEGER NOT NULL DEFAULT 0,
@@ -155,6 +156,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "nodes", "sort_order", `ALTER TABLE nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "nodes", "default_relay_port_range", `ALTER TABLE nodes ADD COLUMN default_relay_port_range TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "sort_order", `ALTER TABLE forward_rules ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
@@ -349,8 +353,8 @@ func (s *Store) bumpRevision(ctx context.Context, tx *sql.Tx) (int64, error) {
 }
 
 func (s *Store) CreateNode(ctx context.Context, n domain.Node, tokenHash string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM nodes),?)`,
-		n.ID, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, tokenHash, unix(n.CreatedAt))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,role,public_address,private_address,public_interface,private_interface,default_relay_port_range,agent_token_hash,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM nodes),?)`,
+		n.ID, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.DefaultRelayPortRange, tokenHash, unix(n.CreatedAt))
 	if err == nil {
 		s.audit(ctx, "create", "node", n.ID, n.Name)
 	}
@@ -361,7 +365,7 @@ func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, err
 	var n domain.Node
 	var tokenHash string
 	var lastSeen, created int64
-	err := scanner.Scan(&n.ID, &n.Name, &n.Role, &n.PublicAddress, &n.PrivateAddress, &n.PublicInterface, &n.PrivateInterface, &tokenHash, &n.AgentVersion, &n.AppliedRevision, &n.ApplyStatus, &n.ApplyError, &lastSeen, &created)
+	err := scanner.Scan(&n.ID, &n.Name, &n.Role, &n.PublicAddress, &n.PrivateAddress, &n.PublicInterface, &n.PrivateInterface, &n.DefaultRelayPortRange, &tokenHash, &n.AgentVersion, &n.AppliedRevision, &n.ApplyStatus, &n.ApplyError, &lastSeen, &created)
 	n.LastSeenAt = fromUnix(lastSeen)
 	n.CreatedAt = fromUnix(created)
 	if time.Since(n.LastSeenAt) <= 45*time.Second {
@@ -372,7 +376,7 @@ func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, err
 	return n, tokenHash, err
 }
 
-const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,agent_version,applied_revision,apply_status,apply_error,last_seen_at,created_at`
+const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,default_relay_port_range,agent_token_hash,agent_version,applied_revision,apply_status,apply_error,last_seen_at,created_at`
 
 func (s *Store) ListNodes(ctx context.Context) ([]domain.Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeColumns+` FROM nodes ORDER BY sort_order, created_at, id`)
@@ -409,7 +413,7 @@ func (s *Store) UpdateNode(ctx context.Context, n domain.Node) error {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.ID)
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=?,default_relay_port_range=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.DefaultRelayPortRange, n.ID)
 	if err != nil {
 		return err
 	}

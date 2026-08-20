@@ -88,6 +88,22 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 	}
 }
 
+func TestValidateNodeDefaultRelayPortRange(t *testing.T) {
+	base := domain.Node{Name: "NAT 出口", Role: domain.NodeRoleEgress}
+	for _, spec := range []string{"", "1301-1349", "1301-1349,25000"} {
+		node := base
+		node.DefaultRelayPortRange = spec
+		if err := validateNode(node); err != nil {
+			t.Fatalf("expected %q to be valid: %v", spec, err)
+		}
+	}
+	node := base
+	node.DefaultRelayPortRange = "70000"
+	if err := validateNode(node); err == nil || !strings.Contains(err.Error(), "默认可用中继端口无效") {
+		t.Fatalf("expected invalid default port range error, got %v", err)
+	}
+}
+
 func TestConfigurationExportDryRunAndImportRestoreTopology(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "control.db"))

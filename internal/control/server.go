@@ -1670,6 +1670,9 @@ func validateNode(n domain.Node) error {
 	if n.Role != domain.NodeRoleIngress && n.Role != domain.NodeRoleEgress && n.Role != domain.NodeRoleBoth {
 		return errors.New("节点角色无效")
 	}
+	if _, err := parsePortRanges(n.DefaultRelayPortRange); err != nil {
+		return fmt.Errorf("默认可用中继端口无效：%w", err)
+	}
 	return nil
 }
 func validateLine(line domain.Line) error {
