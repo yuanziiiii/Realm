@@ -71,7 +71,8 @@ trap cleanup EXIT
 
 download_checked() {
   local name="$1" target="$2" expected actual
-  curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${name}" -o "${target}"
+  say "下载 ${name}"
+  curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${download_base}/${name}" -o "${target}"
   curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${name}.sha256" -o "${target}.sha256"
   expected="$(awk '{print $1}' "${target}.sha256")"
   actual="$(sha256sum "${target}" | awk '{print $1}')"

@@ -49,7 +49,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			agent_token_hash TEXT NOT NULL, agent_version TEXT NOT NULL DEFAULT '',
 			applied_revision INTEGER NOT NULL DEFAULT 0, apply_status TEXT NOT NULL DEFAULT 'pending',
 			apply_error TEXT NOT NULL DEFAULT '', last_seen_at INTEGER NOT NULL DEFAULT 0,
-			created_at INTEGER NOT NULL
+			sort_order INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS lines (
 			id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'dual_managed',
@@ -83,6 +83,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			egress_engine TEXT NOT NULL DEFAULT '', upload_mbps INTEGER NOT NULL DEFAULT 0,
 			download_mbps INTEGER NOT NULL DEFAULT 0, burst_kbytes INTEGER NOT NULL DEFAULT 512,
 			enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
 			UNIQUE(ingress_node_id, listen_port, protocol),
 			UNIQUE(egress_node_id, relay_port, protocol)
@@ -153,6 +154,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "forward_rules", "egress_engine", `ALTER TABLE forward_rules ADD COLUMN egress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "nodes", "sort_order", `ALTER TABLE nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "forward_rules", "sort_order", `ALTER TABLE forward_rules ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "lines", "relay_port_range", `ALTER TABLE lines ADD COLUMN relay_port_range TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
@@ -205,6 +212,14 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE forward_rules SET egress_engine=engine WHERE egress_engine=''`); err != nil {
 		return fmt.Errorf("backfill rule egress engine: %w", err)
+	}
+	// Preserve the order older versions displayed before persistent ordering
+	// existed: nodes were oldest-first and rules were newest-first.
+	if _, err := s.db.ExecContext(ctx, `UPDATE nodes SET sort_order=(SELECT COUNT(*) FROM nodes AS other WHERE other.created_at<nodes.created_at OR (other.created_at=nodes.created_at AND other.id<=nodes.id)) WHERE sort_order=0`); err != nil {
+		return fmt.Errorf("backfill node order: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE forward_rules SET sort_order=(SELECT COUNT(*) FROM forward_rules AS other WHERE other.created_at>forward_rules.created_at OR (other.created_at=forward_rules.created_at AND other.id<=forward_rules.id)) WHERE sort_order=0`); err != nil {
+		return fmt.Errorf("backfill rule order: %w", err)
 	}
 	_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings(key, value) VALUES ('revision', '1')`)
 	var dailyTimezone string
@@ -334,7 +349,7 @@ func (s *Store) bumpRevision(ctx context.Context, tx *sql.Tx) (int64, error) {
 }
 
 func (s *Store) CreateNode(ctx context.Context, n domain.Node, tokenHash string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM nodes),?)`,
 		n.ID, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, tokenHash, unix(n.CreatedAt))
 	if err == nil {
 		s.audit(ctx, "create", "node", n.ID, n.Name)
@@ -360,7 +375,7 @@ func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, err
 const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,agent_token_hash,agent_version,applied_revision,apply_status,apply_error,last_seen_at,created_at`
 
 func (s *Store) ListNodes(ctx context.Context) ([]domain.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeColumns+` FROM nodes ORDER BY created_at`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeColumns+` FROM nodes ORDER BY sort_order, created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -374,6 +389,10 @@ func (s *Store) ListNodes(ctx context.Context) ([]domain.Node, error) {
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()
+}
+
+func (s *Store) ReorderNodes(ctx context.Context, ids []string) error {
+	return s.reorder(ctx, "nodes", "node", ids)
 }
 
 func (s *Store) GetNode(ctx context.Context, id string) (domain.Node, string, error) {
@@ -660,7 +679,7 @@ func ruleArgs(r domain.ForwardRule) []any {
 }
 
 func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+ruleColumns+` FROM forward_rules ORDER BY created_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+ruleColumns+` FROM forward_rules ORDER BY sort_order, created_at DESC, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -674,6 +693,59 @@ func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
 		rules = append(rules, r)
 	}
 	return rules, rows.Err()
+}
+
+func (s *Store) ReorderRules(ctx context.Context, ids []string) error {
+	return s.reorder(ctx, "forward_rules", "rule", ids)
+}
+
+// reorder replaces the complete display order atomically. Requiring the full
+// ID set prevents an old browser tab from silently hiding or duplicating a
+// newly-created item in the ordering.
+func (s *Store) reorder(ctx context.Context, table, resource string, ids []string) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM `+table)
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	if len(ids) != len(existing) {
+		return errors.New("排序数据已过期，请刷新页面后重试")
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" || !existing[id] || seen[id] {
+			return errors.New("排序数据包含无效或重复项目")
+		}
+		seen[id] = true
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for index, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE `+table+` SET sort_order=? WHERE id=?`, index+1, id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.audit(ctx, "reorder", resource, "all", fmt.Sprintf("%d items", len(ids)))
+	return nil
 }
 
 func (s *Store) GetRule(ctx context.Context, id string) (domain.ForwardRule, error) {
@@ -695,6 +767,7 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 		return r, err
 	}
 	now := time.Now().UTC()
+	isCreate := r.CreatedAt.IsZero()
 	r.Revision = revision
 	r.UpdatedAt = now
 	if r.CreatedAt.IsZero() {
@@ -704,6 +777,14 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
 	if err != nil {
 		return r, err
+	}
+	if isCreate {
+		if _, err = tx.ExecContext(ctx, `UPDATE forward_rules SET sort_order=sort_order+1 WHERE id<>?`, r.ID); err != nil {
+			return r, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE forward_rules SET sort_order=1 WHERE id=?`, r.ID); err != nil {
+			return r, err
+		}
 	}
 	// Any rule edit may change the destination or active deployment. Do not
 	// display a latency result measured against the previous configuration.
@@ -730,6 +811,9 @@ func (s *Store) ImportRules(ctx context.Context, rules []domain.ForwardRule) (in
 		return 0, err
 	}
 	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET sort_order=sort_order+?`, len(rules)); err != nil {
+		return 0, err
+	}
 	for i := range rules {
 		rule := rules[i]
 		rule.NormalizeEngines()
@@ -741,6 +825,9 @@ func (s *Store) ImportRules(ctx context.Context, rules []domain.ForwardRule) (in
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
 		if err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE forward_rules SET sort_order=? WHERE id=?`, i+1, rule.ID); err != nil {
 			return 0, err
 		}
 	}
@@ -779,6 +866,10 @@ func (s *Store) ImportTopology(ctx context.Context, lines []domain.Line, rules [
 			return 0, err
 		}
 	}
+	var maxRuleOrder int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order),0) FROM forward_rules`).Scan(&maxRuleOrder); err != nil {
+		return 0, err
+	}
 	for i := range rules {
 		rule := rules[i]
 		rule.NormalizeEngines()
@@ -791,6 +882,14 @@ func (s *Store) ImportTopology(ctx context.Context, lines []domain.Line, rules [
 		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
+		}
+		candidateOrder := maxRuleOrder + 1
+		orderResult, err := tx.ExecContext(ctx, `UPDATE forward_rules SET sort_order=? WHERE id=? AND sort_order=0`, candidateOrder, rule.ID)
+		if err != nil {
+			return 0, err
+		}
+		if changed, _ := orderResult.RowsAffected(); changed > 0 {
+			maxRuleOrder = candidateOrder
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM target_probes WHERE rule_id=?`, rule.ID); err != nil {
 			return 0, err

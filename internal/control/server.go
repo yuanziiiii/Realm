@@ -89,6 +89,10 @@ type ruleBatchImportResult struct {
 	Revision int64 `json:"revision,omitempty"`
 }
 
+type reorderRequest struct {
+	IDs []string `json:"ids"`
+}
+
 func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -164,6 +168,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/dashboard", s.requireAdmin(s.dashboard))
 	mux.HandleFunc("GET /api/v1/nodes", s.requireAdmin(s.listNodes))
 	mux.HandleFunc("POST /api/v1/nodes", s.requireAdmin(s.createNode))
+	mux.HandleFunc("PUT /api/v1/nodes/order", s.requireAdmin(s.reorderNodes))
 	mux.HandleFunc("PUT /api/v1/nodes/{id}", s.requireAdmin(s.updateNode))
 	mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.requireAdmin(s.deleteNode))
 	mux.HandleFunc("GET /api/v1/lines", s.requireAdmin(s.listLines))
@@ -174,6 +179,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/rules", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("POST /api/v1/rules/import", s.requireAdmin(s.importRules))
 	mux.HandleFunc("POST /api/v1/rules/import-text", s.requireAdmin(s.importTextRules))
+	mux.HandleFunc("PUT /api/v1/rules/order", s.requireAdmin(s.reorderRules))
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
@@ -534,6 +540,19 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, nonNil(v))
 }
 
+func (s *Server) reorderNodes(w http.ResponseWriter, r *http.Request) {
+	var request reorderRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.ReorderNodes(r.Context(), request.IDs); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) createNode(w http.ResponseWriter, r *http.Request) {
 	var n domain.Node
 	if err := decodeJSON(r, &n); err != nil {
@@ -824,6 +843,19 @@ func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, nonNil(v))
+}
+
+func (s *Server) reorderRules(w http.ResponseWriter, r *http.Request) {
+	var request reorderRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.ReorderRules(r.Context(), request.IDs); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {

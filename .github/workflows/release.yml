@@ -38,7 +38,7 @@ jobs:
           install -m 0755 scripts/reset-admin-password.sh release/reset-admin-password.sh
           install -m 0755 scripts/uninstall.sh release/uninstall.sh
           for file in release/*; do
-            sha256sum "$file" > "$file.sha256"
+            (cd release && sha256sum "${file#release/}") > "$file.sha256"
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -76,7 +76,7 @@ jobs:
           gzip -1 "release/relay-panel-web-linux-${{ matrix.arch }}.tar"
           gzip -1 "release/relay-panel-control-linux-${{ matrix.arch }}.tar"
           for file in release/*; do
-            sha256sum "$file" > "$file.sha256"
+            (cd release && sha256sum "${file#release/}") > "$file.sha256"
           done
       - uses: actions/upload-artifact@v4
         with:

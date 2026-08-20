@@ -54,7 +54,7 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 binary_name="relay-agent-linux-${agent_arch}"
 
 say "下载 Relay Agent ${version} (${agent_arch})"
-curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${binary_name}" -o "${tmp_dir}/relay-agent"
+curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${download_base}/${binary_name}" -o "${tmp_dir}/relay-agent"
 curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"
 expected="$(awk '{print $1}' "${tmp_dir}/relay-agent.sha256")"
 actual="$(sha256sum "${tmp_dir}/relay-agent" | awk '{print $1}')"

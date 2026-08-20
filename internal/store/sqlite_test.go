@@ -38,6 +38,50 @@ func TestSummarySupportsFreshEmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestNodeAndRuleOrderPersists(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, id := range []string{"n1", "n2", "n3"} {
+		if err := st.CreateNode(ctx, domain.Node{ID: id, Name: id, Role: domain.NodeRoleBoth, CreatedAt: now}, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.ReorderNodes(ctx, []string{"n3", "n1", "n2"}); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := st.ListNodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{nodes[0].ID, nodes[1].ID, nodes[2].ID}; strings.Join(got, ",") != "n3,n1,n2" {
+		t.Fatalf("unexpected node order: %v", got)
+	}
+	if err := st.ReorderNodes(ctx, []string{"n1", "n2"}); err == nil {
+		t.Fatal("stale partial node order was accepted")
+	}
+
+	for i, id := range []string{"r1", "r2", "r3"} {
+		if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: id, Name: id, Protocol: "tcp", IngressNodeID: "n1", EgressNodeID: "n2", ListenAddress: "0.0.0.0", ListenPort: 10000 + i, RelayPort: 20000 + i, TargetHost: "192.0.2.1", TargetPort: 30000 + i, Engine: "nftables", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.ReorderRules(ctx, []string{"r2", "r1", "r3"}); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := st.ListRules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{rules[0].ID, rules[1].ID, rules[2].ID}; strings.Join(got, ",") != "r2,r1,r3" {
+		t.Fatalf("unexpected rule order: %v", got)
+	}
+}
+
 func TestDeploymentsUseIndependentIngressAndEgressEngines(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

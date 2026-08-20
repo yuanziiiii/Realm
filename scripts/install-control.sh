@@ -75,7 +75,8 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 archive_url="https://github.com/${repo}/archive/refs/heads/${branch}.tar.gz"
 say "下载 ${repo}@${branch}"
-curl --proto '=https' --tlsv1.2 -fsSL "${archive_url}" -o "${tmp_dir}/source.tar.gz"
+say "下载 Relay Panel 源码包"
+curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${archive_url}" -o "${tmp_dir}/source.tar.gz"
 mkdir -p "${install_dir}"
 tar -xzf "${tmp_dir}/source.tar.gz" --strip-components=1 -C "${install_dir}"
 
