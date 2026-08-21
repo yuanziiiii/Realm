@@ -29,7 +29,7 @@ func TestRenderPlanBuildsTwoHopNATCountersAndLimits(t *testing.T) {
 	for _, cmd := range plan.TC {
 		joined += cmd.Name + " " + strings.Join(cmd.Args, " ") + "\n"
 	}
-	for _, want := range []string{"dev eth0 root handle 7a1: htb", "rate 100mbit", "dev wg0 root handle 7a1: htb", "rate 30mbit"} {
+	for _, want := range []string{"dev eth0 root handle 7a1: htb", "rate 100mbit", "dev wg0 root handle 7a1: htb", "rate 30mbit", "quantum 60000"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("tc plan missing %q\n%s", want, joined)
 		}
@@ -126,7 +126,7 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 		joined += cmd.Name + " " + strings.Join(cmd.Args, " ") + "\n"
 	}
 	for _, want := range []string{
-		"qdisc replace dev wg0 handle ffff: ingress",
+		"qdisc add dev wg0 handle ffff: ingress",
 		"filter replace dev wg0 parent ffff:",
 		"redirect dev ifb-relay0",
 		"dev ifb-relay0 root handle 7a1: htb",
@@ -141,6 +141,114 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 	}
 	if len(plan.RateLimits) != 2 {
 		t.Fatalf("expected upload and download limiter diagnostics, got %#v", plan.RateLimits)
+	}
+	for _, want := range []string{
+		"counter rp_realm_up", "counter rp_realm_down",
+		`iifname "wg0" ip daddr 10.24.0.3 tcp dport 24444 counter name rp_realm_up`,
+		`oifname "wg0" ip saddr 10.24.0.3 tcp sport 24444 counter name rp_realm_down`,
+	} {
+		if !strings.Contains(plan.NFTScript, want) {
+			t.Errorf("Realm traffic stats missing %q\n%s", want, plan.NFTScript)
+		}
+	}
+}
+
+func TestRenderDualManagedRealmLimitsAndTrafficForTCPAndUDP(t *testing.T) {
+	node := domain.Node{
+		ID: "node_in", Name: "入口", PublicInterface: "eth0", PrivateInterface: "eth1",
+	}
+	rule := domain.ForwardRule{
+		ID: "rule_realm_dual", Mode: domain.ForwardModeDualManaged, Name: "Realm 双端",
+		Protocol: "both", IngressNodeID: node.ID, EgressNodeID: "node_out",
+		ListenAddress: "0.0.0.0", ListenPort: 11301, RelayPort: 1301,
+		TargetHost: "192.0.2.88", TargetPort: 36666, Engine: "realm",
+		UploadMbps: 40, DownloadMbps: 80, Enabled: true,
+	}
+	deployments := []domain.Deployment{{Rule: rule, Role: domain.NodeRoleIngress}}
+	plan, err := RenderPlan(node, deployments, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err = FinalizePlan(plan, deployments, map[string]domain.Node{
+		"node_out": {ID: "node_out", Name: "出口", PrivateAddress: "10.24.0.3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"counter rp_realm_dual_up", "counter rp_realm_dual_down",
+		`iifname "eth0" tcp dport 11301 counter name rp_realm_dual_up`,
+		`iifname "eth0" udp dport 11301 counter name rp_realm_dual_up`,
+		`oifname "eth0" tcp sport 11301 counter name rp_realm_dual_down`,
+		`oifname "eth0" udp sport 11301 counter name rp_realm_dual_down`,
+	} {
+		if !strings.Contains(plan.NFTScript, want) {
+			t.Errorf("Realm traffic plan missing %q\n%s", want, plan.NFTScript)
+		}
+	}
+	if strings.Contains(plan.NFTScript, "dnat ip to") {
+		t.Fatalf("Realm plan must not install nftables DNAT rules:\n%s", plan.NFTScript)
+	}
+	joined := ""
+	for _, cmd := range plan.TC {
+		joined += cmd.Name + " " + strings.Join(cmd.Args, " ") + "\n"
+	}
+	for _, want := range []string{
+		"qdisc add dev eth0 handle ffff: ingress",
+		"flower ip_proto tcp dst_port 11301",
+		"flower ip_proto udp dst_port 11301",
+		"redirect dev ifb-relay0",
+		"dev ifb-relay0 root handle 7a1: htb",
+		"rate 40mbit",
+		"dev eth0 root handle 7a1: htb",
+		"rate 80mbit",
+		"flower ip_proto tcp src_port 11301",
+		"flower ip_proto udp src_port 11301",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("Realm tc plan missing %q\n%s", want, joined)
+		}
+	}
+	if len(plan.RateLimits) != 2 {
+		t.Fatalf("expected two Realm limiter specs, got %#v", plan.RateLimits)
+	}
+	for _, spec := range plan.RateLimits {
+		if spec.Direction == "upload" && (spec.Interface != "ifb-relay0" || spec.SourceInterface != "eth0" || spec.ListenPort != 11301) {
+			t.Fatalf("unexpected Realm upload limiter spec: %+v", spec)
+		}
+		if spec.Direction == "download" && (spec.Interface != "eth0" || spec.SourceInterface != "") {
+			t.Fatalf("unexpected Realm download limiter spec: %+v", spec)
+		}
+	}
+	var config struct {
+		Endpoints []struct {
+			Listen  string `json:"listen"`
+			Remote  string `json:"remote"`
+			Network struct {
+				NoTCP  bool `json:"no_tcp"`
+				UseUDP bool `json:"use_udp"`
+			} `json:"network"`
+		} `json:"endpoints"`
+	}
+	if err := json.Unmarshal(plan.RealmConfig, &config); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Endpoints) != 1 || config.Endpoints[0].Listen != "0.0.0.0:11301" || config.Endpoints[0].Remote != "10.24.0.3:1301" || config.Endpoints[0].Network.NoTCP || !config.Endpoints[0].Network.UseUDP {
+		t.Fatalf("unexpected dual-managed Realm config: %+v", config.Endpoints)
+	}
+}
+
+func TestRenderPlanWithoutLimitsHasNoTCCommands(t *testing.T) {
+	for _, engine := range []string{"nftables", "realm"} {
+		node := domain.Node{ID: "in", PublicInterface: "eth0", PrivateInterface: "eth1"}
+		rule := domain.ForwardRule{ID: "rule_" + engine, Mode: domain.ForwardModeDualManaged, Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenPort: 10000, RelayPort: 20000, TargetHost: "192.0.2.2", TargetPort: 80, Engine: engine, Enabled: true}
+		plan, err := RenderPlan(node, []domain.Deployment{{Rule: rule, Role: domain.NodeRoleIngress}}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.TC) != 0 || len(plan.RateLimits) != 0 {
+			t.Fatalf("%s plan without limits must not install tc objects: %+v", engine, plan.TC)
+		}
 	}
 }
 

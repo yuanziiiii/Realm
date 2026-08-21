@@ -18,12 +18,14 @@ type Command struct {
 }
 
 type RateLimitSpec struct {
-	RuleID         string
-	Direction      string
-	Interface      string
-	ClassID        string
-	Mark           uint32
-	ConfiguredMbps int
+	RuleID          string
+	Direction       string
+	Interface       string
+	SourceInterface string
+	ListenPort      int
+	ClassID         string
+	Mark            uint32
+	ConfiguredMbps  int
 }
 
 type Plan struct {
@@ -208,6 +210,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		mark         uint32
 		direction    string
 		directListen bool
+		source       string
 	}
 	byInterface := map[string][]rateEntry{}
 	ifbEntries := map[string][]rateEntry{}
@@ -222,7 +225,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			}
 			if r.UploadMbps > 0 {
 				if r.Engine == "realm" {
-					ifbEntries[node.PrivateInterface] = append(ifbEntries[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
+					ifbEntries[node.PrivateInterface] = append(ifbEntries[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", source: node.PrivateInterface})
 				} else {
 					byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
 				}
@@ -234,7 +237,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		}
 		if r.UploadMbps > 0 {
 			if r.Engine == "realm" {
-				ifbEntries[node.PublicInterface] = append(ifbEntries[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
+				ifbEntries[node.PublicInterface] = append(ifbEntries[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", source: node.PublicInterface})
 			} else {
 				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
 			}
@@ -252,7 +255,9 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		sort.Strings(ifbSources)
 		pref := 100
 		for _, source := range ifbSources {
-			cmds = append(cmds, Command{"tc", []string{"qdisc", "replace", "dev", source, "handle", "ffff:", "ingress"}})
+			// An ingress qdisc is exclusive and cannot be replaced in place on
+			// several kernels. Add it once, then reuse it on later reconciles.
+			cmds = append(cmds, Command{"tc", []string{"qdisc", "add", "dev", source, "handle", "ffff:", "ingress"}})
 			for _, e := range ifbEntries[source] {
 				for _, proto := range protocols(e.rule.Protocol) {
 					args := []string{"filter", "replace", "dev", source, "parent", "ffff:", "protocol", "ip", "pref", strconv.Itoa(pref), "flower", "ip_proto", proto, "dst_port", strconv.Itoa(e.rule.ListenPort), "action", "skbedit", "mark", strconv.FormatUint(uint64(e.mark), 10), "action", "mirred", "egress", "redirect", "dev", "ifb-relay0"}
@@ -281,7 +286,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		if allowReplace {
 			verb = "replace"
 		}
-		cmds = append(cmds, Command{"tc", []string{"qdisc", verb, "dev", iface, "root", "handle", "7a1:", "htb", "default", "999"}}, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:", "classid", "7a1:1", "htb", "rate", "10000mbit", "ceil", "10000mbit"}}, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", "7a1:999", "htb", "rate", "10000mbit", "ceil", "10000mbit"}})
+		cmds = append(cmds, Command{"tc", []string{"qdisc", verb, "dev", iface, "root", "handle", "7a1:", "htb", "default", "999"}}, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:", "classid", "7a1:1", "htb", "rate", "10000mbit", "ceil", "10000mbit", "quantum", "60000"}}, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", "7a1:999", "htb", "rate", "10000mbit", "ceil", "10000mbit", "quantum", "60000"}})
 		for _, e := range entries {
 			minor := classMinor(e.rule.ID, e.mark == downloadMark(e.rule.ID))
 			classID := fmt.Sprintf("7a1:%d", minor)
@@ -289,7 +294,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			if burst <= 0 {
 				burst = 512
 			}
-			cmds = append(cmds, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", classID, "htb", "rate", fmt.Sprintf("%dmbit", e.rate), "ceil", fmt.Sprintf("%dmbit", e.rate), "burst", fmt.Sprintf("%dk", burst)}}, Command{"tc", []string{"qdisc", "replace", "dev", iface, "parent", classID, "handle", fmt.Sprintf("%x:", minor), "fq_codel"}})
+			cmds = append(cmds, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", classID, "htb", "rate", fmt.Sprintf("%dmbit", e.rate), "ceil", fmt.Sprintf("%dmbit", e.rate), "burst", fmt.Sprintf("%dk", burst), "quantum", "60000"}}, Command{"tc", []string{"qdisc", "replace", "dev", iface, "parent", classID, "handle", fmt.Sprintf("%x:", minor), "fq_codel"}})
 			if e.directListen {
 				for protocolIndex, proto := range protocols(e.rule.Protocol) {
 					cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor + protocolIndex*10000), "flower", "ip_proto", proto, "src_port", strconv.Itoa(e.rule.ListenPort), "flowid", classID}})
@@ -297,7 +302,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			} else {
 				cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor), "handle", strconv.FormatUint(uint64(e.mark), 10), "fw", "flowid", classID}})
 			}
-			specs = append(specs, RateLimitSpec{RuleID: e.rule.ID, Direction: e.direction, Interface: iface, ClassID: classID, Mark: e.mark, ConfiguredMbps: e.rate})
+			specs = append(specs, RateLimitSpec{RuleID: e.rule.ID, Direction: e.direction, Interface: iface, SourceInterface: e.source, ListenPort: e.rule.ListenPort, ClassID: classID, Mark: e.mark, ConfiguredMbps: e.rate})
 		}
 	}
 	return cmds, specs

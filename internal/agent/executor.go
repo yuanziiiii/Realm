@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,18 +22,19 @@ import (
 )
 
 type Executor struct {
-	Apply        bool
-	StateDir     string
-	RealmBinary  string
-	log          *slog.Logger
-	mu           sync.Mutex
-	realm        *exec.Cmd
-	realmDone    chan struct{}
-	realmHash    [32]byte
-	realmWanted  bool
-	tcInterfaces []string
-	rateLimits   []RateLimitSpec
-	reconciled   bool
+	Apply             bool
+	StateDir          string
+	RealmBinary       string
+	log               *slog.Logger
+	mu                sync.Mutex
+	realm             *exec.Cmd
+	realmDone         chan struct{}
+	realmHash         [32]byte
+	realmWanted       bool
+	tcInterfaces      []string
+	ingressInterfaces []string
+	rateLimits        []RateLimitSpec
+	reconciled        bool
 }
 
 func NewExecutor(apply bool, stateDir, realmBinary string, log *slog.Logger) *Executor {
@@ -48,6 +51,7 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 		e.reconciled = true
 		e.realmWanted = len(p.RealmConfig) > 0
 		e.tcInterfaces = managedTCInterfaces(p.TC)
+		e.ingressInterfaces = managedIngressInterfaces(p.TC)
 		e.rateLimits = append([]RateLimitSpec(nil), p.RateLimits...)
 		e.mu.Unlock()
 		return nil
@@ -71,6 +75,10 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 		return fmt.Errorf("apply nftables: %w: %s", err, bytes.TrimSpace(out))
 	}
 	if err := reconcileForwardingCompat(ctx, p.ForwardMarks); err != nil {
+		rollbackNFT(ctx, previous, hadPrevious)
+		return err
+	}
+	if err := cleanupManagedTC(ctx); err != nil {
 		rollbackNFT(ctx, previous, hadPrevious)
 		return err
 	}
@@ -103,6 +111,7 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 	e.reconciled = true
 	e.realmWanted = len(p.RealmConfig) > 0
 	e.tcInterfaces = managedTCInterfaces(p.TC)
+	e.ingressInterfaces = managedIngressInterfaces(p.TC)
 	e.rateLimits = append([]RateLimitSpec(nil), p.RateLimits...)
 	e.mu.Unlock()
 	return nil
@@ -147,15 +156,27 @@ func (e *Executor) RateLimitStatuses(ctx context.Context, nodeID string) []domai
 			statuses = append(statuses, status)
 			continue
 		}
-		if !strings.Contains(string(filterOutput), "flowid "+spec.ClassID) {
+		if !hasTCFlowTarget(string(filterOutput), spec.ClassID) {
 			status.Error = "限速 filter 未安装"
 			statuses = append(statuses, status)
 			continue
+		}
+		if spec.SourceInterface != "" {
+			ingressOutput, ingressErr := exec.CommandContext(ctx, "tc", "filter", "show", "dev", spec.SourceInterface, "parent", "ffff:").CombinedOutput()
+			if ingressErr != nil || !strings.Contains(string(ingressOutput), "ifb-relay0") || !strings.Contains(string(ingressOutput), fmt.Sprintf("dst_port %d", spec.ListenPort)) {
+				status.Error = "Realm 入站重定向 filter 未安装"
+				statuses = append(statuses, status)
+				continue
+			}
 		}
 		status.Installed = true
 		statuses = append(statuses, status)
 	}
 	return statuses
+}
+
+func hasTCFlowTarget(listed, classID string) bool {
+	return strings.Contains(listed, "flowid "+classID) || strings.Contains(listed, "classid "+classID)
 }
 
 // Healthy verifies runtime state instead of trusting the revision persisted on
@@ -165,6 +186,7 @@ func (e *Executor) Healthy(ctx context.Context) bool {
 	e.mu.Lock()
 	reconciled, realmWanted, realm, realmDone := e.reconciled, e.realmWanted, e.realm, e.realmDone
 	tcInterfaces := append([]string(nil), e.tcInterfaces...)
+	ingressInterfaces := append([]string(nil), e.ingressInterfaces...)
 	e.mu.Unlock()
 	if !reconciled {
 		return false
@@ -193,6 +215,12 @@ func (e *Executor) Healthy(ctx context.Context) bool {
 			return false
 		}
 	}
+	for _, iface := range ingressInterfaces {
+		output, err := exec.CommandContext(ctx, "tc", "qdisc", "show", "dev", iface).Output()
+		if err != nil || !strings.Contains(string(output), "qdisc ingress ffff:") {
+			return false
+		}
+	}
 	if !realmWanted {
 		return true
 	}
@@ -211,7 +239,7 @@ func managedTCInterfaces(commands []Command) []string {
 	seen := map[string]bool{}
 	var interfaces []string
 	for _, command := range commands {
-		if command.Name != "tc" || len(command.Args) < 5 || command.Args[0] != "qdisc" {
+		if command.Name != "tc" || len(command.Args) < 7 || command.Args[0] != "qdisc" || !containsArg(command.Args, "root") || !containsArg(command.Args, "7a1:") {
 			continue
 		}
 		for i, arg := range command.Args {
@@ -222,6 +250,32 @@ func managedTCInterfaces(commands []Command) []string {
 		}
 	}
 	return interfaces
+}
+
+func managedIngressInterfaces(commands []Command) []string {
+	seen := map[string]bool{}
+	var interfaces []string
+	for _, command := range commands {
+		if command.Name != "tc" || len(command.Args) < 7 || command.Args[0] != "qdisc" || !containsArg(command.Args, "ingress") {
+			continue
+		}
+		for i, arg := range command.Args {
+			if arg == "dev" && i+1 < len(command.Args) && !seen[command.Args[i+1]] {
+				seen[command.Args[i+1]] = true
+				interfaces = append(interfaces, command.Args[i+1])
+			}
+		}
+	}
+	return interfaces
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }
 
 // reconcileForwardingCompat inserts a narrowly scoped iptables chain ahead of
@@ -329,7 +383,7 @@ func rollbackNFT(ctx context.Context, previous []byte, hadPrevious bool) {
 }
 
 func isManagedQdiscAlreadyPresent(ctx context.Context, c Command, out []byte) bool {
-	if c.Name != "tc" || len(c.Args) < 5 || c.Args[0] != "qdisc" || c.Args[1] != "add" || !strings.Contains(string(out), "File exists") {
+	if c.Name != "tc" || len(c.Args) < 5 || c.Args[0] != "qdisc" || c.Args[1] != "add" || !isQdiscConflict(out) {
 		return false
 	}
 	var iface string
@@ -343,7 +397,68 @@ func isManagedQdiscAlreadyPresent(ctx context.Context, c Command, out []byte) bo
 		return false
 	}
 	listed, err := exec.CommandContext(ctx, "tc", "qdisc", "show", "dev", iface).Output()
-	return err == nil && strings.Contains(string(listed), "qdisc htb 7a1:")
+	return err == nil && compatibleManagedQdisc(c.Args, string(listed))
+}
+
+func isQdiscConflict(out []byte) bool {
+	message := string(out)
+	return strings.Contains(message, "File exists") || strings.Contains(message, "Exclusivity flag on")
+}
+
+func compatibleManagedQdisc(args []string, listed string) bool {
+	if containsArg(args, "ingress") {
+		return strings.Contains(listed, "qdisc ingress ffff:")
+	}
+	return containsArg(args, "root") && containsArg(args, "7a1:") && strings.Contains(listed, "qdisc htb 7a1:")
+}
+
+var tcPrefPattern = regexp.MustCompile(`\bpref ([0-9]+)\b`)
+
+// cleanupManagedTC removes only objects carrying Relay Panel's reserved HTB
+// handle or its IFB redirect signature. Rebuilding those objects on a real
+// configuration change prevents deleted or modified Realm limits from
+// continuing to match old listener ports. Unrelated administrator qdiscs and
+// filters are left untouched.
+func cleanupManagedTC(ctx context.Context) error {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("list interfaces for tc cleanup: %w", err)
+	}
+	for _, iface := range interfaces {
+		qdiscs, qdiscErr := exec.CommandContext(ctx, "tc", "qdisc", "show", "dev", iface.Name).CombinedOutput()
+		if qdiscErr == nil && strings.Contains(string(qdiscs), "qdisc htb 7a1:") {
+			if out, deleteErr := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", iface.Name, "root").CombinedOutput(); deleteErr != nil {
+				return fmt.Errorf("remove old Relay Panel qdisc on %s: %w: %s", iface.Name, deleteErr, bytes.TrimSpace(out))
+			}
+		}
+		filters, filterErr := exec.CommandContext(ctx, "tc", "filter", "show", "dev", iface.Name, "parent", "ffff:").CombinedOutput()
+		if filterErr != nil {
+			continue
+		}
+		for _, pref := range managedIngressFilterPrefs(string(filters)) {
+			if out, deleteErr := exec.CommandContext(ctx, "tc", "filter", "del", "dev", iface.Name, "parent", "ffff:", "protocol", "ip", "pref", pref).CombinedOutput(); deleteErr != nil {
+				return fmt.Errorf("remove old Relay Panel ingress filter on %s pref %s: %w: %s", iface.Name, pref, deleteErr, bytes.TrimSpace(out))
+			}
+		}
+	}
+	return nil
+}
+
+func managedIngressFilterPrefs(listed string) []string {
+	seen := map[string]bool{}
+	var prefs []string
+	for _, block := range strings.Split(listed, "filter protocol") {
+		if !strings.Contains(block, "ifb-relay0") || !strings.Contains(block, "skbedit") {
+			continue
+		}
+		match := tcPrefPattern.FindStringSubmatch(block)
+		if len(match) != 2 || seen[match[1]] {
+			continue
+		}
+		seen[match[1]] = true
+		prefs = append(prefs, match[1])
+	}
+	return prefs
 }
 
 func ensureNFTTable(ctx context.Context) error {
