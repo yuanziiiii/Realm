@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +34,7 @@ type Server struct {
 	sessionSecret []byte
 	secureCookies bool
 	webProxy      *httputil.ReverseProxy
+	downloadDir   string
 }
 
 type Options struct {
@@ -39,6 +42,7 @@ type Options struct {
 	SessionSecret string
 	SecureCookies bool
 	WebURL        string
+	DownloadDir   string
 	Logger        *slog.Logger
 }
 
@@ -125,7 +129,7 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
 			}
 		}
 	}
-	s := &Server{store: st, log: opts.Logger, sessionSecret: secret, secureCookies: opts.SecureCookies}
+	s := &Server{store: st, log: opts.Logger, sessionSecret: secret, secureCookies: opts.SecureCookies, downloadDir: opts.DownloadDir}
 	if opts.WebURL != "" {
 		target, err := url.Parse(opts.WebURL)
 		if err != nil {
@@ -159,6 +163,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	if s.downloadDir != "" {
+		mux.HandleFunc("GET /downloads/{name}", s.download)
+	}
 	mux.HandleFunc("POST /api/v1/login", s.login)
 	mux.HandleFunc("POST /api/v1/logout", s.requireAdmin(s.logout))
 	mux.HandleFunc("POST /api/v1/admin/password", s.requireAdmin(s.changePassword))
@@ -184,6 +191,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
 	mux.HandleFunc("GET /api/v1/traffic/rules", s.requireAdmin(s.ruleTraffic))
+	mux.HandleFunc("GET /api/v1/traffic/nodes", s.requireAdmin(s.nodeTraffic))
 	mux.HandleFunc("GET /api/v1/probes", s.requireAdmin(s.listProbes))
 	mux.HandleFunc("GET /api/v1/target-probes", s.requireAdmin(s.listTargetProbes))
 	mux.HandleFunc("GET /api/v1/config/export", s.requireAdmin(s.exportConfiguration))
@@ -197,6 +205,23 @@ func (s *Server) Handler() http.Handler {
 		http.NotFound(w, r)
 	})
 	return requestLog(s.log, mux)
+}
+
+func (s *Server) download(w http.ResponseWriter, r *http.Request) {
+	name := filepath.Base(r.PathValue("name"))
+	if name == "." || name == "" || name != r.PathValue("name") {
+		http.NotFound(w, r)
+		return
+	}
+	path := filepath.Join(s.downloadDir, name)
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeFile(w, r, path)
 }
 
 func (s *Server) exportConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -559,6 +584,7 @@ func (s *Server) createNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err)
 		return
 	}
+	normalizeNodeQuota(&n)
 	if err := validateNode(n); err != nil {
 		writeError(w, 422, err)
 		return
@@ -587,6 +613,7 @@ func (s *Server) updateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n.ID = r.PathValue("id")
+	normalizeNodeQuota(&n)
 	if err := validateNode(n); err != nil {
 		writeError(w, 422, err)
 		return
@@ -1525,6 +1552,15 @@ func (s *Server) ruleTraffic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, nonNil(items))
 }
 
+func (s *Server) nodeTraffic(w http.ResponseWriter, r *http.Request) {
+	items, err := s.store.NodeTrafficSummaries(r.Context(), time.Now().UTC())
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, nonNil(items))
+}
+
 func (s *Server) listProbes(w http.ResponseWriter, r *http.Request) {
 	probes, err := s.store.ListLinkProbes(r.Context())
 	if err != nil {
@@ -1580,6 +1616,12 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.NodeTraffic != nil {
+		if err := s.store.AddNodeTraffic(r.Context(), req.NodeID, *req.NodeTraffic); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
 	if len(req.Probes) > 0 {
 		if err := s.store.UpsertLinkProbes(r.Context(), req.NodeID, req.Probes); err != nil {
 			writeError(w, 500, err)
@@ -1588,6 +1630,12 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.TargetProbes) > 0 {
 		if err := s.store.UpsertTargetProbes(r.Context(), req.NodeID, req.TargetProbes); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if len(req.RateLimits) > 0 {
+		if err := s.store.UpsertRateLimitStatuses(r.Context(), req.NodeID, req.RateLimits); err != nil {
 			writeError(w, 500, err)
 			return
 		}
@@ -1673,7 +1721,37 @@ func validateNode(n domain.Node) error {
 	if _, err := parsePortRanges(n.DefaultRelayPortRange); err != nil {
 		return fmt.Errorf("默认可用中继端口无效：%w", err)
 	}
+	if n.TrafficQuotaBytes < 0 {
+		return errors.New("流量包容量不能为负数")
+	}
+	if n.TrafficQuotaMode != "" && n.TrafficQuotaMode != "sum" && n.TrafficQuotaMode != "rx" && n.TrafficQuotaMode != "tx" {
+		return errors.New("流量包统计方向无效")
+	}
+	if n.TrafficResetDay != 0 && (n.TrafficResetDay < 1 || n.TrafficResetDay > 28) {
+		return errors.New("流量包重置日必须为 1–28 日")
+	}
+	if n.TrafficSwitchPercent != 0 && (n.TrafficSwitchPercent < 50 || n.TrafficSwitchPercent > 100) {
+		return errors.New("自动切换阈值必须为 50%–100%")
+	}
 	return nil
+}
+
+func normalizeNodeQuota(n *domain.Node) {
+	if n.TrafficQuotaMode == "" {
+		n.TrafficQuotaMode = "sum"
+	}
+	if n.TrafficResetDay == 0 {
+		n.TrafficResetDay = 1
+	}
+	if n.TrafficSwitchPercent == 0 {
+		n.TrafficSwitchPercent = 95
+	}
+	if n.TrafficQuotaInterface == "" {
+		n.TrafficQuotaInterface = n.PublicInterface
+	}
+	if n.TrafficQuotaBytes <= 0 {
+		n.TrafficQuotaEnabled = false
+	}
 }
 func validateLine(line domain.Line) error {
 	line.NormalizeEngines()

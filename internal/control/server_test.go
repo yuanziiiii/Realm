@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -56,6 +57,7 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 		"/api/v1/rules",
 		"/api/v1/traffic?period=day",
 		"/api/v1/traffic/rules",
+		"/api/v1/traffic/nodes",
 		"/api/v1/probes",
 		"/api/v1/target-probes",
 	}
@@ -85,6 +87,33 @@ func TestFreshInstallLoginAndDashboardAPIsReturnStableEmptyCollections(t *testin
 		if path != "/api/v1/me" && path != "/api/v1/dashboard" && !bytes.Equal(bytes.TrimSpace(body), []byte("[]")) {
 			t.Fatalf("GET %s must return [] on a fresh install: %s", path, body)
 		}
+	}
+}
+
+func TestControllerServesBundledAgentDownloadsWithoutLogin(t *testing.T) {
+	ctx := context.Background()
+	temp := t.TempDir()
+	st, err := store.Open(filepath.Join(temp, "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	downloads := filepath.Join(temp, "downloads")
+	if err := os.Mkdir(downloads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "install-agent-online.sh"), []byte("#!/bin/sh\necho ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(ctx, st, Options{AdminPassword: "fresh-install-password", DownloadDir: downloads})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/downloads/install-agent-online.sh", nil)
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "echo ok") {
+		t.Fatalf("unexpected download response %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

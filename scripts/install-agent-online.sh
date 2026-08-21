@@ -97,6 +97,8 @@ check_controller() {
 
 check_controller
 
+local_download_base="${controller_url%/}/downloads"
+
 if [[ "${version}" == "latest" ]]; then
   download_base="https://github.com/${repo}/releases/latest/download"
 else
@@ -104,15 +106,23 @@ else
 fi
 binary_name="relay-agent-linux-${agent_arch}"
 say "下载 Relay Agent ${version} (${agent_arch})"
-curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${download_base}/${binary_name}" -o "${tmp_dir}/relay-agent"
-curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"
+if curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fL --show-error --progress-bar "${local_download_base}/${binary_name}" -o "${tmp_dir}/relay-agent" \
+  && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"; then
+  say "已从控制端本地下载源获取 Agent"
+else
+  say "控制端未提供本地文件，回退 GitHub Release"
+  curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${download_base}/${binary_name}" -o "${tmp_dir}/relay-agent"
+  curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"
+fi
 expected="$(awk '{print $1}' "${tmp_dir}/relay-agent.sha256")"
 actual="$(sha256sum "${tmp_dir}/relay-agent" | awk '{print $1}')"
 [[ "${actual}" == "${expected}" ]] || fail "Agent SHA-256 校验失败"
 install -m 0755 "${tmp_dir}/relay-agent" /usr/local/bin/relay-agent
 
-if curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh" -o "${tmp_dir}/zf" \
-  && curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; then
+if { curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/zf.sh" -o "${tmp_dir}/zf" \
+  && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; } \
+  || { curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh" -o "${tmp_dir}/zf" \
+  && curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; }; then
   zf_expected="$(awk '{print $1}' "${tmp_dir}/zf.sha256")"
   zf_actual="$(sha256sum "${tmp_dir}/zf" | awk '{print $1}')"
   [[ -n "${zf_expected}" && "${zf_actual}" == "${zf_expected}" ]] || fail "zf 管理工具的 SHA-256 校验失败"
@@ -122,7 +132,16 @@ fi
 if [[ "${install_realm}" == true ]]; then
   say "安装 Realm"
   realm_archive="realm-${realm_target}.tar.gz"
-  curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "https://github.com/zhboner/realm/releases/latest/download/${realm_archive}" -o "${tmp_dir}/realm.tar.gz"
+  if curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fL --show-error --progress-bar "${local_download_base}/${realm_archive}" -o "${tmp_dir}/realm.tar.gz" \
+    && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/${realm_archive}.sha256" -o "${tmp_dir}/realm.sha256"; then
+    realm_expected="$(awk '{print $1}' "${tmp_dir}/realm.sha256")"
+    realm_actual="$(sha256sum "${tmp_dir}/realm.tar.gz" | awk '{print $1}')"
+    [[ -n "${realm_expected}" && "${realm_actual}" == "${realm_expected}" ]] || fail "Realm SHA-256 校验失败"
+    say "已从控制端本地下载源获取 Realm"
+  else
+    say "控制端未提供 Realm，回退 GitHub Release"
+    curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "https://github.com/zhboner/realm/releases/latest/download/${realm_archive}" -o "${tmp_dir}/realm.tar.gz"
+  fi
   tar -xzf "${tmp_dir}/realm.tar.gz" -C "${tmp_dir}"
   realm_binary="$(find "${tmp_dir}" -type f -name realm | head -n 1)"
   [[ -n "${realm_binary}" ]] || fail "Realm 压缩包中未找到可执行文件"

@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"relaypanel/internal/domain"
 )
@@ -29,6 +30,7 @@ type Executor struct {
 	realmHash    [32]byte
 	realmWanted  bool
 	tcInterfaces []string
+	rateLimits   []RateLimitSpec
 	reconciled   bool
 }
 
@@ -46,6 +48,7 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 		e.reconciled = true
 		e.realmWanted = len(p.RealmConfig) > 0
 		e.tcInterfaces = managedTCInterfaces(p.TC)
+		e.rateLimits = append([]RateLimitSpec(nil), p.RateLimits...)
 		e.mu.Unlock()
 		return nil
 	}
@@ -100,8 +103,59 @@ func (e *Executor) Reconcile(ctx context.Context, p Plan) error {
 	e.reconciled = true
 	e.realmWanted = len(p.RealmConfig) > 0
 	e.tcInterfaces = managedTCInterfaces(p.TC)
+	e.rateLimits = append([]RateLimitSpec(nil), p.RateLimits...)
 	e.mu.Unlock()
 	return nil
+}
+
+// RateLimitStatuses verifies the concrete tc class and filter for every
+// configured rule direction. A root HTB qdisc alone is not enough: a missing
+// child class or filter silently sends traffic through the unlimited default
+// class, which is the failure mode administrators need to see.
+func (e *Executor) RateLimitStatuses(ctx context.Context, nodeID string) []domain.RateLimitStatus {
+	e.mu.Lock()
+	specs := append([]RateLimitSpec(nil), e.rateLimits...)
+	apply := e.Apply
+	e.mu.Unlock()
+	checkedAt := time.Now().UTC()
+	statuses := make([]domain.RateLimitStatus, 0, len(specs))
+	for _, spec := range specs {
+		status := domain.RateLimitStatus{
+			RuleID: spec.RuleID, NodeID: nodeID, Direction: spec.Direction,
+			Interface: spec.Interface, ConfiguredMbps: spec.ConfiguredMbps,
+			CheckedAt: checkedAt,
+		}
+		if !apply {
+			status.Installed = true
+			statuses = append(statuses, status)
+			continue
+		}
+		classOutput, classErr := exec.CommandContext(ctx, "tc", "class", "show", "dev", spec.Interface).CombinedOutput()
+		if classErr != nil {
+			status.Error = fmt.Sprintf("读取 tc class 失败: %s", strings.TrimSpace(string(classOutput)))
+			statuses = append(statuses, status)
+			continue
+		}
+		if !strings.Contains(string(classOutput), "class htb "+spec.ClassID) {
+			status.Error = "限速 class 未安装"
+			statuses = append(statuses, status)
+			continue
+		}
+		filterOutput, filterErr := exec.CommandContext(ctx, "tc", "filter", "show", "dev", spec.Interface, "parent", "7a1:").CombinedOutput()
+		if filterErr != nil {
+			status.Error = fmt.Sprintf("读取 tc filter 失败: %s", strings.TrimSpace(string(filterOutput)))
+			statuses = append(statuses, status)
+			continue
+		}
+		if !strings.Contains(string(filterOutput), "flowid "+spec.ClassID) {
+			status.Error = "限速 filter 未安装"
+			statuses = append(statuses, status)
+			continue
+		}
+		status.Installed = true
+		statuses = append(statuses, status)
+	}
+	return statuses
 }
 
 // Healthy verifies runtime state instead of trusting the revision persisted on

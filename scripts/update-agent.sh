@@ -17,6 +17,8 @@ command -v curl >/dev/null 2>&1 || fail "缺少 curl"
 command -v sha256sum >/dev/null 2>&1 || fail "缺少 sha256sum"
 [[ -s "${config_path}" ]] || fail "没有找到现有 Agent 配置 ${config_path}，请先从面板安装 Agent"
 systemctl cat "${service_name}" >/dev/null 2>&1 || fail "没有找到 ${service_name}"
+controller_url="$(jq -r '.controller_url // empty' "${config_path}" 2>/dev/null || true)"
+local_download_base="${controller_url%/}/downloads"
 
 if ! command -v ping >/dev/null 2>&1; then
   say "安装线路延迟探测工具"
@@ -54,16 +56,25 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 binary_name="relay-agent-linux-${agent_arch}"
 
 say "下载 Relay Agent ${version} (${agent_arch})"
-curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${download_base}/${binary_name}" -o "${tmp_dir}/relay-agent"
-curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"
+if [[ -n "${controller_url}" ]] \
+  && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fL --show-error --progress-bar "${local_download_base}/${binary_name}" -o "${tmp_dir}/relay-agent" \
+  && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"; then
+  say "已从控制端本地下载源获取 Agent"
+else
+  say "控制端本地下载源不可用，回退 GitHub Release"
+  curl --proto '=https' --tlsv1.2 -fL --show-error --progress-bar "${download_base}/${binary_name}" -o "${tmp_dir}/relay-agent"
+  curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/${binary_name}.sha256" -o "${tmp_dir}/relay-agent.sha256"
+fi
 expected="$(awk '{print $1}' "${tmp_dir}/relay-agent.sha256")"
 actual="$(sha256sum "${tmp_dir}/relay-agent" | awk '{print $1}')"
 [[ -n "${expected}" && "${actual}" == "${expected}" ]] || fail "Agent SHA-256 校验失败"
 chmod 0755 "${tmp_dir}/relay-agent"
 
 zf_available=false
-if curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh" -o "${tmp_dir}/zf" \
-  && curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; then
+if { [[ -n "${controller_url}" ]] && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/zf.sh" -o "${tmp_dir}/zf" \
+  && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; } \
+  || { curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh" -o "${tmp_dir}/zf" \
+  && curl --proto '=https' --tlsv1.2 -fsSL "${download_base}/zf.sh.sha256" -o "${tmp_dir}/zf.sha256"; }; then
   zf_expected="$(awk '{print $1}' "${tmp_dir}/zf.sha256")"
   zf_actual="$(sha256sum "${tmp_dir}/zf" | awk '{print $1}')"
   [[ -n "${zf_expected}" && "${zf_actual}" == "${zf_expected}" ]] || fail "zf 管理工具的 SHA-256 校验失败"

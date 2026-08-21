@@ -20,12 +20,14 @@ import (
 var version = "dev"
 
 type state struct {
-	AppliedRevision int64                `json:"applied_revision"`
-	ApplyStatus     string               `json:"apply_status"`
-	ApplyError      string               `json:"apply_error"`
-	IngressRuleIDs  []string             `json:"ingress_rule_ids"`
-	Probes          []domain.LinkProbe   `json:"probes,omitempty"`
-	TargetProbes    []domain.TargetProbe `json:"target_probes,omitempty"`
+	AppliedRevision int64                     `json:"applied_revision"`
+	ApplyStatus     string                    `json:"apply_status"`
+	ApplyError      string                    `json:"apply_error"`
+	IngressRuleIDs  []string                  `json:"ingress_rule_ids"`
+	Probes          []domain.LinkProbe        `json:"probes,omitempty"`
+	TargetProbes    []domain.TargetProbe      `json:"target_probes,omitempty"`
+	RateLimits      []domain.RateLimitStatus  `json:"rate_limits,omitempty"`
+	NodeTraffic     *domain.NodeTrafficSample `json:"node_traffic,omitempty"`
 }
 
 func main() {
@@ -77,7 +79,7 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 			}
 		}
 	}
-	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes, TargetProbes: st.TargetProbes})
+	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes, TargetProbes: st.TargetProbes, RateLimits: st.RateLimits, NodeTraffic: st.NodeTraffic})
 	if err != nil {
 		return err
 	}
@@ -96,7 +98,17 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	probeWG.Wait()
 	st.Probes = linkProbes
 	st.TargetProbes = targetProbes
+	trafficInterface := resp.Node.TrafficQuotaInterface
+	if trafficInterface == "" {
+		trafficInterface = resp.Node.PublicInterface
+	}
+	if sample, sampleErr := agent.ReadInterfaceTraffic(trafficInterface); sampleErr == nil {
+		st.NodeTraffic = &sample
+	} else {
+		st.NodeTraffic = nil
+	}
 	if resp.Revision == st.AppliedRevision && st.ApplyStatus == "normal" && executor.Healthy(ctx) {
+		st.RateLimits = executor.RateLimitStatuses(ctx, resp.Node.ID)
 		return nil
 	}
 	nodes := map[string]domain.Node{resp.Node.ID: resp.Node}
@@ -119,6 +131,7 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	st.ApplyStatus = "normal"
 	st.ApplyError = ""
 	st.IngressRuleIDs = plan.IngressRuleIDs
+	st.RateLimits = executor.RateLimitStatuses(ctx, resp.Node.ID)
 	return nil
 }
 

@@ -35,7 +35,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
-	srv, err := control.New(context.Background(), st, control.Options{AdminPassword: os.Getenv("RELAY_ADMIN_PASSWORD"), SessionSecret: os.Getenv("RELAY_SESSION_SECRET"), SecureCookies: os.Getenv("RELAY_SECURE_COOKIES") == "true", WebURL: os.Getenv("RELAY_WEB_URL"), Logger: logger})
+	srv, err := control.New(context.Background(), st, control.Options{AdminPassword: os.Getenv("RELAY_ADMIN_PASSWORD"), SessionSecret: os.Getenv("RELAY_SESSION_SECRET"), SecureCookies: os.Getenv("RELAY_SECURE_COOKIES") == "true", WebURL: os.Getenv("RELAY_WEB_URL"), DownloadDir: os.Getenv("RELAY_DOWNLOAD_DIR"), Logger: logger})
 	if err != nil {
 		logger.Error("initialize controller", "error", err)
 		os.Exit(1)

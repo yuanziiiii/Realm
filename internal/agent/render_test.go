@@ -96,7 +96,8 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 		ID: "rule_realm", Mode: domain.ForwardModeExitOnly, Name: "Realm 仅出口",
 		Protocol: "tcp", IngressNodeID: node.ID, EgressNodeID: node.ID,
 		ListenAddress: "10.24.0.3", ListenPort: 24444, RelayPort: 24444,
-		TargetHost: "192.0.2.88", TargetPort: 443, Engine: "realm", Enabled: true,
+		TargetHost: "landing.example.com", TargetPort: 443, Engine: "realm",
+		UploadMbps: 30, DownloadMbps: 100, Enabled: true,
 	}
 	plan, err := RenderPlan(node, []domain.Deployment{{Rule: rule, Role: domain.NodeRoleEgress}}, true)
 	if err != nil {
@@ -117,8 +118,29 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 		t.Fatalf("expected one endpoint, got %#v", config.Endpoints)
 	}
 	got := config.Endpoints[0]
-	if got.Listen != "10.24.0.3:24444" || got.Remote != "192.0.2.88:443" || got.Through != "" || got.Interface != "eth0" {
+	if got.Listen != "10.24.0.3:24444" || got.Remote != "landing.example.com:443" || got.Through != "" || got.Interface != "eth0" {
 		t.Fatalf("unexpected Realm endpoint: %+v", got)
+	}
+	joined := ""
+	for _, cmd := range plan.TC {
+		joined += cmd.Name + " " + strings.Join(cmd.Args, " ") + "\n"
+	}
+	for _, want := range []string{
+		"qdisc replace dev wg0 handle ffff: ingress",
+		"filter replace dev wg0 parent ffff:",
+		"redirect dev ifb-relay0",
+		"dev ifb-relay0 root handle 7a1: htb",
+		"rate 30mbit",
+		"dev wg0 root handle 7a1: htb",
+		"rate 100mbit",
+		"flower ip_proto tcp src_port 24444",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("tc plan missing %q\n%s", want, joined)
+		}
+	}
+	if len(plan.RateLimits) != 2 {
+		t.Fatalf("expected upload and download limiter diagnostics, got %#v", plan.RateLimits)
 	}
 }
 

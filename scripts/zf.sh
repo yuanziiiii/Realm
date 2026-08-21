@@ -41,14 +41,27 @@ confirm() {
   [[ "${answer}" == "y" || "${answer}" == "Y" ]]
 }
 run_release_script() {
-  local name="$1" tmp_file checksum_file expected actual
+  local name="$1" tmp_file checksum_file expected actual controller_url local_base downloaded
   shift
   command -v curl >/dev/null 2>&1 || { warn '缺少 curl，无法在线执行'; return 1; }
   command -v sha256sum >/dev/null 2>&1 || { warn '缺少 sha256sum，无法校验更新文件'; return 1; }
   tmp_file="$(mktemp)" || return 1
   checksum_file="${tmp_file}.sha256"
-  if ! curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/${repo}/releases/latest/download/${name}" -o "${tmp_file}" \
-    || ! curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/${repo}/releases/latest/download/${name}.sha256" -o "${checksum_file}"; then
+  downloaded=false
+  controller_url=""
+  if [[ -s "${agent_config}" ]] && command -v jq >/dev/null 2>&1; then
+    controller_url="$(jq -r '.controller_url // empty' "${agent_config}" 2>/dev/null || true)"
+  fi
+  local_base="${controller_url%/}/downloads"
+  if [[ -n "${controller_url}" ]] \
+    && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_base}/${name}" -o "${tmp_file}" \
+    && curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL "${local_base}/${name}.sha256" -o "${checksum_file}"; then
+    downloaded=true
+    say "已从控制端本地下载源获取 ${name}"
+  fi
+  if [[ "${downloaded}" != true ]] \
+    && { ! curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/${repo}/releases/latest/download/${name}" -o "${tmp_file}" \
+    || ! curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/${repo}/releases/latest/download/${name}.sha256" -o "${checksum_file}"; }; then
     rm -f "${tmp_file}" "${checksum_file}"
     warn "下载 ${name} 失败"
     return 1

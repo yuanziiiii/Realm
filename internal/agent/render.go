@@ -16,17 +16,39 @@ type Command struct {
 	Name string   `json:"name"`
 	Args []string `json:"args"`
 }
+
+type RateLimitSpec struct {
+	RuleID         string
+	Direction      string
+	Interface      string
+	ClassID        string
+	Mark           uint32
+	ConfiguredMbps int
+}
+
 type Plan struct {
-	NFTScript      string    `json:"nft_script"`
-	TC             []Command `json:"tc"`
-	RealmConfig    []byte    `json:"realm_config,omitempty"`
-	IngressRuleIDs []string  `json:"ingress_rule_ids"`
-	ForwardMarks   []uint32  `json:"forward_marks,omitempty"`
+	NFTScript      string          `json:"nft_script"`
+	TC             []Command       `json:"tc"`
+	RealmConfig    []byte          `json:"realm_config,omitempty"`
+	IngressRuleIDs []string        `json:"ingress_rule_ids"`
+	ForwardMarks   []uint32        `json:"forward_marks,omitempty"`
+	RateLimits     []RateLimitSpec `json:"-"`
 }
 
 func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscReplace bool) (Plan, error) {
 	sort.Slice(deployments, func(i, j int) bool { return deployments[i].Rule.ID < deployments[j].Rule.ID })
 	var p Plan
+	markOwners := map[uint32]string{}
+	for _, deployment := range deployments {
+		if deployment.Rule.Engine != "nftables" {
+			continue
+		}
+		mark := uploadMark(deployment.Rule.ID)
+		if owner := markOwners[mark]; owner != "" && owner != deployment.Rule.ID {
+			return p, fmt.Errorf("traffic mark collision between rules %s and %s", owner, deployment.Rule.ID)
+		}
+		markOwners[mark] = deployment.Rule.ID
+	}
 	var b strings.Builder
 	b.WriteString("flush table inet relay_panel\n")
 	b.WriteString("table inet relay_panel {\n")
@@ -93,7 +115,15 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 	}
 	b.WriteString("  }\n  chain forward { type filter hook forward priority filter; policy accept; }\n}\n")
 	p.NFTScript = b.String()
-	p.TC = renderTC(node, deployments, allowQdiscReplace)
+	p.TC, p.RateLimits = renderTC(node, deployments, allowQdiscReplace)
+	classOwners := map[string]string{}
+	for _, limit := range p.RateLimits {
+		key := limit.Interface + "/" + limit.ClassID
+		if owner := classOwners[key]; owner != "" && owner != limit.RuleID {
+			return p, fmt.Errorf("tc class collision between rules %s and %s on %s", owner, limit.RuleID, limit.Interface)
+		}
+		classOwners[key] = limit.RuleID
+	}
 	p.RealmConfig = renderRealm(node, deployments)
 	return p, nil
 }
@@ -171,13 +201,16 @@ func renderPostrouting(b *strings.Builder, node domain.Node, d domain.Deployment
 	return nil
 }
 
-func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bool) []Command {
-	byInterface := map[string][]struct {
-		rule        domain.ForwardRule
-		rate        int
-		mark        uint32
-		realmUpload bool
-	}{}
+func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bool) ([]Command, []RateLimitSpec) {
+	type rateEntry struct {
+		rule         domain.ForwardRule
+		rate         int
+		mark         uint32
+		direction    string
+		directListen bool
+	}
+	byInterface := map[string][]rateEntry{}
+	ifbEntries := map[string][]rateEntry{}
 	for _, d := range deployments {
 		if d.Role != domain.NodeRoleIngress && d.Role != domain.NodeRoleBoth && d.Rule.Mode != domain.ForwardModeExitOnly {
 			continue
@@ -185,58 +218,52 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		r := d.Rule
 		if r.Mode == domain.ForwardModeExitOnly {
 			if r.DownloadMbps > 0 {
-				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], struct {
-					rule        domain.ForwardRule
-					rate        int
-					mark        uint32
-					realmUpload bool
-				}{r, r.DownloadMbps, downloadMark(r.ID), false})
+				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.DownloadMbps, mark: downloadMark(r.ID), direction: "download", directListen: r.Engine == "realm"})
 			}
 			if r.UploadMbps > 0 {
-				byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], struct {
-					rule        domain.ForwardRule
-					rate        int
-					mark        uint32
-					realmUpload bool
-				}{r, r.UploadMbps, uploadMark(r.ID), false})
+				if r.Engine == "realm" {
+					ifbEntries[node.PrivateInterface] = append(ifbEntries[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
+				} else {
+					byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
+				}
 			}
 			continue
 		}
 		if r.DownloadMbps > 0 {
-			byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], struct {
-				rule        domain.ForwardRule
-				rate        int
-				mark        uint32
-				realmUpload bool
-			}{r, r.DownloadMbps, downloadMark(r.ID), false})
+			byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.DownloadMbps, mark: downloadMark(r.ID), direction: "download", directListen: r.Engine == "realm"})
 		}
 		if r.UploadMbps > 0 {
 			if r.Engine == "realm" {
-				byInterface["ifb-relay0"] = append(byInterface["ifb-relay0"], struct {
-					rule        domain.ForwardRule
-					rate        int
-					mark        uint32
-					realmUpload bool
-				}{r, r.UploadMbps, uploadMark(r.ID), true})
+				ifbEntries[node.PublicInterface] = append(ifbEntries[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
 			} else {
-				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], struct {
-					rule        domain.ForwardRule
-					rate        int
-					mark        uint32
-					realmUpload bool
-				}{r, r.UploadMbps, uploadMark(r.ID), false})
+				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
 			}
 		}
 	}
 	var cmds []Command
-	if entries := byInterface["ifb-relay0"]; len(entries) > 0 {
-		cmds = append(cmds, Command{"modprobe", []string{"ifb"}}, Command{"ip", []string{"link", "add", "ifb-relay0", "type", "ifb"}}, Command{"ip", []string{"link", "set", "ifb-relay0", "up"}}, Command{"tc", []string{"qdisc", "replace", "dev", node.PublicInterface, "handle", "ffff:", "ingress"}})
+	if len(ifbEntries) > 0 {
+		cmds = append(cmds, Command{"modprobe", []string{"ifb"}}, Command{"ip", []string{"link", "add", "ifb-relay0", "type", "ifb"}}, Command{"ip", []string{"link", "set", "ifb-relay0", "up"}})
+		ifbSources := make([]string, 0, len(ifbEntries))
+		for source := range ifbEntries {
+			if source != "" {
+				ifbSources = append(ifbSources, source)
+			}
+		}
+		sort.Strings(ifbSources)
 		pref := 100
-		for _, e := range entries {
-			for _, proto := range protocols(e.rule.Protocol) {
-				args := []string{"filter", "replace", "dev", node.PublicInterface, "parent", "ffff:", "protocol", "ip", "pref", strconv.Itoa(pref), "flower", "ip_proto", proto, "dst_port", strconv.Itoa(e.rule.ListenPort), "action", "skbedit", "mark", strconv.FormatUint(uint64(e.mark), 10), "action", "mirred", "egress", "redirect", "dev", "ifb-relay0"}
-				cmds = append(cmds, Command{"tc", args})
-				pref++
+		for _, source := range ifbSources {
+			cmds = append(cmds, Command{"tc", []string{"qdisc", "replace", "dev", source, "handle", "ffff:", "ingress"}})
+			for _, e := range ifbEntries[source] {
+				for _, proto := range protocols(e.rule.Protocol) {
+					args := []string{"filter", "replace", "dev", source, "parent", "ffff:", "protocol", "ip", "pref", strconv.Itoa(pref), "flower", "ip_proto", proto, "dst_port", strconv.Itoa(e.rule.ListenPort), "action", "skbedit", "mark", strconv.FormatUint(uint64(e.mark), 10), "action", "mirred", "egress", "redirect", "dev", "ifb-relay0"}
+					cmds = append(cmds, Command{"tc", args})
+					pref++
+				}
+			}
+		}
+		for _, entries := range ifbEntries {
+			for _, e := range entries {
+				byInterface["ifb-relay0"] = append(byInterface["ifb-relay0"], e)
 			}
 		}
 	}
@@ -247,6 +274,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		}
 	}
 	sort.Strings(interfaces)
+	var specs []RateLimitSpec
 	for _, iface := range interfaces {
 		entries := byInterface[iface]
 		verb := "add"
@@ -261,10 +289,18 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			if burst <= 0 {
 				burst = 512
 			}
-			cmds = append(cmds, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", classID, "htb", "rate", fmt.Sprintf("%dmbit", e.rate), "ceil", fmt.Sprintf("%dmbit", e.rate), "burst", fmt.Sprintf("%dk", burst)}}, Command{"tc", []string{"qdisc", "replace", "dev", iface, "parent", classID, "handle", fmt.Sprintf("%x:", minor), "fq_codel"}}, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor), "handle", strconv.FormatUint(uint64(e.mark), 10), "fw", "flowid", classID}})
+			cmds = append(cmds, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", classID, "htb", "rate", fmt.Sprintf("%dmbit", e.rate), "ceil", fmt.Sprintf("%dmbit", e.rate), "burst", fmt.Sprintf("%dk", burst)}}, Command{"tc", []string{"qdisc", "replace", "dev", iface, "parent", classID, "handle", fmt.Sprintf("%x:", minor), "fq_codel"}})
+			if e.directListen {
+				for protocolIndex, proto := range protocols(e.rule.Protocol) {
+					cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor + protocolIndex*10000), "flower", "ip_proto", proto, "src_port", strconv.Itoa(e.rule.ListenPort), "flowid", classID}})
+				}
+			} else {
+				cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor), "handle", strconv.FormatUint(uint64(e.mark), 10), "fw", "flowid", classID}})
+			}
+			specs = append(specs, RateLimitSpec{RuleID: e.rule.ID, Direction: e.direction, Interface: iface, ClassID: classID, Mark: e.mark, ConfiguredMbps: e.rate})
 		}
 	}
-	return cmds
+	return cmds, specs
 }
 
 func renderRealm(node domain.Node, deployments []domain.Deployment) []byte {

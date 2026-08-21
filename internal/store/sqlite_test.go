@@ -243,6 +243,67 @@ func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	}
 }
 
+func TestRuleTrafficSummaryUsesLatestAgentSampleRate(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, n := range []domain.Node{{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now}, {ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}} {
+		if err := st.CreateNode(ctx, n, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", Mode: domain.ForwardModeDualManaged, Name: "测试", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.2", TargetPort: 80, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	first := domain.TrafficDelta{RuleID: "rule", CapturedAt: now.Add(-10 * time.Second), Cumulative: true, UploadBytes: 1000, DownloadBytes: 2000}
+	second := domain.TrafficDelta{RuleID: "rule", CapturedAt: now, Cumulative: true, UploadBytes: 3000, DownloadBytes: 7000}
+	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{first}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{second}); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := st.RuleTrafficSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].UploadBytesPerSecond != 200 || summaries[0].DownloadBytesPerSecond != 500 {
+		t.Fatalf("expected latest 10-second sample rate 200/500 Bps, got %+v", summaries)
+	}
+}
+
+func TestRateLimitStatusesAreAttachedToRuleTraffic(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, n := range []domain.Node{{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now}, {ID: "out", Name: "出口", Role: domain.NodeRoleEgress, CreatedAt: now}} {
+		if err := st.CreateNode(ctx, n, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", Mode: domain.ForwardModeDualManaged, Name: "测试", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 10000, RelayPort: 30000, TargetHost: "192.0.2.2", TargetPort: 80, Engine: "nftables", DownloadMbps: 100, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertRateLimitStatuses(ctx, "in", []domain.RateLimitStatus{{RuleID: "rule", Direction: "download", Interface: "eth0", ConfiguredMbps: 100, Installed: true, CheckedAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := st.RuleTrafficSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || len(summaries[0].RateLimits) != 1 || !summaries[0].RateLimits[0].Installed {
+		t.Fatalf("unexpected limiter status: %+v", summaries)
+	}
+}
+
 func TestHeartbeatAutoFillsBlankNetworkWithoutOverwritingManualValues(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
@@ -772,6 +833,69 @@ func TestICMPBlockedDoesNotTriggerAutomaticFailover(t *testing.T) {
 	got, err := st.GetLine(ctx, "line")
 	if err != nil || got.ActiveEgressNodeID != "out-a" {
 		t.Fatalf("ICMP-blocked path caused a false switch: %+v, %v", got, err)
+	}
+}
+
+func TestServerTrafficQuotaSwitchesToHealthyBackup(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	nodes := []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PublicInterface: "eth0", CreatedAt: now},
+		{ID: "out-a", Name: "主出口", Role: domain.NodeRoleEgress, PublicInterface: "eth0", TrafficQuotaEnabled: true, TrafficQuotaBytes: 1000, TrafficQuotaMode: "sum", TrafficQuotaInterface: "eth0", TrafficResetDay: 1, TrafficSwitchPercent: 90, CreatedAt: now},
+		{ID: "out-b", Name: "备用出口", Role: domain.NodeRoleEgress, PublicInterface: "eth0", TrafficQuotaEnabled: true, TrafficQuotaBytes: 10000, TrafficQuotaMode: "sum", TrafficQuotaInterface: "eth0", TrafficResetDay: 1, TrafficSwitchPercent: 90, CreatedAt: now},
+	}
+	for _, node := range nodes {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateHeartbeat(ctx, node.ID, "test", "normal", "", 1, domain.NetworkInfo{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "配额主备", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out-a", EgressNodeIDs: []string{"out-a", "out-b"}, ActiveEgressNodeID: "out-a", FailoverEnabled: true, ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		if err := st.UpsertLinkProbes(ctx, "in", []domain.LinkProbe{{EgressNodeID: "out-a", Success: true, PacketLoss: 0, CheckedAt: at}, {EgressNodeID: "out-b", Success: true, PacketLoss: 0, CheckedAt: at}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, nodeID := range []string{"out-a", "out-b"} {
+		if err := st.AddNodeTraffic(ctx, nodeID, domain.NodeTrafficSample{Interface: "eth0", CapturedAt: now.Add(-10 * time.Second), Cumulative: true, RXBytes: 1000, TXBytes: 1000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.AddNodeTraffic(ctx, "out-a", domain.NodeTrafficSample{Interface: "eth0", CapturedAt: now, Cumulative: true, RXBytes: 1700, TXBytes: 1300}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddNodeTraffic(ctx, "out-b", domain.NodeTrafficSample{Interface: "eth0", CapturedAt: now, Cumulative: true, RXBytes: 1100, TXBytes: 1100}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReconcileFailover(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	line, err := st.GetLine(ctx, "line")
+	if err != nil || line.ActiveEgressNodeID != "out-b" {
+		t.Fatalf("quota did not switch to backup: %+v, %v", line, err)
+	}
+	summaries, err := st.NodeTrafficSummaries(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var primary domain.NodeTrafficSummary
+	for _, item := range summaries {
+		if item.NodeID == "out-a" {
+			primary = item
+		}
+	}
+	if !primary.Exhausted || primary.BillableBytes != 1000 {
+		t.Fatalf("unexpected primary quota summary: %+v", primary)
 	}
 }
 

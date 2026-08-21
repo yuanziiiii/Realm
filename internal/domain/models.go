@@ -23,6 +23,12 @@ type Node struct {
 	PublicInterface       string    `json:"public_interface"`
 	PrivateInterface      string    `json:"private_interface"`
 	DefaultRelayPortRange string    `json:"default_relay_port_range"`
+	TrafficQuotaEnabled   bool      `json:"traffic_quota_enabled"`
+	TrafficQuotaBytes     int64     `json:"traffic_quota_bytes"`
+	TrafficQuotaMode      string    `json:"traffic_quota_mode"`
+	TrafficQuotaInterface string    `json:"traffic_quota_interface"`
+	TrafficResetDay       int       `json:"traffic_reset_day"`
+	TrafficSwitchPercent  int       `json:"traffic_switch_percent"`
 	Status                string    `json:"status"`
 	AgentVersion          string    `json:"agent_version,omitempty"`
 	AppliedRevision       int64     `json:"applied_revision"`
@@ -206,20 +212,63 @@ type TrafficPoint struct {
 	DownloadPackets int64     `json:"download_packets"`
 }
 
+type NodeTrafficSample struct {
+	Interface  string    `json:"interface"`
+	CapturedAt time.Time `json:"captured_at"`
+	Cumulative bool      `json:"cumulative,omitempty"`
+	RXBytes    int64     `json:"rx_bytes"`
+	TXBytes    int64     `json:"tx_bytes"`
+}
+
+type NodeTrafficSummary struct {
+	NodeID         string    `json:"node_id"`
+	Interface      string    `json:"interface"`
+	Mode           string    `json:"mode"`
+	CycleStart     time.Time `json:"cycle_start"`
+	CycleEnd       time.Time `json:"cycle_end"`
+	RXBytes        int64     `json:"rx_bytes"`
+	TXBytes        int64     `json:"tx_bytes"`
+	BillableBytes  int64     `json:"billable_bytes"`
+	QuotaBytes     int64     `json:"quota_bytes"`
+	RemainingBytes int64     `json:"remaining_bytes"`
+	UsedPercent    float64   `json:"used_percent"`
+	SwitchPercent  int       `json:"switch_percent"`
+	Exhausted      bool      `json:"exhausted"`
+	RXBytesPerSec  int64     `json:"rx_bytes_per_second"`
+	TXBytesPerSec  int64     `json:"tx_bytes_per_second"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 type RuleTrafficSummary struct {
-	RuleID                 string `json:"rule_id"`
-	TotalUploadBytes       int64  `json:"total_upload_bytes"`
-	TotalDownloadBytes     int64  `json:"total_download_bytes"`
-	TodayUploadBytes       int64  `json:"today_upload_bytes"`
-	TodayDownloadBytes     int64  `json:"today_download_bytes"`
-	WeekUploadBytes        int64  `json:"week_upload_bytes"`
-	WeekDownloadBytes      int64  `json:"week_download_bytes"`
-	MonthUploadBytes       int64  `json:"month_upload_bytes"`
-	MonthDownloadBytes     int64  `json:"month_download_bytes"`
-	QuarterUploadBytes     int64  `json:"quarter_upload_bytes"`
-	QuarterDownloadBytes   int64  `json:"quarter_download_bytes"`
-	UploadBytesPerSecond   int64  `json:"upload_bytes_per_second"`
-	DownloadBytesPerSecond int64  `json:"download_bytes_per_second"`
+	RuleID                 string            `json:"rule_id"`
+	TotalUploadBytes       int64             `json:"total_upload_bytes"`
+	TotalDownloadBytes     int64             `json:"total_download_bytes"`
+	TodayUploadBytes       int64             `json:"today_upload_bytes"`
+	TodayDownloadBytes     int64             `json:"today_download_bytes"`
+	WeekUploadBytes        int64             `json:"week_upload_bytes"`
+	WeekDownloadBytes      int64             `json:"week_download_bytes"`
+	MonthUploadBytes       int64             `json:"month_upload_bytes"`
+	MonthDownloadBytes     int64             `json:"month_download_bytes"`
+	QuarterUploadBytes     int64             `json:"quarter_upload_bytes"`
+	QuarterDownloadBytes   int64             `json:"quarter_download_bytes"`
+	UploadBytesPerSecond   int64             `json:"upload_bytes_per_second"`
+	DownloadBytesPerSecond int64             `json:"download_bytes_per_second"`
+	RateLimits             []RateLimitStatus `json:"rate_limits,omitempty"`
+}
+
+// RateLimitStatus is reported by the Agent after checking the tc class and
+// filter that should enforce one direction of a rule's configured limit.
+// Keeping this separate from ApplyStatus makes a partially broken limiter
+// visible without incorrectly marking the forwarding rule itself offline.
+type RateLimitStatus struct {
+	RuleID         string    `json:"rule_id"`
+	NodeID         string    `json:"node_id"`
+	Direction      string    `json:"direction"`
+	Interface      string    `json:"interface"`
+	ConfiguredMbps int       `json:"configured_mbps"`
+	Installed      bool      `json:"installed"`
+	Error          string    `json:"error,omitempty"`
+	CheckedAt      time.Time `json:"checked_at"`
 }
 
 type NetworkInfo struct {
@@ -264,15 +313,17 @@ type TargetProbe struct {
 }
 
 type SyncRequest struct {
-	NodeID          string         `json:"node_id"`
-	AgentVersion    string         `json:"agent_version"`
-	AppliedRevision int64          `json:"applied_revision"`
-	ApplyStatus     string         `json:"apply_status"`
-	ApplyError      string         `json:"apply_error,omitempty"`
-	Network         NetworkInfo    `json:"network,omitempty"`
-	Traffic         []TrafficDelta `json:"traffic,omitempty"`
-	Probes          []LinkProbe    `json:"probes,omitempty"`
-	TargetProbes    []TargetProbe  `json:"target_probes,omitempty"`
+	NodeID          string             `json:"node_id"`
+	AgentVersion    string             `json:"agent_version"`
+	AppliedRevision int64              `json:"applied_revision"`
+	ApplyStatus     string             `json:"apply_status"`
+	ApplyError      string             `json:"apply_error,omitempty"`
+	Network         NetworkInfo        `json:"network,omitempty"`
+	Traffic         []TrafficDelta     `json:"traffic,omitempty"`
+	Probes          []LinkProbe        `json:"probes,omitempty"`
+	TargetProbes    []TargetProbe      `json:"target_probes,omitempty"`
+	RateLimits      []RateLimitStatus  `json:"rate_limits,omitempty"`
+	NodeTraffic     *NodeTrafficSample `json:"node_traffic,omitempty"`
 }
 
 type SyncResponse struct {

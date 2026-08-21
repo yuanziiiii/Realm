@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +48,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			public_address TEXT NOT NULL DEFAULT '', private_address TEXT NOT NULL DEFAULT '',
 			public_interface TEXT NOT NULL DEFAULT '', private_interface TEXT NOT NULL DEFAULT '',
 			default_relay_port_range TEXT NOT NULL DEFAULT '',
+			traffic_quota_enabled INTEGER NOT NULL DEFAULT 0, traffic_quota_bytes INTEGER NOT NULL DEFAULT 0,
+			traffic_quota_mode TEXT NOT NULL DEFAULT 'sum', traffic_quota_interface TEXT NOT NULL DEFAULT '',
+			traffic_reset_day INTEGER NOT NULL DEFAULT 1, traffic_switch_percent INTEGER NOT NULL DEFAULT 95,
 			agent_token_hash TEXT NOT NULL, agent_version TEXT NOT NULL DEFAULT '',
 			applied_revision INTEGER NOT NULL DEFAULT 0, apply_status TEXT NOT NULL DEFAULT 'pending',
 			apply_error TEXT NOT NULL DEFAULT '', last_seen_at INTEGER NOT NULL DEFAULT 0,
@@ -122,7 +126,41 @@ func (s *Store) migrate(ctx context.Context) error {
 			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
 			upload_bytes INTEGER NOT NULL DEFAULT 0, download_bytes INTEGER NOT NULL DEFAULT 0,
 			upload_packets INTEGER NOT NULL DEFAULT 0, download_packets INTEGER NOT NULL DEFAULT 0,
+			captured_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(rule_id, node_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS traffic_rates (
+			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			captured_at INTEGER NOT NULL DEFAULT 0,
+			upload_bps INTEGER NOT NULL DEFAULT 0, download_bps INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(rule_id, node_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS rate_limit_status (
+			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			direction TEXT NOT NULL, interface TEXT NOT NULL DEFAULT '',
+			configured_mbps INTEGER NOT NULL DEFAULT 0, installed INTEGER NOT NULL DEFAULT 0,
+			error TEXT NOT NULL DEFAULT '', checked_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(rule_id, node_id, direction)
+		)`,
+		`CREATE TABLE IF NOT EXISTS node_traffic_daily (
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			interface TEXT NOT NULL, bucket INTEGER NOT NULL,
+			rx_bytes INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(node_id, interface, bucket)
+		)`,
+		`CREATE TABLE IF NOT EXISTS node_traffic_baselines (
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			interface TEXT NOT NULL, rx_bytes INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0,
+			captured_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(node_id, interface)
+		)`,
+		`CREATE TABLE IF NOT EXISTS node_traffic_rates (
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			interface TEXT NOT NULL, captured_at INTEGER NOT NULL DEFAULT 0,
+			rx_bps INTEGER NOT NULL DEFAULT 0, tx_bps INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(node_id, interface)
 		)`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL,
@@ -137,6 +175,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_rules_line ON forward_rules(line_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic_minute(bucket)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_daily_bucket ON traffic_daily(bucket)`,
+		`CREATE INDEX IF NOT EXISTS idx_traffic_rates_captured ON traffic_rates(captured_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -155,11 +194,26 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "forward_rules", "egress_engine", `ALTER TABLE forward_rules ADD COLUMN egress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "traffic_baselines", "captured_at", `ALTER TABLE traffic_baselines ADD COLUMN captured_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "nodes", "sort_order", `ALTER TABLE nodes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "nodes", "default_relay_port_range", `ALTER TABLE nodes ADD COLUMN default_relay_port_range TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
+	}
+	for column, alter := range map[string]string{
+		"traffic_quota_enabled":   `ALTER TABLE nodes ADD COLUMN traffic_quota_enabled INTEGER NOT NULL DEFAULT 0`,
+		"traffic_quota_bytes":     `ALTER TABLE nodes ADD COLUMN traffic_quota_bytes INTEGER NOT NULL DEFAULT 0`,
+		"traffic_quota_mode":      `ALTER TABLE nodes ADD COLUMN traffic_quota_mode TEXT NOT NULL DEFAULT 'sum'`,
+		"traffic_quota_interface": `ALTER TABLE nodes ADD COLUMN traffic_quota_interface TEXT NOT NULL DEFAULT ''`,
+		"traffic_reset_day":       `ALTER TABLE nodes ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 1`,
+		"traffic_switch_percent":  `ALTER TABLE nodes ADD COLUMN traffic_switch_percent INTEGER NOT NULL DEFAULT 95`,
+	} {
+		if err := s.ensureColumn(ctx, "nodes", column, alter); err != nil {
+			return err
+		}
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "sort_order", `ALTER TABLE forward_rules ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
@@ -353,8 +407,17 @@ func (s *Store) bumpRevision(ctx context.Context, tx *sql.Tx) (int64, error) {
 }
 
 func (s *Store) CreateNode(ctx context.Context, n domain.Node, tokenHash string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,role,public_address,private_address,public_interface,private_interface,default_relay_port_range,agent_token_hash,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM nodes),?)`,
-		n.ID, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.DefaultRelayPortRange, tokenHash, unix(n.CreatedAt))
+	if n.TrafficQuotaMode == "" {
+		n.TrafficQuotaMode = "sum"
+	}
+	if n.TrafficResetDay == 0 {
+		n.TrafficResetDay = 1
+	}
+	if n.TrafficSwitchPercent == 0 {
+		n.TrafficSwitchPercent = 95
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,role,public_address,private_address,public_interface,private_interface,default_relay_port_range,traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode,traffic_quota_interface,traffic_reset_day,traffic_switch_percent,agent_token_hash,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM nodes),?)`,
+		n.ID, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.DefaultRelayPortRange, boolInt(n.TrafficQuotaEnabled), n.TrafficQuotaBytes, n.TrafficQuotaMode, n.TrafficQuotaInterface, n.TrafficResetDay, n.TrafficSwitchPercent, tokenHash, unix(n.CreatedAt))
 	if err == nil {
 		s.audit(ctx, "create", "node", n.ID, n.Name)
 	}
@@ -364,8 +427,10 @@ func (s *Store) CreateNode(ctx context.Context, n domain.Node, tokenHash string)
 func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, error) {
 	var n domain.Node
 	var tokenHash string
+	var quotaEnabled int
 	var lastSeen, created int64
-	err := scanner.Scan(&n.ID, &n.Name, &n.Role, &n.PublicAddress, &n.PrivateAddress, &n.PublicInterface, &n.PrivateInterface, &n.DefaultRelayPortRange, &tokenHash, &n.AgentVersion, &n.AppliedRevision, &n.ApplyStatus, &n.ApplyError, &lastSeen, &created)
+	err := scanner.Scan(&n.ID, &n.Name, &n.Role, &n.PublicAddress, &n.PrivateAddress, &n.PublicInterface, &n.PrivateInterface, &n.DefaultRelayPortRange, &quotaEnabled, &n.TrafficQuotaBytes, &n.TrafficQuotaMode, &n.TrafficQuotaInterface, &n.TrafficResetDay, &n.TrafficSwitchPercent, &tokenHash, &n.AgentVersion, &n.AppliedRevision, &n.ApplyStatus, &n.ApplyError, &lastSeen, &created)
+	n.TrafficQuotaEnabled = quotaEnabled != 0
 	n.LastSeenAt = fromUnix(lastSeen)
 	n.CreatedAt = fromUnix(created)
 	if time.Since(n.LastSeenAt) <= 45*time.Second {
@@ -376,7 +441,7 @@ func scanNode(scanner interface{ Scan(...any) error }) (domain.Node, string, err
 	return n, tokenHash, err
 }
 
-const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,default_relay_port_range,agent_token_hash,agent_version,applied_revision,apply_status,apply_error,last_seen_at,created_at`
+const nodeColumns = `id,name,role,public_address,private_address,public_interface,private_interface,default_relay_port_range,traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode,traffic_quota_interface,traffic_reset_day,traffic_switch_percent,agent_token_hash,agent_version,applied_revision,apply_status,apply_error,last_seen_at,created_at`
 
 func (s *Store) ListNodes(ctx context.Context) ([]domain.Node, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeColumns+` FROM nodes ORDER BY sort_order, created_at, id`)
@@ -408,12 +473,21 @@ func (s *Store) GetNode(ctx context.Context, id string) (domain.Node, string, er
 }
 
 func (s *Store) UpdateNode(ctx context.Context, n domain.Node) error {
+	if n.TrafficQuotaMode == "" {
+		n.TrafficQuotaMode = "sum"
+	}
+	if n.TrafficResetDay == 0 {
+		n.TrafficResetDay = 1
+	}
+	if n.TrafficSwitchPercent == 0 {
+		n.TrafficSwitchPercent = 95
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=?,default_relay_port_range=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.DefaultRelayPortRange, n.ID)
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET name=?,role=?,public_address=?,private_address=?,public_interface=?,private_interface=?,default_relay_port_range=?,traffic_quota_enabled=?,traffic_quota_bytes=?,traffic_quota_mode=?,traffic_quota_interface=?,traffic_reset_day=?,traffic_switch_percent=? WHERE id=?`, n.Name, n.Role, n.PublicAddress, n.PrivateAddress, n.PublicInterface, n.PrivateInterface, n.DefaultRelayPortRange, boolInt(n.TrafficQuotaEnabled), n.TrafficQuotaBytes, n.TrafficQuotaMode, n.TrafficQuotaInterface, n.TrafficResetDay, n.TrafficSwitchPercent, n.ID)
 	if err != nil {
 		return err
 	}
@@ -1200,14 +1274,14 @@ func (s *Store) ReconcileFailover(ctx context.Context, now time.Time) (bool, err
 		if active == "" {
 			active = line.EgressNodeID
 		}
-		activeHealthy, err := failoverCandidateHealthy(ctx, tx, line.IngressNodeID, active, now, true, 0)
+		activeHealthy, err := failoverCandidateReady(ctx, tx, line.IngressNodeID, active, now, true, 0)
 		if err != nil {
 			return false, err
 		}
 		desired := active
 		if !activeHealthy {
 			for _, candidate := range line.EgressNodeIDs {
-				ready, err := failoverCandidateHealthy(ctx, tx, line.IngressNodeID, candidate, now, false, 2)
+				ready, err := failoverCandidateReady(ctx, tx, line.IngressNodeID, candidate, now, false, 2)
 				if err != nil {
 					return false, err
 				}
@@ -1221,7 +1295,7 @@ func (s *Store) ReconcileFailover(ctx context.Context, now time.Time) (bool, err
 				if candidate == active {
 					break
 				}
-				ready, err := failoverCandidateHealthy(ctx, tx, line.IngressNodeID, candidate, now, false, 3)
+				ready, err := failoverCandidateReady(ctx, tx, line.IngressNodeID, candidate, now, false, 3)
 				if err != nil {
 					return false, err
 				}
@@ -1244,6 +1318,54 @@ func (s *Store) ReconcileFailover(ctx context.Context, now time.Time) (bool, err
 		}
 	}
 	return changed, tx.Commit()
+}
+
+func failoverCandidateReady(ctx context.Context, tx *sql.Tx, ingressNodeID, egressNodeID string, now time.Time, current bool, minimumSuccesses int) (bool, error) {
+	healthy, err := failoverCandidateHealthy(ctx, tx, ingressNodeID, egressNodeID, now, current, minimumSuccesses)
+	if err != nil || !healthy {
+		return healthy, err
+	}
+	return failoverQuotaAvailable(ctx, tx, egressNodeID, now, current)
+}
+
+func failoverQuotaAvailable(ctx context.Context, tx *sql.Tx, nodeID string, now time.Time, current bool) (bool, error) {
+	var enabled int
+	var quota int64
+	var mode, iface, publicInterface string
+	var resetDay, threshold int
+	err := tx.QueryRowContext(ctx, `SELECT traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode,traffic_quota_interface,public_interface,traffic_reset_day,traffic_switch_percent FROM nodes WHERE id=?`, nodeID).Scan(&enabled, &quota, &mode, &iface, &publicInterface, &resetDay, &threshold)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if enabled == 0 || quota <= 0 {
+		return true, nil
+	}
+	if iface == "" {
+		iface = publicInterface
+	}
+	var capturedAt int64
+	err = tx.QueryRowContext(ctx, `SELECT captured_at FROM node_traffic_baselines WHERE node_id=? AND interface=?`, nodeID, iface).Scan(&capturedAt)
+	if errors.Is(err, sql.ErrNoRows) || capturedAt < now.Add(-45*time.Second).Unix() {
+		// Never move traffic based on an unknown quota state. The active path may
+		// keep running, while an unknown backup is not eligible for selection.
+		return current, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	start, end := trafficCycle(now, resetDay)
+	var rx, sent int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(rx_bytes),0),COALESCE(SUM(tx_bytes),0) FROM node_traffic_daily WHERE node_id=? AND interface=? AND bucket>=? AND bucket<?`, nodeID, iface, start.Unix(), end.Unix()).Scan(&rx, &sent); err != nil {
+		return false, err
+	}
+	if threshold <= 0 {
+		threshold = 95
+	}
+	used := billableTraffic(mode, rx, sent)
+	return used*100 < quota*int64(threshold), nil
 }
 
 func failoverCandidateHealthy(ctx context.Context, tx *sql.Tx, ingressNodeID, egressNodeID string, now time.Time, current bool, minimumSuccesses int) (bool, error) {
@@ -1302,10 +1424,15 @@ func (s *Store) AddTraffic(ctx context.Context, nodeID string, deltas []domain.T
 		if err != nil {
 			return err
 		}
+		capturedAt := d.CapturedAt.UTC()
+		if capturedAt.IsZero() {
+			capturedAt = time.Now().UTC()
+		}
+		var uploadBPS, downloadBPS int64
 		if d.Cumulative {
 			rawUpBytes, rawDownBytes, rawUpPackets, rawDownPackets := d.UploadBytes, d.DownloadBytes, d.UploadPackets, d.DownloadPackets
-			var oldUpBytes, oldDownBytes, oldUpPackets, oldDownPackets int64
-			err = tx.QueryRowContext(ctx, `SELECT upload_bytes,download_bytes,upload_packets,download_packets FROM traffic_baselines WHERE rule_id=? AND node_id=?`, d.RuleID, nodeID).Scan(&oldUpBytes, &oldDownBytes, &oldUpPackets, &oldDownPackets)
+			var oldUpBytes, oldDownBytes, oldUpPackets, oldDownPackets, oldCapturedAt int64
+			err = tx.QueryRowContext(ctx, `SELECT upload_bytes,download_bytes,upload_packets,download_packets,captured_at FROM traffic_baselines WHERE rule_id=? AND node_id=?`, d.RuleID, nodeID).Scan(&oldUpBytes, &oldDownBytes, &oldUpPackets, &oldDownPackets, &oldCapturedAt)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
@@ -1313,12 +1440,21 @@ func (s *Store) AddTraffic(ctx context.Context, nodeID string, deltas []domain.T
 			d.DownloadBytes = counterDelta(d.DownloadBytes, oldDownBytes)
 			d.UploadPackets = counterDelta(d.UploadPackets, oldUpPackets)
 			d.DownloadPackets = counterDelta(d.DownloadPackets, oldDownPackets)
-			_, err = tx.ExecContext(ctx, `INSERT INTO traffic_baselines(rule_id,node_id,upload_bytes,download_bytes,upload_packets,download_packets) VALUES(?,?,?,?,?,?) ON CONFLICT(rule_id,node_id) DO UPDATE SET upload_bytes=excluded.upload_bytes,download_bytes=excluded.download_bytes,upload_packets=excluded.upload_packets,download_packets=excluded.download_packets`, d.RuleID, nodeID, rawUpBytes, rawDownBytes, rawUpPackets, rawDownPackets)
+			elapsed := capturedAt.Unix() - oldCapturedAt
+			if oldCapturedAt > 0 && elapsed > 0 && elapsed <= 120 {
+				uploadBPS = d.UploadBytes / elapsed
+				downloadBPS = d.DownloadBytes / elapsed
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO traffic_baselines(rule_id,node_id,upload_bytes,download_bytes,upload_packets,download_packets,captured_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id) DO UPDATE SET upload_bytes=excluded.upload_bytes,download_bytes=excluded.download_bytes,upload_packets=excluded.upload_packets,download_packets=excluded.download_packets,captured_at=excluded.captured_at`, d.RuleID, nodeID, rawUpBytes, rawDownBytes, rawUpPackets, rawDownPackets, capturedAt.Unix())
+			if err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO traffic_rates(rule_id,node_id,captured_at,upload_bps,download_bps) VALUES(?,?,?,?,?) ON CONFLICT(rule_id,node_id) DO UPDATE SET captured_at=excluded.captured_at,upload_bps=excluded.upload_bps,download_bps=excluded.download_bps`, d.RuleID, nodeID, capturedAt.Unix(), uploadBPS, downloadBPS)
 			if err != nil {
 				return err
 			}
 		}
-		bucket := d.CapturedAt.UTC().Truncate(time.Minute).Unix()
+		bucket := capturedAt.Truncate(time.Minute).Unix()
 		if bucket == 0 {
 			bucket = time.Now().UTC().Truncate(time.Minute).Unix()
 		}
@@ -1347,6 +1483,132 @@ func counterDelta(current, previous int64) int64 {
 		return current - previous
 	}
 	return current
+}
+
+func (s *Store) AddNodeTraffic(ctx context.Context, nodeID string, sample domain.NodeTrafficSample) error {
+	if sample.RXBytes < 0 || sample.TXBytes < 0 || strings.TrimSpace(sample.Interface) == "" {
+		return errors.New("invalid node traffic sample")
+	}
+	var configuredInterface, publicInterface string
+	if err := s.db.QueryRowContext(ctx, `SELECT traffic_quota_interface,public_interface FROM nodes WHERE id=?`, nodeID).Scan(&configuredInterface, &publicInterface); err != nil {
+		return err
+	}
+	expected := configuredInterface
+	if expected == "" {
+		expected = publicInterface
+	}
+	// An Agent can have one old-interface sample queued while a node edit is
+	// propagating. Ignore it instead of mixing two NICs into one quota cycle.
+	if expected != "" && sample.Interface != expected {
+		return nil
+	}
+	capturedAt := sample.CapturedAt.UTC()
+	if capturedAt.IsZero() {
+		capturedAt = time.Now().UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var oldRX, oldTX, oldCapturedAt int64
+	err = tx.QueryRowContext(ctx, `SELECT rx_bytes,tx_bytes,captured_at FROM node_traffic_baselines WHERE node_id=? AND interface=?`, nodeID, sample.Interface).Scan(&oldRX, &oldTX, &oldCapturedAt)
+	hadBaseline := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	rxDelta, txDelta := sample.RXBytes, sample.TXBytes
+	if sample.Cumulative {
+		if hadBaseline {
+			rxDelta = counterDelta(sample.RXBytes, oldRX)
+			txDelta = counterDelta(sample.TXBytes, oldTX)
+		} else {
+			rxDelta, txDelta = 0, 0
+		}
+	}
+	var rxBPS, txBPS int64
+	elapsed := capturedAt.Unix() - oldCapturedAt
+	if oldCapturedAt > 0 && elapsed > 0 && elapsed <= 120 {
+		rxBPS = rxDelta / elapsed
+		txBPS = txDelta / elapsed
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO node_traffic_baselines(node_id,interface,rx_bytes,tx_bytes,captured_at) VALUES(?,?,?,?,?) ON CONFLICT(node_id,interface) DO UPDATE SET rx_bytes=excluded.rx_bytes,tx_bytes=excluded.tx_bytes,captured_at=excluded.captured_at`, nodeID, sample.Interface, sample.RXBytes, sample.TXBytes, capturedAt.Unix())
+	if err != nil {
+		return err
+	}
+	day := trafficDayStart(capturedAt).Unix()
+	_, err = tx.ExecContext(ctx, `INSERT INTO node_traffic_daily(node_id,interface,bucket,rx_bytes,tx_bytes) VALUES(?,?,?,?,?) ON CONFLICT(node_id,interface,bucket) DO UPDATE SET rx_bytes=rx_bytes+excluded.rx_bytes,tx_bytes=tx_bytes+excluded.tx_bytes`, nodeID, sample.Interface, day, rxDelta, txDelta)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO node_traffic_rates(node_id,interface,captured_at,rx_bps,tx_bps) VALUES(?,?,?,?,?) ON CONFLICT(node_id,interface) DO UPDATE SET captured_at=excluded.captured_at,rx_bps=excluded.rx_bps,tx_bps=excluded.tx_bps`, nodeID, sample.Interface, capturedAt.Unix(), rxBPS, txBPS)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func trafficCycle(now time.Time, resetDay int) (time.Time, time.Time) {
+	local := now.In(trafficLocation)
+	if resetDay < 1 || resetDay > 28 {
+		resetDay = 1
+	}
+	start := time.Date(local.Year(), local.Month(), resetDay, 0, 0, 0, 0, trafficLocation)
+	if local.Before(start) {
+		start = start.AddDate(0, -1, 0)
+	}
+	return start, start.AddDate(0, 1, 0)
+}
+
+func billableTraffic(mode string, rx, tx int64) int64 {
+	switch mode {
+	case "rx":
+		return rx
+	case "tx":
+		return tx
+	default:
+		return rx + tx
+	}
+}
+
+func (s *Store) NodeTrafficSummaries(ctx context.Context, now time.Time) ([]domain.NodeTrafficSummary, error) {
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.NodeTrafficSummary, 0, len(nodes))
+	for _, node := range nodes {
+		iface := node.TrafficQuotaInterface
+		if iface == "" {
+			iface = node.PublicInterface
+		}
+		start, end := trafficCycle(now, node.TrafficResetDay)
+		item := domain.NodeTrafficSummary{NodeID: node.ID, Interface: iface, Mode: node.TrafficQuotaMode, CycleStart: start.UTC(), CycleEnd: end.UTC(), QuotaBytes: node.TrafficQuotaBytes, SwitchPercent: node.TrafficSwitchPercent}
+		if iface != "" {
+			_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(rx_bytes),0),COALESCE(SUM(tx_bytes),0) FROM node_traffic_daily WHERE node_id=? AND interface=? AND bucket>=? AND bucket<?`, node.ID, iface, start.Unix(), end.Unix()).Scan(&item.RXBytes, &item.TXBytes)
+			var rateAt int64
+			_ = s.db.QueryRowContext(ctx, `SELECT rx_bps,tx_bps,captured_at FROM node_traffic_rates WHERE node_id=? AND interface=?`, node.ID, iface).Scan(&item.RXBytesPerSec, &item.TXBytesPerSec, &rateAt)
+			item.UpdatedAt = fromUnix(rateAt)
+			if rateAt < now.Add(-45*time.Second).Unix() {
+				item.RXBytesPerSec, item.TXBytesPerSec = 0, 0
+			}
+		}
+		item.BillableBytes = billableTraffic(item.Mode, item.RXBytes, item.TXBytes)
+		item.RemainingBytes = item.QuotaBytes - item.BillableBytes
+		if item.RemainingBytes < 0 {
+			item.RemainingBytes = 0
+		}
+		if item.QuotaBytes > 0 {
+			item.UsedPercent = float64(item.BillableBytes) * 100 / float64(item.QuotaBytes)
+			threshold := item.SwitchPercent
+			if threshold <= 0 {
+				threshold = 95
+			}
+			item.Exhausted = node.TrafficQuotaEnabled && item.UsedPercent >= float64(threshold)
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func (s *Store) Traffic(ctx context.Context, ruleID string, since time.Time) ([]domain.TrafficPoint, error) {
@@ -1420,11 +1682,7 @@ func trafficDayStart(t time.Time) time.Time {
 func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficSummary, error) {
 	now := time.Now().UTC()
 	today, week, month, quarter := trafficPeriodStarts(now)
-	currentMinute := now.Truncate(time.Minute)
-	elapsed := int64(now.Sub(currentMinute).Seconds())
-	if elapsed < 10 {
-		elapsed = 10
-	}
+	rateCutoff := now.Add(-45 * time.Second).Unix()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.id,
 			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
@@ -1436,12 +1694,12 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.download_bytes ELSE 0 END),0),
 			COALESCE(SUM(d.upload_bytes),0), COALESCE(SUM(d.download_bytes),0),
-			COALESCE((SELECT SUM(m.upload_bytes) FROM traffic_minute m WHERE m.rule_id=r.id AND m.bucket=?),0),
-			COALESCE((SELECT SUM(m.download_bytes) FROM traffic_minute m WHERE m.rule_id=r.id AND m.bucket=?),0)
+			COALESCE((SELECT SUM(x.upload_bps) FROM traffic_rates x WHERE x.rule_id=r.id AND x.captured_at>=?),0),
+			COALESCE((SELECT SUM(x.download_bps) FROM traffic_rates x WHERE x.rule_id=r.id AND x.captured_at>=?),0)
 		FROM forward_rules r
 		LEFT JOIN traffic_daily d ON d.rule_id=r.id
 		GROUP BY r.id
-		ORDER BY r.created_at DESC`, today, today, week, week, month, month, quarter, quarter, currentMinute.Unix(), currentMinute.Unix())
+		ORDER BY r.created_at DESC`, today, today, week, week, month, month, quarter, quarter, rateCutoff, rateCutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -1453,8 +1711,74 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 		if err := rows.Scan(&item.RuleID, &item.TodayUploadBytes, &item.TodayDownloadBytes, &item.WeekUploadBytes, &item.WeekDownloadBytes, &item.MonthUploadBytes, &item.MonthDownloadBytes, &item.QuarterUploadBytes, &item.QuarterDownloadBytes, &item.TotalUploadBytes, &item.TotalDownloadBytes, &currentUpload, &currentDownload); err != nil {
 			return nil, err
 		}
-		item.UploadBytesPerSecond = currentUpload / elapsed
-		item.DownloadBytesPerSecond = currentDownload / elapsed
+		item.UploadBytesPerSecond = currentUpload
+		item.DownloadBytesPerSecond = currentDownload
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	statuses, err := s.RateLimitStatuses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byRule := make(map[string][]domain.RateLimitStatus)
+	for _, status := range statuses {
+		byRule[status.RuleID] = append(byRule[status.RuleID], status)
+	}
+	for i := range out {
+		out[i].RateLimits = byRule[out[i].RuleID]
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertRateLimitStatuses(ctx context.Context, nodeID string, statuses []domain.RateLimitStatus) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, status := range statuses {
+		if status.RuleID == "" || (status.Direction != "upload" && status.Direction != "download") {
+			continue
+		}
+		checkedAt := status.CheckedAt.UTC()
+		if checkedAt.IsZero() {
+			checkedAt = time.Now().UTC()
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO rate_limit_status(rule_id,node_id,direction,interface,configured_mbps,installed,error,checked_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,node_id,direction) DO UPDATE SET interface=excluded.interface,configured_mbps=excluded.configured_mbps,installed=excluded.installed,error=excluded.error,checked_at=excluded.checked_at`, status.RuleID, nodeID, status.Direction, status.Interface, status.ConfiguredMbps, status.Installed, status.Error, checkedAt.Unix())
+		if err != nil {
+			// Ignore one final status for a rule deleted between Agent syncs.
+			if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+				continue
+			}
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RateLimitStatuses(ctx context.Context) ([]domain.RateLimitStatus, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status.rule_id,status.node_id,status.direction,status.interface,status.configured_mbps,status.installed,status.error,status.checked_at
+		FROM rate_limit_status status
+		JOIN forward_rules rule ON rule.id=status.rule_id
+		WHERE (status.direction='upload' AND rule.upload_mbps>0 AND rule.upload_mbps=status.configured_mbps)
+		   OR (status.direction='download' AND rule.download_mbps>0 AND rule.download_mbps=status.configured_mbps)
+		ORDER BY status.rule_id,status.node_id,status.direction`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.RateLimitStatus
+	for rows.Next() {
+		var item domain.RateLimitStatus
+		var installed int
+		var checkedAt int64
+		if err := rows.Scan(&item.RuleID, &item.NodeID, &item.Direction, &item.Interface, &item.ConfiguredMbps, &installed, &item.Error, &checkedAt); err != nil {
+			return nil, err
+		}
+		item.Installed = installed != 0
+		item.CheckedAt = fromUnix(checkedAt)
 		out = append(out, item)
 	}
 	return out, rows.Err()
