@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -24,6 +25,17 @@ func TestRenderPlanBuildsTwoHopNATCountersAndLimits(t *testing.T) {
 		if !strings.Contains(plan.NFTScript, want) {
 			t.Errorf("NFT script missing %q\n%s", want, plan.NFTScript)
 		}
+	}
+	for _, want := range []string{
+		fmt.Sprintf("ct mark %d ct direction original counter name rp_demo_up meta mark set %d", uploadMark(rule.ID), uploadMark(rule.ID)),
+		fmt.Sprintf("ct mark %d ct direction reply counter name rp_demo_down meta mark set %d", uploadMark(rule.ID), downloadMark(rule.ID)),
+	} {
+		if !strings.Contains(plan.NFTScript, want) {
+			t.Errorf("NFT forwarding stats missing %q\n%s", want, plan.NFTScript)
+		}
+	}
+	if strings.Contains(plan.NFTScript, "tcp dport 24444 counter name rp_demo_up") || strings.Contains(plan.NFTScript, "udp dport 24444 counter name rp_demo_up") {
+		t.Fatalf("upload traffic must be counted per packet in forward_stats, not only on the first NAT packet:\n%s", plan.NFTScript)
 	}
 	joined := ""
 	for _, cmd := range plan.TC {
@@ -61,11 +73,15 @@ func TestRenderExitOnlyNFTOwnsCountersAndUsesPrivateListener(t *testing.T) {
 		`iifname "wg0" ip daddr 10.24.0.3 tcp dport 24444`,
 		"dnat ip to 192.0.2.88:443",
 		`oifname "eth0" ip daddr 192.0.2.88 tcp dport 443 masquerade`,
+		fmt.Sprintf("ct mark %d ct direction original counter name rp_exit_up meta mark set %d", uploadMark(rule.ID), uploadMark(rule.ID)),
 		"ct direction reply counter name rp_exit_down",
 	} {
 		if !strings.Contains(plan.NFTScript, want) {
 			t.Errorf("NFT script missing %q\n%s", want, plan.NFTScript)
 		}
+	}
+	if strings.Contains(plan.NFTScript, "tcp dport 24444 counter name rp_exit_up") || strings.Contains(plan.NFTScript, "udp dport 24444 counter name rp_exit_up") {
+		t.Fatalf("exit-only upload traffic must not be counted in the first-packet-only NAT chain:\n%s", plan.NFTScript)
 	}
 	if strings.Contains(plan.NFTScript, "__NODE_") {
 		t.Fatalf("exit-only plan unexpectedly contains an ingress placeholder:\n%s", plan.NFTScript)
@@ -95,7 +111,9 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 	rule := domain.ForwardRule{
 		ID: "rule_realm", Mode: domain.ForwardModeExitOnly, Name: "Realm 仅出口",
 		Protocol: "tcp", IngressNodeID: node.ID, EgressNodeID: node.ID,
-		ListenAddress: "10.24.0.3", ListenPort: 24444, RelayPort: 24444,
+		// Keep these deliberately different: an exit-only Realm deployment must
+		// consistently inspect the actual egress listener (RelayPort).
+		ListenAddress: "10.24.0.3", ListenPort: 11301, RelayPort: 24444,
 		TargetHost: "landing.example.com", TargetPort: 443, Engine: "realm",
 		UploadMbps: 30, DownloadMbps: 100, Enabled: true,
 	}
@@ -128,6 +146,7 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 	for _, want := range []string{
 		"qdisc add dev wg0 handle ffff: ingress",
 		"filter replace dev wg0 parent ffff:",
+		"flower ip_proto tcp dst_port 24444",
 		"redirect dev ifb-relay0",
 		"dev ifb-relay0 root handle 7a1: htb",
 		"rate 30mbit",
@@ -139,8 +158,16 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 			t.Errorf("tc plan missing %q\n%s", want, joined)
 		}
 	}
+	if strings.Contains(joined, "dst_port 11301") || strings.Contains(joined, "src_port 11301") {
+		t.Fatalf("exit-only Realm tc plan matched the public entry port instead of the egress listener:\n%s", joined)
+	}
 	if len(plan.RateLimits) != 2 {
 		t.Fatalf("expected upload and download limiter diagnostics, got %#v", plan.RateLimits)
+	}
+	for _, spec := range plan.RateLimits {
+		if spec.ListenPort != 24444 {
+			t.Fatalf("exit-only Realm limiter diagnostics use the wrong listener: %+v", spec)
+		}
 	}
 	for _, want := range []string{
 		"counter rp_realm_up", "counter rp_realm_down",
@@ -150,6 +177,9 @@ func TestRenderExitOnlyRealmBindsPrivateAddressAndOutboundInterface(t *testing.T
 		if !strings.Contains(plan.NFTScript, want) {
 			t.Errorf("Realm traffic stats missing %q\n%s", want, plan.NFTScript)
 		}
+	}
+	if strings.Contains(plan.NFTScript, "dport 11301") || strings.Contains(plan.NFTScript, "sport 11301") {
+		t.Fatalf("exit-only Realm stats matched the public entry port instead of the egress listener:\n%s", plan.NFTScript)
 	}
 }
 

@@ -83,6 +83,7 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 	b.WriteString("  }\n  chain forward_stats { type filter hook forward priority -10; policy accept;\n")
 	for _, d := range deployments {
 		if d.Rule.Engine == "nftables" && ownsTrafficCounters(d) {
+			fmt.Fprintf(&b, "    ct mark %d ct direction original counter name %s meta mark set %d\n", uploadMark(d.Rule.ID), counterName(d.Rule.ID, "up"), uploadMark(d.Rule.ID))
 			fmt.Fprintf(&b, "    ct mark %d ct direction reply counter name %s meta mark set %d\n", uploadMark(d.Rule.ID), counterName(d.Rule.ID, "down"), downloadMark(d.Rule.ID))
 		}
 	}
@@ -95,7 +96,7 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 		}
 		if d.Rule.Engine == "realm" && d.Rule.Mode == domain.ForwardModeExitOnly && d.Role == domain.NodeRoleEgress {
 			for _, proto := range protocols(d.Rule.Protocol) {
-				fmt.Fprintf(&b, "    iifname \"%s\" ip daddr %s %s dport %d counter name %s\n", safeInterface(node.PrivateInterface), d.Rule.ListenAddress, proto, d.Rule.ListenPort, counterName(d.Rule.ID, "up"))
+				fmt.Fprintf(&b, "    iifname \"%s\" ip daddr %s %s dport %d counter name %s\n", safeInterface(node.PrivateInterface), d.Rule.ListenAddress, proto, realmListenPort(d.Rule), counterName(d.Rule.ID, "up"))
 			}
 		}
 	}
@@ -111,7 +112,7 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 				if ip := net.ParseIP(d.Rule.TargetHost); ip != nil && ip.To4() != nil {
 					fmt.Fprintf(&b, "    oifname \"%s\" ip daddr %s %s dport %d meta mark set %d\n", safeInterface(node.PublicInterface), ip.String(), proto, d.Rule.TargetPort, uploadMark(d.Rule.ID))
 				}
-				fmt.Fprintf(&b, "    oifname \"%s\" ip saddr %s %s sport %d counter name %s meta mark set %d\n", safeInterface(node.PrivateInterface), d.Rule.ListenAddress, proto, d.Rule.ListenPort, counterName(d.Rule.ID, "down"), downloadMark(d.Rule.ID))
+				fmt.Fprintf(&b, "    oifname \"%s\" ip saddr %s %s sport %d counter name %s meta mark set %d\n", safeInterface(node.PrivateInterface), d.Rule.ListenAddress, proto, realmListenPort(d.Rule), counterName(d.Rule.ID, "down"), downloadMark(d.Rule.ID))
 			}
 		}
 	}
@@ -134,7 +135,7 @@ func renderPrerouting(b *strings.Builder, node domain.Node, d domain.Deployment)
 	r := d.Rule
 	if d.Role == domain.NodeRoleIngress || d.Role == domain.NodeRoleBoth {
 		for _, proto := range protocols(r.Protocol) {
-			fmt.Fprintf(b, "    iifname \"%s\" %s dport %d counter name %s meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PublicInterface), proto, r.ListenPort, counterName(r.ID, "up"), uploadMark(r.ID), uploadMark(r.ID), mustIPv4Placeholder(r.EgressNodeID), r.RelayPort)
+			fmt.Fprintf(b, "    iifname \"%s\" %s dport %d meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PublicInterface), proto, r.ListenPort, uploadMark(r.ID), uploadMark(r.ID), mustIPv4Placeholder(r.EgressNodeID), r.RelayPort)
 		}
 	}
 	if d.Role == domain.NodeRoleEgress || d.Role == domain.NodeRoleBoth {
@@ -143,7 +144,7 @@ func renderPrerouting(b *strings.Builder, node domain.Node, d domain.Deployment)
 		}
 		for _, proto := range protocols(r.Protocol) {
 			if r.Mode == domain.ForwardModeExitOnly {
-				fmt.Fprintf(b, "    iifname \"%s\" ip daddr %s %s dport %d counter name %s meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), r.ListenAddress, proto, r.ListenPort, counterName(r.ID, "up"), uploadMark(r.ID), uploadMark(r.ID), r.TargetHost, r.TargetPort)
+				fmt.Fprintf(b, "    iifname \"%s\" ip daddr %s %s dport %d meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), r.ListenAddress, proto, r.ListenPort, uploadMark(r.ID), uploadMark(r.ID), r.TargetHost, r.TargetPort)
 			} else {
 				fmt.Fprintf(b, "    iifname \"%s\" %s dport %d meta mark set %d ct mark set %d dnat ip to %s:%d\n", safeInterface(node.PrivateInterface), proto, r.RelayPort, uploadMark(r.ID), uploadMark(r.ID), r.TargetHost, r.TargetPort)
 			}
@@ -211,6 +212,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 		direction    string
 		directListen bool
 		source       string
+		matchPort    int
 	}
 	byInterface := map[string][]rateEntry{}
 	ifbEntries := map[string][]rateEntry{}
@@ -219,27 +221,31 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			continue
 		}
 		r := d.Rule
+		matchPort := r.ListenPort
+		if r.Engine == "realm" {
+			matchPort = realmListenPort(r)
+		}
 		if r.Mode == domain.ForwardModeExitOnly {
 			if r.DownloadMbps > 0 {
-				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.DownloadMbps, mark: downloadMark(r.ID), direction: "download", directListen: r.Engine == "realm"})
+				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.DownloadMbps, mark: downloadMark(r.ID), direction: "download", directListen: r.Engine == "realm", matchPort: matchPort})
 			}
 			if r.UploadMbps > 0 {
 				if r.Engine == "realm" {
-					ifbEntries[node.PrivateInterface] = append(ifbEntries[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", source: node.PrivateInterface})
+					ifbEntries[node.PrivateInterface] = append(ifbEntries[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", source: node.PrivateInterface, matchPort: matchPort})
 				} else {
-					byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
+					byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", matchPort: matchPort})
 				}
 			}
 			continue
 		}
 		if r.DownloadMbps > 0 {
-			byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.DownloadMbps, mark: downloadMark(r.ID), direction: "download", directListen: r.Engine == "realm"})
+			byInterface[node.PublicInterface] = append(byInterface[node.PublicInterface], rateEntry{rule: r, rate: r.DownloadMbps, mark: downloadMark(r.ID), direction: "download", directListen: r.Engine == "realm", matchPort: matchPort})
 		}
 		if r.UploadMbps > 0 {
 			if r.Engine == "realm" {
-				ifbEntries[node.PublicInterface] = append(ifbEntries[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", source: node.PublicInterface})
+				ifbEntries[node.PublicInterface] = append(ifbEntries[node.PublicInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", source: node.PublicInterface, matchPort: matchPort})
 			} else {
-				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload"})
+				byInterface[node.PrivateInterface] = append(byInterface[node.PrivateInterface], rateEntry{rule: r, rate: r.UploadMbps, mark: uploadMark(r.ID), direction: "upload", matchPort: matchPort})
 			}
 		}
 	}
@@ -260,7 +266,7 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			cmds = append(cmds, Command{"tc", []string{"qdisc", "add", "dev", source, "handle", "ffff:", "ingress"}})
 			for _, e := range ifbEntries[source] {
 				for _, proto := range protocols(e.rule.Protocol) {
-					args := []string{"filter", "replace", "dev", source, "parent", "ffff:", "protocol", "ip", "pref", strconv.Itoa(pref), "flower", "ip_proto", proto, "dst_port", strconv.Itoa(e.rule.ListenPort), "action", "skbedit", "mark", strconv.FormatUint(uint64(e.mark), 10), "action", "mirred", "egress", "redirect", "dev", "ifb-relay0"}
+					args := []string{"filter", "replace", "dev", source, "parent", "ffff:", "protocol", "ip", "pref", strconv.Itoa(pref), "flower", "ip_proto", proto, "dst_port", strconv.Itoa(e.matchPort), "action", "skbedit", "mark", strconv.FormatUint(uint64(e.mark), 10), "action", "mirred", "egress", "redirect", "dev", "ifb-relay0"}
 					cmds = append(cmds, Command{"tc", args})
 					pref++
 				}
@@ -297,12 +303,12 @@ func renderTC(node domain.Node, deployments []domain.Deployment, allowReplace bo
 			cmds = append(cmds, Command{"tc", []string{"class", "replace", "dev", iface, "parent", "7a1:1", "classid", classID, "htb", "rate", fmt.Sprintf("%dmbit", e.rate), "ceil", fmt.Sprintf("%dmbit", e.rate), "burst", fmt.Sprintf("%dk", burst), "quantum", "60000"}}, Command{"tc", []string{"qdisc", "replace", "dev", iface, "parent", classID, "handle", fmt.Sprintf("%x:", minor), "fq_codel"}})
 			if e.directListen {
 				for protocolIndex, proto := range protocols(e.rule.Protocol) {
-					cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor + protocolIndex*10000), "flower", "ip_proto", proto, "src_port", strconv.Itoa(e.rule.ListenPort), "flowid", classID}})
+					cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor + protocolIndex*10000), "flower", "ip_proto", proto, "src_port", strconv.Itoa(e.matchPort), "flowid", classID}})
 				}
 			} else {
 				cmds = append(cmds, Command{"tc", []string{"filter", "replace", "dev", iface, "parent", "7a1:", "protocol", "ip", "pref", strconv.Itoa(minor), "handle", strconv.FormatUint(uint64(e.mark), 10), "fw", "flowid", classID}})
 			}
-			specs = append(specs, RateLimitSpec{RuleID: e.rule.ID, Direction: e.direction, Interface: iface, SourceInterface: e.source, ListenPort: e.rule.ListenPort, ClassID: classID, Mark: e.mark, ConfiguredMbps: e.rate})
+			specs = append(specs, RateLimitSpec{RuleID: e.rule.ID, Direction: e.direction, Interface: iface, SourceInterface: e.source, ListenPort: e.matchPort, ClassID: classID, Mark: e.mark, ConfiguredMbps: e.rate})
 		}
 	}
 	return cmds, specs
@@ -345,6 +351,13 @@ func renderRealm(node domain.Node, deployments []domain.Deployment) []byte {
 
 func ownsTrafficCounters(d domain.Deployment) bool {
 	return d.Role == domain.NodeRoleIngress || d.Role == domain.NodeRoleBoth || (d.Rule.Mode == domain.ForwardModeExitOnly && d.Role == domain.NodeRoleEgress)
+}
+
+func realmListenPort(rule domain.ForwardRule) int {
+	if rule.Mode == domain.ForwardModeExitOnly && rule.RelayPort > 0 {
+		return rule.RelayPort
+	}
+	return rule.ListenPort
 }
 
 func protocols(p string) []string {
