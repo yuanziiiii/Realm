@@ -21,6 +21,7 @@ var version = "dev"
 
 type state struct {
 	AppliedRevision     int64                     `json:"applied_revision"`
+	AppliedConfigHash   string                    `json:"applied_config_hash,omitempty"`
 	ApplyStatus         string                    `json:"apply_status"`
 	ApplyError          string                    `json:"apply_error"`
 	IngressRuleIDs      []string                  `json:"ingress_rule_ids"`
@@ -129,7 +130,7 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	} else {
 		st.NodeTraffic = nil
 	}
-	if resp.Revision == st.AppliedRevision && st.ApplyStatus == "normal" && executor.Healthy(ctx) {
+	if appliedConfigurationMatches(resp, st) && st.ApplyStatus == "normal" && executor.Healthy(ctx) {
 		st.RateLimits = executor.RateLimitStatuses(ctx, resp.Node.ID)
 		return nil
 	}
@@ -150,11 +151,22 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 		return err
 	}
 	st.AppliedRevision = resp.Revision
+	st.AppliedConfigHash = resp.ConfigHash
 	st.ApplyStatus = "normal"
 	st.ApplyError = ""
 	st.IngressRuleIDs = plan.IngressRuleIDs
 	st.RateLimits = executor.RateLimitStatuses(ctx, resp.Node.ID)
 	return nil
+}
+
+func appliedConfigurationMatches(resp domain.SyncResponse, st *state) bool {
+	if resp.Revision != st.AppliedRevision {
+		return false
+	}
+	// Empty hashes preserve compatibility with older controllers. When a new
+	// controller starts returning a hash, an upgraded Agent performs one
+	// reconciliation to establish the local fingerprint.
+	return resp.ConfigHash == "" || (st.AppliedConfigHash != "" && resp.ConfigHash == st.AppliedConfigHash)
 }
 
 func targetProbeDue(last time.Time, interval time.Duration, now time.Time) bool {

@@ -1520,9 +1520,9 @@ export default function Home() {
               setAccessRule({ ...accessRule, access_policy: policy });
               return;
             }
-            await api(`/api/v1/rules/${accessRule.id}`, {
+            await api(`/api/v1/rules/${accessRule.id}/access-policy`, {
               method: "PUT",
-              body: JSON.stringify({ ...accessRule, access_policy: policy }),
+              body: JSON.stringify(policy),
             });
             await refresh();
             setAccessRule(null);

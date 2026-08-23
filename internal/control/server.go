@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -187,6 +188,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/rules/import", s.requireAdmin(s.importRules))
 	mux.HandleFunc("POST /api/v1/rules/import-text", s.requireAdmin(s.importTextRules))
 	mux.HandleFunc("PUT /api/v1/rules/order", s.requireAdmin(s.reorderRules))
+	mux.HandleFunc("PUT /api/v1/rules/{id}/access-policy", s.requireAdmin(s.saveRuleAccessPolicy))
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
@@ -980,6 +982,43 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, saved)
 }
 
+// saveRuleAccessPolicy updates only the access policy on the latest stored
+// rule. The general rule editor sends a complete rule document, but the access
+// panel can stay open while other rule fields or revisions change. Reading the
+// current rule here prevents that stale snapshot from overwriting newer data
+// and makes repeated IP/CIDR edits reliable.
+func (s *Server) saveRuleAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	var policy domain.AccessPolicy
+	if err := decodeJSON(r, &policy); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rule, err := s.store.GetRule(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Resolved ranges are generated from the controller's current geo database;
+	// never persist values sent by a browser or an older controller response.
+	policy.ResolvedAllowRanges = nil
+	policy.ResolvedDenyRanges = nil
+	rule.AccessPolicy = policy
+	if err := validateRule(rule); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	saved, err := s.store.SaveRule(r.Context(), rule)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
 func (s *Server) importRules(w http.ResponseWriter, r *http.Request) {
 	var batch ruleBatchImport
 	if err := decodeJSON(r, &batch); err != nil {
@@ -1683,7 +1722,37 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 	}
 	node.Status = "online"
 	node.LastSeenAt = time.Now().UTC()
-	writeJSON(w, 200, domain.SyncResponse{Revision: revision, GeneratedAt: time.Now().UTC(), Node: node, Peers: peers, ProbeTargets: probeTargets, Deployments: deployments})
+	writeJSON(w, 200, domain.SyncResponse{Revision: revision, ConfigHash: syncConfigHash(node, peers, deployments), GeneratedAt: time.Now().UTC(), Node: node, Peers: peers, ProbeTargets: probeTargets, Deployments: deployments})
+}
+
+// syncConfigHash fingerprints only inputs that can affect an Agent's rendered
+// forwarding plan. Runtime heartbeat fields are deliberately excluded so the
+// hash remains stable between syncs. Agents use this alongside the global
+// revision to detect a changed IP/access policy even if a revision is stale.
+func syncConfigHash(node domain.Node, peers []domain.Node, deployments []domain.Deployment) string {
+	type configNode struct {
+		ID               string `json:"id"`
+		PrivateAddress   string `json:"private_address"`
+		PublicInterface  string `json:"public_interface"`
+		PrivateInterface string `json:"private_interface"`
+	}
+	type configDocument struct {
+		Node        configNode          `json:"node"`
+		Peers       []configNode        `json:"peers"`
+		Deployments []domain.Deployment `json:"deployments"`
+	}
+	toConfigNode := func(value domain.Node) configNode {
+		return configNode{ID: value.ID, PrivateAddress: value.PrivateAddress, PublicInterface: value.PublicInterface, PrivateInterface: value.PrivateInterface}
+	}
+	document := configDocument{Node: toConfigNode(node), Deployments: append([]domain.Deployment(nil), deployments...)}
+	for _, peer := range peers {
+		document.Peers = append(document.Peers, toConfigNode(peer))
+	}
+	sort.Slice(document.Peers, func(i, j int) bool { return document.Peers[i].ID < document.Peers[j].ID })
+	sort.Slice(document.Deployments, func(i, j int) bool { return document.Deployments[i].Rule.ID < document.Deployments[j].Rule.ID })
+	payload, _ := json.Marshal(document)
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 func requestPublicAddress(r *http.Request) string {

@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"relaypanel/internal/domain"
 )
 
 func TestTargetProbeDueAtConfiguredInterval(t *testing.T) {
@@ -15,5 +17,24 @@ func TestTargetProbeDueAtConfiguredInterval(t *testing.T) {
 	}
 	if !targetProbeDue(now.Add(-60*time.Second), 60*time.Second, now) {
 		t.Fatal("target probe did not run when the configured interval elapsed")
+	}
+}
+
+func TestAppliedConfigurationMatchesRevisionAndFingerprint(t *testing.T) {
+	st := &state{AppliedRevision: 12, AppliedConfigHash: "old"}
+	if appliedConfigurationMatches(domain.SyncResponse{Revision: 13, ConfigHash: "old"}, st) {
+		t.Fatal("a newer revision was treated as already applied")
+	}
+	if appliedConfigurationMatches(domain.SyncResponse{Revision: 12, ConfigHash: "new"}, st) {
+		t.Fatal("changed configuration content was ignored at the same revision")
+	}
+	if !appliedConfigurationMatches(domain.SyncResponse{Revision: 12, ConfigHash: "old"}, st) {
+		t.Fatal("matching revision and configuration fingerprint was not recognized")
+	}
+	if !appliedConfigurationMatches(domain.SyncResponse{Revision: 12}, st) {
+		t.Fatal("an older controller without fingerprints lost compatibility")
+	}
+	if appliedConfigurationMatches(domain.SyncResponse{Revision: 12, ConfigHash: "new"}, &state{AppliedRevision: 12}) {
+		t.Fatal("an upgraded agent skipped the first fingerprinted configuration")
 	}
 }

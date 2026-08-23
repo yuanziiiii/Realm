@@ -412,6 +412,7 @@ type SyncRequest struct {
 
 type SyncResponse struct {
 	Revision     int64        `json:"revision"`
+	ConfigHash   string       `json:"config_hash,omitempty"`
 	GeneratedAt  time.Time    `json:"generated_at"`
 	Node         Node         `json:"node"`
 	Peers        []Node       `json:"peers"`

@@ -451,6 +451,93 @@ func TestSaveRuleUpdatePreservesRelayPortAndChangesFields(t *testing.T) {
 	}
 }
 
+func TestAccessPolicyCanBeUpdatedRepeatedlyWithoutStaleRuleSnapshot(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "access-policy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, PublicAddress: "198.51.100.2", PublicInterface: "eth0", PrivateAddress: "10.0.0.2", PrivateInterface: "eth1", CreatedAt: now},
+		{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PublicAddress: "198.51.100.3", PublicInterface: "eth0", PrivateAddress: "10.0.0.3", PrivateInterface: "eth1", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line, err := st.SaveLine(ctx, domain.Line{ID: "line", Name: "线路", Mode: domain.ForwardModeDualManaged, IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := st.SaveRule(ctx, domain.ForwardRule{ID: "rule", LineID: line.ID, Name: "测试", Mode: line.Mode, Protocol: "both", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 31259, RelayPort: 31256, TargetHost: "192.0.2.8", TargetPort: 31271, Engine: "nftables", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{store: st}
+	save := func(cidr string) domain.ForwardRule {
+		body, marshalErr := json.Marshal(domain.AccessPolicy{Enabled: true, DenyCIDRs: []string{cidr}, ResolvedDenyRanges: []string{"203.0.113.0/24"}})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/rules/rule/access-policy", bytes.NewReader(body))
+		req.SetPathValue("id", original.ID)
+		recorder := httptest.NewRecorder()
+		server.saveRuleAccessPolicy(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("save %s returned %d: %s", cidr, recorder.Code, recorder.Body.String())
+		}
+		var saved domain.ForwardRule
+		if err := json.NewDecoder(recorder.Body).Decode(&saved); err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	first := save("0.0.0.0/24")
+	second := save("0.0.0.0/0")
+	if second.Revision <= first.Revision {
+		t.Fatalf("access policy update did not advance revision: first=%d second=%d", first.Revision, second.Revision)
+	}
+	if len(second.AccessPolicy.DenyCIDRs) != 1 || second.AccessPolicy.DenyCIDRs[0] != "0.0.0.0/0" {
+		t.Fatalf("second access policy was not persisted: %+v", second.AccessPolicy)
+	}
+	if len(second.AccessPolicy.ResolvedDenyRanges) != 0 {
+		t.Fatalf("browser-supplied resolved ranges were persisted: %+v", second.AccessPolicy.ResolvedDenyRanges)
+	}
+	deployments, err := st.DeploymentsForNode(ctx, "in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deployments) != 1 || len(deployments[0].Rule.AccessPolicy.DenyCIDRs) != 1 || deployments[0].Rule.AccessPolicy.DenyCIDRs[0] != "0.0.0.0/0" {
+		t.Fatalf("agent deployment retained the first policy: %+v", deployments)
+	}
+	got, err := st.GetRule(ctx, original.ID)
+	if err != nil || got.ListenPort != original.ListenPort || got.TargetHost != original.TargetHost {
+		t.Fatalf("access-only update changed unrelated rule fields: rule=%+v err=%v", got, err)
+	}
+}
+
+func TestSyncConfigHashChangesWithAccessPolicyAndIgnoresPeerOrder(t *testing.T) {
+	node := domain.Node{ID: "in", PublicInterface: "eth0", PrivateInterface: "eth1", LastSeenAt: time.Now()}
+	peers := []domain.Node{{ID: "b", PrivateAddress: "10.0.0.3"}, {ID: "a", PrivateAddress: "10.0.0.2"}}
+	rule := domain.ForwardRule{ID: "rule", AccessPolicy: domain.AccessPolicy{Enabled: true, DenyCIDRs: []string{"0.0.0.0/24"}}}
+	deployments := []domain.Deployment{{Rule: rule, Role: domain.NodeRoleIngress}}
+	first := syncConfigHash(node, peers, deployments)
+	if reordered := syncConfigHash(node, []domain.Node{peers[1], peers[0]}, deployments); reordered != first {
+		t.Fatal("peer map iteration order made the configuration fingerprint unstable")
+	}
+	deployments[0].Rule.AccessPolicy.DenyCIDRs = []string{"0.0.0.0/0"}
+	if second := syncConfigHash(node, peers, deployments); second == first {
+		t.Fatal("access policy change did not change the configuration fingerprint")
+	}
+	node.LastSeenAt = node.LastSeenAt.Add(time.Minute)
+	deployments[0].Rule.AccessPolicy.DenyCIDRs = []string{"0.0.0.0/24"}
+	if heartbeat := syncConfigHash(node, peers, deployments); heartbeat != first {
+		t.Fatal("runtime heartbeat fields changed the configuration fingerprint")
+	}
+}
+
 func TestRequestPublicAddressSupportsDirectAndHTTPSProxyRequests(t *testing.T) {
 	direct := httptest.NewRequest(http.MethodPost, "/agent/v1/sync", nil)
 	direct.RemoteAddr = "198.51.100.20:43210"
