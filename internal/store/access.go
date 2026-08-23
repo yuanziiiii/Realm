@@ -30,6 +30,11 @@ func ipv4String(value uint32) string {
 	return netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)}).String()
 }
 
+func supportedGeoCountry(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || value == "中国" || strings.EqualFold(value, "china") || strings.EqualFold(value, "cn")
+}
+
 func (s *Store) invalidateAccessCache() {
 	s.accessMu.Lock()
 	s.accessCache = map[string]domain.AccessPolicy{}
@@ -85,7 +90,7 @@ func (s *Store) expandRegions(ctx context.Context, regions []string) ([]string, 
 		}
 		seen[selection] = true
 		province, city := splitRegion(selection)
-		query := `SELECT start_ip,end_ip FROM geo_ip_ranges WHERE province=?`
+		query := `SELECT start_ip,end_ip FROM geo_ip_ranges WHERE country='中国' AND province=?`
 		args := []any{province}
 		if city != "" {
 			query += ` AND city=?`
@@ -158,10 +163,10 @@ func (s *Store) ReplaceGeoRanges(ctx context.Context, ranges []domain.GeoRange) 
 	for _, item := range ranges {
 		start, okStart := ipv4Number(item.StartIP)
 		end, okEnd := ipv4Number(item.EndIP)
-		if !okStart || !okEnd || start > end || strings.TrimSpace(item.Province) == "" {
+		if !okStart || !okEnd || start > end || strings.TrimSpace(item.Province) == "" || !supportedGeoCountry(item.Country) {
 			continue
 		}
-		if _, err = stmt.ExecContext(ctx, int64(start), int64(end), strings.TrimSpace(item.Country), strings.TrimSpace(item.Province), strings.TrimSpace(item.City), strings.TrimSpace(item.ISP)); err != nil {
+		if _, err = stmt.ExecContext(ctx, int64(start), int64(end), "中国", strings.TrimSpace(item.Province), strings.TrimSpace(item.City), strings.TrimSpace(item.ISP)); err != nil {
 			return err
 		}
 	}
@@ -181,14 +186,14 @@ func (s *Store) ReplaceGeoRanges(ctx context.Context, ranges []domain.GeoRange) 
 
 func (s *Store) GeoStatus(ctx context.Context) (domain.GeoStatus, error) {
 	var status domain.GeoStatus
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM geo_ip_ranges`).Scan(&status.Ranges); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM geo_ip_ranges WHERE country='中国'`).Scan(&status.Ranges); err != nil {
 		return status, err
 	}
 	status.Ready = status.Ranges > 0
 	if value, err := s.GetSetting(ctx, "geo_updated_at"); err == nil {
 		status.UpdatedAt, _ = time.Parse(time.RFC3339, value)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT province,city FROM geo_ip_ranges WHERE province<>'' GROUP BY province,city ORDER BY province,city`)
+	rows, err := s.db.QueryContext(ctx, `SELECT province,city FROM geo_ip_ranges WHERE country='中国' AND province<>'' GROUP BY province,city ORDER BY province,city`)
 	if err != nil {
 		return status, err
 	}
@@ -202,6 +207,7 @@ func (s *Store) GeoStatus(ctx context.Context) (domain.GeoStatus, error) {
 		}
 		if _, ok := byProvince[province]; !ok {
 			order = append(order, province)
+			byProvince[province] = []string{}
 		}
 		if city != "" {
 			byProvince[province] = append(byProvince[province], city)
@@ -302,6 +308,7 @@ func (s *Store) ListConnections(ctx context.Context) (domain.ConnectionsResponse
 		LEFT JOIN geo_ip_ranges geo ON geo.rowid=(
 			SELECT candidate.rowid FROM geo_ip_ranges candidate
 			WHERE candidate.start_ip<=cs.source_ip_number AND candidate.end_ip>=cs.source_ip_number
+			  AND candidate.country='中国'
 			ORDER BY candidate.start_ip DESC LIMIT 1
 		)
 		WHERE cs.last_seen_at>=?

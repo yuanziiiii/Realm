@@ -206,6 +206,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_connections_rule ON connection_sources(rule_id,captured_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_geo_lookup ON geo_ip_ranges(start_ip,end_ip)`,
 		`CREATE INDEX IF NOT EXISTS idx_geo_region ON geo_ip_ranges(province,city)`,
+		`CREATE INDEX IF NOT EXISTS idx_geo_country_lookup ON geo_ip_ranges(country,start_ip,end_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_geo_country_region ON geo_ip_ranges(country,province,city)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {

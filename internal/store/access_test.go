@@ -67,3 +67,47 @@ func TestGeoAccessExpansionAndConnectionStatus(t *testing.T) {
 		t.Fatalf("unexpected source geolocation: %#v", connections.Sources)
 	}
 }
+
+func TestGeoStatusDoesNotDuplicateProvinceWithEmptyCity(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "geo-status.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.ReplaceGeoRanges(ctx, []domain.GeoRange{
+		{StartIP: "1.0.0.0", EndIP: "1.0.0.127", Country: "中国", Province: "广东省"},
+		{StartIP: "1.0.0.128", EndIP: "1.0.0.255", Country: "中国", Province: "广东省", City: "深圳市"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := st.GeoStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Regions) != 1 || status.Regions[0].Province != "广东省" || len(status.Regions[0].Cities) != 1 || status.Regions[0].Cities[0] != "深圳市" {
+		t.Fatalf("unexpected regions: %#v", status.Regions)
+	}
+}
+
+func TestGeoStatusHidesPreviouslyImportedGlobalRows(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "geo-global.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO geo_ip_ranges(start_ip,end_ip,country,province,city,isp) VALUES(?,?,?,?,?,?),(?,?,?,?,?,?)`,
+		int64(1), int64(255), "Netherlands", "'s-Gravenzande", "0", "Vodafone",
+		int64(256), int64(511), "中国", "广东省", "深圳市", "电信",
+	); err != nil {
+		t.Fatal(err)
+	}
+	status, err := st.GeoStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Ranges != 1 || len(status.Regions) != 1 || status.Regions[0].Province != "广东省" {
+		t.Fatalf("global rows leaked into status: %#v", status)
+	}
+}

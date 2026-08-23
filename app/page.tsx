@@ -840,7 +840,7 @@ export default function Home() {
     setAuthenticated(true);
     setDemo(false);
     try {
-      const [n, l, r, s, t, rt, nt, p, tp, cn, geo] = await Promise.all([
+      const [n, l, r, s, t, rt, nt, p, tp, geo] = await Promise.all([
         api<Node[]>("/api/v1/nodes"),
         api<Line[]>("/api/v1/lines"),
         api<Rule[]>("/api/v1/rules"),
@@ -850,7 +850,6 @@ export default function Home() {
         api<NodeTraffic[]>("/api/v1/traffic/nodes"),
         api<LinkProbe[]>("/api/v1/probes"),
         api<TargetProbe[]>("/api/v1/target-probes"),
-        api<ConnectionsResponse>("/api/v1/connections"),
         api<GeoStatus>("/api/v1/geo/status"),
       ]);
       setNodes(asArray(n));
@@ -862,10 +861,6 @@ export default function Home() {
       setNodeTraffic(asArray(nt));
       setProbes(asArray(p));
       setTargetProbes(asArray(tp));
-      setConnections({
-        sources: asArray(cn.sources),
-        statuses: asArray(cn.statuses),
-      });
       setGeoStatus({ ...geo, regions: asArray(geo.regions) });
       setError("");
     } catch (e) {
@@ -3568,7 +3563,8 @@ function Settings({
           </span>
         </div>
         <div className="update-points">
-          <span>✓ 支持 ip2region 的 ip.merge.txt</span>
+          <span>✓ 支持 ip2region 新版 ipv4_source.txt 与旧版 ip.merge.txt</span>
+          <span>✓ 自动过滤非中国网段，避免全球州省干扰地域选择</span>
           <span>✓ 支持 CIDR,start/end 的 CSV、Tab 或竖线分隔文本</span>
           <span>✓ 新数据库原子替换，并自动重新下发地区策略</span>
         </div>
