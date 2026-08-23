@@ -90,6 +90,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			engine TEXT NOT NULL DEFAULT 'nftables', ingress_engine TEXT NOT NULL DEFAULT '',
 			egress_engine TEXT NOT NULL DEFAULT '', upload_mbps INTEGER NOT NULL DEFAULT 0,
 			download_mbps INTEGER NOT NULL DEFAULT 0, burst_kbytes INTEGER NOT NULL DEFAULT 512,
+			traffic_quota_enabled INTEGER NOT NULL DEFAULT 0, traffic_quota_bytes INTEGER NOT NULL DEFAULT 0,
+			traffic_quota_mode TEXT NOT NULL DEFAULT 'sum', traffic_quota_baseline_bytes INTEGER NOT NULL DEFAULT 0,
 			access_policy TEXT NOT NULL DEFAULT '{}',
 			enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL,
 			sort_order INTEGER NOT NULL DEFAULT 0,
@@ -188,6 +190,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			rx_bps INTEGER NOT NULL DEFAULT 0, tx_bps INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(node_id, interface)
 		)`,
+		`CREATE TABLE IF NOT EXISTS node_quota_resets (
+			node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+			interface TEXT NOT NULL, cycle_start INTEGER NOT NULL,
+			rx_bytes INTEGER NOT NULL DEFAULT 0, tx_bytes INTEGER NOT NULL DEFAULT 0,
+			reset_at INTEGER NOT NULL DEFAULT 0
+		)`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL,
 			resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
@@ -228,6 +236,16 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "access_policy", `ALTER TABLE forward_rules ADD COLUMN access_policy TEXT NOT NULL DEFAULT '{}'`); err != nil {
 		return err
+	}
+	for column, alter := range map[string]string{
+		"traffic_quota_enabled":        `ALTER TABLE forward_rules ADD COLUMN traffic_quota_enabled INTEGER NOT NULL DEFAULT 0`,
+		"traffic_quota_bytes":          `ALTER TABLE forward_rules ADD COLUMN traffic_quota_bytes INTEGER NOT NULL DEFAULT 0`,
+		"traffic_quota_mode":           `ALTER TABLE forward_rules ADD COLUMN traffic_quota_mode TEXT NOT NULL DEFAULT 'sum'`,
+		"traffic_quota_baseline_bytes": `ALTER TABLE forward_rules ADD COLUMN traffic_quota_baseline_bytes INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if err := s.ensureColumn(ctx, "forward_rules", column, alter); err != nil {
+			return err
+		}
 	}
 	if err := s.ensureColumn(ctx, "connection_status", "total_tcp_connections", `ALTER TABLE connection_status ADD COLUMN total_tcp_connections INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
@@ -558,6 +576,33 @@ func (s *Store) UpdateNode(ctx context.Context, n domain.Node) error {
 	return nil
 }
 
+func (s *Store) ResetNodeTrafficQuota(ctx context.Context, id string, now time.Time) error {
+	node, _, err := s.GetNode(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !node.TrafficQuotaEnabled || node.TrafficQuotaBytes <= 0 {
+		return errors.New("服务器尚未启用流量包")
+	}
+	iface := node.TrafficQuotaInterface
+	if iface == "" {
+		iface = node.PublicInterface
+	}
+	if iface == "" {
+		return errors.New("服务器没有可统计的流量网卡")
+	}
+	start, end := trafficCycle(now, node.TrafficResetDay)
+	var rx, txBytes int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(rx_bytes),0),COALESCE(SUM(tx_bytes),0) FROM node_traffic_daily WHERE node_id=? AND interface=? AND bucket>=? AND bucket<?`, id, iface, start.Unix(), end.Unix()).Scan(&rx, &txBytes); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO node_quota_resets(node_id,interface,cycle_start,rx_bytes,tx_bytes,reset_at) VALUES(?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET interface=excluded.interface,cycle_start=excluded.cycle_start,rx_bytes=excluded.rx_bytes,tx_bytes=excluded.tx_bytes,reset_at=excluded.reset_at`, id, iface, start.Unix(), rx, txBytes, now.UTC().Unix())
+	if err == nil {
+		s.audit(ctx, "reset", "node_quota", id, "usage baseline reset")
+	}
+	return err
+}
+
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
 	lines, err := s.ListLines(ctx)
 	if err != nil {
@@ -777,9 +822,9 @@ func (s *Store) DeleteLine(ctx context.Context, id string) error {
 func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, error) {
 	var r domain.ForwardRule
 	var relayPortsJSON, accessPolicyJSON string
-	var enabled int
+	var enabled, quotaEnabled int
 	var created, updated int64
-	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &relayPortsJSON, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &accessPolicyJSON, &enabled, &r.Revision, &created, &updated)
+	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &relayPortsJSON, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &quotaEnabled, &r.TrafficQuotaBytes, &r.TrafficQuotaMode, &r.TrafficQuotaBaselineBytes, &accessPolicyJSON, &enabled, &r.Revision, &created, &updated)
 	if err == nil && relayPortsJSON != "" {
 		_ = json.Unmarshal([]byte(relayPortsJSON), &r.RelayPorts)
 	}
@@ -789,19 +834,26 @@ func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, erro
 	r.NormalizeEngines()
 	r.NormalizeRelayPorts()
 	r.Enabled = enabled == 1
+	r.TrafficQuotaEnabled = quotaEnabled == 1
+	if r.TrafficQuotaMode == "" {
+		r.TrafficQuotaMode = "sum"
+	}
 	r.CreatedAt = fromUnix(created)
 	r.UpdatedAt = fromUnix(updated)
 	return r, err
 }
 
-const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,relay_ports,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,access_policy,enabled,revision,created_at,updated_at`
+const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,relay_ports,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode,traffic_quota_baseline_bytes,access_policy,enabled,revision,created_at,updated_at`
 
 func ruleArgs(r domain.ForwardRule) []any {
 	r.NormalizeEngines()
 	r.NormalizeRelayPorts()
 	relayPortsJSON, _ := json.Marshal(r.RelayPorts)
 	accessPolicyJSON, _ := json.Marshal(r.AccessPolicy)
-	return []any{r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, string(relayPortsJSON), r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, string(accessPolicyJSON), boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt)}
+	if r.TrafficQuotaMode == "" {
+		r.TrafficQuotaMode = "sum"
+	}
+	return []any{r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, string(relayPortsJSON), r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.TrafficQuotaEnabled), r.TrafficQuotaBytes, r.TrafficQuotaMode, r.TrafficQuotaBaselineBytes, string(accessPolicyJSON), boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt)}
 }
 
 func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
@@ -900,7 +952,7 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 		r.CreatedAt = now
 	}
 	r.NormalizeEngines()
-	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
+	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,traffic_quota_enabled=excluded.traffic_quota_enabled,traffic_quota_bytes=excluded.traffic_quota_bytes,traffic_quota_mode=excluded.traffic_quota_mode,traffic_quota_baseline_bytes=excluded.traffic_quota_baseline_bytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
 	if err != nil {
 		return r, err
 	}
@@ -923,6 +975,107 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 	s.audit(ctx, "save", "rule", r.ID, r.Name)
 	s.invalidateAccessCache()
 	return r, nil
+}
+
+func ruleBillableTraffic(mode string, upload, download int64) int64 {
+	switch mode {
+	case "upload":
+		return upload
+	case "download":
+		return download
+	default:
+		return upload + download
+	}
+}
+
+func ruleTrafficTotals(ctx context.Context, tx *sql.Tx, ruleID string) (upload, download int64, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(upload_bytes),0),COALESCE(SUM(download_bytes),0) FROM traffic_daily WHERE rule_id=?`, ruleID).Scan(&upload, &download)
+	return
+}
+
+// UpdateRuleTrafficQuota changes only quota state, preserving the forwarding
+// topology and every other rule field. Resetting starts a fresh allowance from
+// the current lifetime counters without deleting traffic history.
+func (s *Store) UpdateRuleTrafficQuota(ctx context.Context, id string, enabled bool, quotaBytes int64, mode string) (domain.ForwardRule, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.ForwardRule{}, err
+	}
+	defer tx.Rollback()
+	var currentEnabled int
+	var currentMode string
+	var baseline int64
+	if err := tx.QueryRowContext(ctx, `SELECT traffic_quota_enabled,traffic_quota_mode,traffic_quota_baseline_bytes FROM forward_rules WHERE id=?`, id).Scan(&currentEnabled, &currentMode, &baseline); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ForwardRule{}, ErrNotFound
+		}
+		return domain.ForwardRule{}, err
+	}
+	if mode == "" {
+		mode = "sum"
+	}
+	if (enabled && currentEnabled == 0) || mode != currentMode {
+		upload, download, err := ruleTrafficTotals(ctx, tx, id)
+		if err != nil {
+			return domain.ForwardRule{}, err
+		}
+		baseline = ruleBillableTraffic(mode, upload, download)
+	}
+	revision, err := s.bumpRevision(ctx, tx)
+	if err != nil {
+		return domain.ForwardRule{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_enabled=?,traffic_quota_bytes=?,traffic_quota_mode=?,traffic_quota_baseline_bytes=?,revision=?,updated_at=? WHERE id=?`, boolInt(enabled), quotaBytes, mode, baseline, revision, time.Now().UTC().Unix(), id); err != nil {
+		return domain.ForwardRule{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.ForwardRule{}, err
+	}
+	s.audit(ctx, "update", "rule_quota", id, fmt.Sprintf("enabled=%t quota=%d mode=%s", enabled, quotaBytes, mode))
+	return s.GetRule(ctx, id)
+}
+
+// ResetRuleTrafficQuota starts the configured allowance from zero without
+// deleting historical traffic. Future summaries subtract this lifetime
+// baseline while charts continue to show the original data.
+func (s *Store) ResetRuleTrafficQuota(ctx context.Context, id string) (domain.ForwardRule, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.ForwardRule{}, err
+	}
+	defer tx.Rollback()
+	var enabled int
+	var quota int64
+	var mode string
+	if err := tx.QueryRowContext(ctx, `SELECT traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode FROM forward_rules WHERE id=?`, id).Scan(&enabled, &quota, &mode); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ForwardRule{}, ErrNotFound
+		}
+		return domain.ForwardRule{}, err
+	}
+	if mode == "" {
+		mode = "sum"
+	}
+	if enabled == 0 || quota <= 0 {
+		return domain.ForwardRule{}, errors.New("规则尚未启用流量控制")
+	}
+	upload, download, err := ruleTrafficTotals(ctx, tx, id)
+	if err != nil {
+		return domain.ForwardRule{}, err
+	}
+	baseline := ruleBillableTraffic(mode, upload, download)
+	revision, err := s.bumpRevision(ctx, tx)
+	if err != nil {
+		return domain.ForwardRule{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_baseline_bytes=?,revision=?,updated_at=? WHERE id=?`, baseline, revision, time.Now().UTC().Unix(), id); err != nil {
+		return domain.ForwardRule{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.ForwardRule{}, err
+	}
+	s.audit(ctx, "reset", "rule_quota", id, "usage baseline reset")
+	return s.GetRule(ctx, id)
 }
 
 // ImportRules creates a validated batch under one revision and one
@@ -950,7 +1103,7 @@ func (s *Store) ImportRules(ctx context.Context, rules []domain.ForwardRule) (in
 		if rule.CreatedAt.IsZero() {
 			rule.CreatedAt = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
 		}
@@ -1006,7 +1159,7 @@ func (s *Store) ImportTopology(ctx context.Context, lines []domain.Line, rules [
 		if rule.CreatedAt.IsZero() {
 			rule.CreatedAt = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,traffic_quota_enabled=excluded.traffic_quota_enabled,traffic_quota_bytes=excluded.traffic_quota_bytes,traffic_quota_mode=excluded.traffic_quota_mode,traffic_quota_baseline_bytes=excluded.traffic_quota_baseline_bytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
 		}
@@ -1059,8 +1212,37 @@ func boolInt(v bool) int {
 	return 0
 }
 
+func (s *Store) exhaustedRuleQuotas(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.id,r.traffic_quota_bytes,r.traffic_quota_mode,r.traffic_quota_baseline_bytes,
+			COALESCE(SUM(d.upload_bytes),0),COALESCE(SUM(d.download_bytes),0)
+		FROM forward_rules r
+		LEFT JOIN traffic_daily d ON d.rule_id=r.id
+		WHERE r.traffic_quota_enabled=1 AND r.traffic_quota_bytes>0
+		GROUP BY r.id,r.traffic_quota_bytes,r.traffic_quota_mode,r.traffic_quota_baseline_bytes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	exhausted := make(map[string]bool)
+	for rows.Next() {
+		var id, mode string
+		var quota, baseline, upload, download int64
+		if err := rows.Scan(&id, &quota, &mode, &baseline, &upload, &download); err != nil {
+			return nil, err
+		}
+		used := ruleBillableTraffic(mode, upload, download) - baseline
+		exhausted[id] = used >= quota
+	}
+	return exhausted, rows.Err()
+}
+
 func (s *Store) DeploymentsForNode(ctx context.Context, nodeID string) ([]domain.Deployment, error) {
 	rules, err := s.ListRules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	exhausted, err := s.exhaustedRuleQuotas(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1074,7 +1256,7 @@ func (s *Store) DeploymentsForNode(ctx context.Context, nodeID string) ([]domain
 	}
 	var out []domain.Deployment
 	for _, rule := range rules {
-		if !rule.Enabled {
+		if !rule.Enabled || exhausted[rule.ID] {
 			continue
 		}
 		rule.AccessPolicy, err = s.resolveAccessPolicy(ctx, rule)
@@ -1418,6 +1600,12 @@ func failoverQuotaAvailable(ctx context.Context, tx *sql.Tx, nodeID string, now 
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(rx_bytes),0),COALESCE(SUM(tx_bytes),0) FROM node_traffic_daily WHERE node_id=? AND interface=? AND bucket>=? AND bucket<?`, nodeID, iface, start.Unix(), end.Unix()).Scan(&rx, &sent); err != nil {
 		return false, err
 	}
+	var resetRX, resetTX int64
+	if err := tx.QueryRowContext(ctx, `SELECT rx_bytes,tx_bytes FROM node_quota_resets WHERE node_id=? AND interface=? AND cycle_start=?`, nodeID, iface, start.Unix()).Scan(&resetRX, &resetTX); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	rx = max(0, rx-resetRX)
+	sent = max(0, sent-resetTX)
 	if threshold <= 0 {
 		threshold = 95
 	}
@@ -1643,6 +1831,11 @@ func (s *Store) NodeTrafficSummaries(ctx context.Context, now time.Time) ([]doma
 		item := domain.NodeTrafficSummary{NodeID: node.ID, Interface: iface, Mode: node.TrafficQuotaMode, CycleStart: start.UTC(), CycleEnd: end.UTC(), QuotaBytes: node.TrafficQuotaBytes, SwitchPercent: node.TrafficSwitchPercent}
 		if iface != "" {
 			_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(rx_bytes),0),COALESCE(SUM(tx_bytes),0) FROM node_traffic_daily WHERE node_id=? AND interface=? AND bucket>=? AND bucket<?`, node.ID, iface, start.Unix(), end.Unix()).Scan(&item.RXBytes, &item.TXBytes)
+			var resetRX, resetTX int64
+			if err := s.db.QueryRowContext(ctx, `SELECT rx_bytes,tx_bytes FROM node_quota_resets WHERE node_id=? AND interface=? AND cycle_start=?`, node.ID, iface, start.Unix()).Scan(&resetRX, &resetTX); err == nil {
+				item.RXBytes = max(0, item.RXBytes-resetRX)
+				item.TXBytes = max(0, item.TXBytes-resetTX)
+			}
 			var rateAt int64
 			_ = s.db.QueryRowContext(ctx, `SELECT rx_bps,tx_bps,captured_at FROM node_traffic_rates WHERE node_id=? AND interface=?`, node.ID, iface).Scan(&item.RXBytesPerSec, &item.TXBytesPerSec, &rateAt)
 			item.UpdatedAt = fromUnix(rateAt)
@@ -1741,7 +1934,7 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 	today, week, month, quarter := trafficPeriodStarts(now)
 	rateCutoff := now.Add(-45 * time.Second).Unix()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT r.id,
+		SELECT r.id,r.traffic_quota_enabled,r.traffic_quota_bytes,r.traffic_quota_mode,r.traffic_quota_baseline_bytes,
 			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.download_bytes ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN d.bucket>=? THEN d.upload_bytes ELSE 0 END),0),
@@ -1755,7 +1948,7 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 			COALESCE((SELECT SUM(x.download_bps) FROM traffic_rates x WHERE x.rule_id=r.id AND x.captured_at>=?),0)
 		FROM forward_rules r
 		LEFT JOIN traffic_daily d ON d.rule_id=r.id
-		GROUP BY r.id
+		GROUP BY r.id,r.traffic_quota_enabled,r.traffic_quota_bytes,r.traffic_quota_mode,r.traffic_quota_baseline_bytes
 		ORDER BY r.created_at DESC`, today, today, week, week, month, month, quarter, quarter, rateCutoff, rateCutoff)
 	if err != nil {
 		return nil, err
@@ -1764,12 +1957,30 @@ func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficS
 	var out []domain.RuleTrafficSummary
 	for rows.Next() {
 		var item domain.RuleTrafficSummary
+		var quotaEnabled int
+		var quotaBaseline int64
 		var currentUpload, currentDownload int64
-		if err := rows.Scan(&item.RuleID, &item.TodayUploadBytes, &item.TodayDownloadBytes, &item.WeekUploadBytes, &item.WeekDownloadBytes, &item.MonthUploadBytes, &item.MonthDownloadBytes, &item.QuarterUploadBytes, &item.QuarterDownloadBytes, &item.TotalUploadBytes, &item.TotalDownloadBytes, &currentUpload, &currentDownload); err != nil {
+		if err := rows.Scan(&item.RuleID, &quotaEnabled, &item.QuotaBytes, &item.QuotaMode, &quotaBaseline, &item.TodayUploadBytes, &item.TodayDownloadBytes, &item.WeekUploadBytes, &item.WeekDownloadBytes, &item.MonthUploadBytes, &item.MonthDownloadBytes, &item.QuarterUploadBytes, &item.QuarterDownloadBytes, &item.TotalUploadBytes, &item.TotalDownloadBytes, &currentUpload, &currentDownload); err != nil {
 			return nil, err
 		}
 		item.UploadBytesPerSecond = currentUpload
 		item.DownloadBytesPerSecond = currentDownload
+		item.QuotaEnabled = quotaEnabled != 0
+		if item.QuotaMode == "" {
+			item.QuotaMode = "sum"
+		}
+		item.QuotaUsedBytes = ruleBillableTraffic(item.QuotaMode, item.TotalUploadBytes, item.TotalDownloadBytes) - quotaBaseline
+		if item.QuotaUsedBytes < 0 {
+			item.QuotaUsedBytes = 0
+		}
+		item.QuotaRemainingBytes = item.QuotaBytes - item.QuotaUsedBytes
+		if item.QuotaRemainingBytes < 0 {
+			item.QuotaRemainingBytes = 0
+		}
+		if item.QuotaBytes > 0 {
+			item.QuotaUsedPercent = float64(item.QuotaUsedBytes) * 100 / float64(item.QuotaBytes)
+		}
+		item.QuotaExhausted = item.QuotaEnabled && item.QuotaBytes > 0 && item.QuotaUsedBytes >= item.QuotaBytes
 		out = append(out, item)
 	}
 	if err := rows.Err(); err != nil {

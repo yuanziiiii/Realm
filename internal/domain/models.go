@@ -56,17 +56,21 @@ type ForwardRule struct {
 	TargetPort int            `json:"target_port"`
 	// Engine is retained as a compatibility field for older Agents and API
 	// clients. The controller rewrites it to the engine for each deployment.
-	Engine        string       `json:"engine"`
-	IngressEngine string       `json:"ingress_engine"`
-	EgressEngine  string       `json:"egress_engine"`
-	UploadMbps    int          `json:"upload_mbps"`
-	DownloadMbps  int          `json:"download_mbps"`
-	BurstKBytes   int          `json:"burst_kbytes"`
-	AccessPolicy  AccessPolicy `json:"access_policy"`
-	Enabled       bool         `json:"enabled"`
-	Revision      int64        `json:"revision"`
-	CreatedAt     time.Time    `json:"created_at"`
-	UpdatedAt     time.Time    `json:"updated_at"`
+	Engine                    string       `json:"engine"`
+	IngressEngine             string       `json:"ingress_engine"`
+	EgressEngine              string       `json:"egress_engine"`
+	UploadMbps                int          `json:"upload_mbps"`
+	DownloadMbps              int          `json:"download_mbps"`
+	BurstKBytes               int          `json:"burst_kbytes"`
+	TrafficQuotaEnabled       bool         `json:"traffic_quota_enabled"`
+	TrafficQuotaBytes         int64        `json:"traffic_quota_bytes"`
+	TrafficQuotaMode          string       `json:"traffic_quota_mode"`
+	TrafficQuotaBaselineBytes int64        `json:"-"`
+	AccessPolicy              AccessPolicy `json:"access_policy"`
+	Enabled                   bool         `json:"enabled"`
+	Revision                  int64        `json:"revision"`
+	CreatedAt                 time.Time    `json:"created_at"`
+	UpdatedAt                 time.Time    `json:"updated_at"`
 }
 
 // AccessPolicy is enforced on the client-facing side of a rule. Manual IP
@@ -336,6 +340,13 @@ type RuleTrafficSummary struct {
 	QuarterDownloadBytes   int64             `json:"quarter_download_bytes"`
 	UploadBytesPerSecond   int64             `json:"upload_bytes_per_second"`
 	DownloadBytesPerSecond int64             `json:"download_bytes_per_second"`
+	QuotaEnabled           bool              `json:"quota_enabled"`
+	QuotaBytes             int64             `json:"quota_bytes"`
+	QuotaMode              string            `json:"quota_mode"`
+	QuotaUsedBytes         int64             `json:"quota_used_bytes"`
+	QuotaRemainingBytes    int64             `json:"quota_remaining_bytes"`
+	QuotaUsedPercent       float64           `json:"quota_used_percent"`
+	QuotaExhausted         bool              `json:"quota_exhausted"`
 	RateLimits             []RateLimitStatus `json:"rate_limits,omitempty"`
 }
 

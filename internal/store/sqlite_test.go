@@ -243,6 +243,103 @@ func TestCumulativeTrafficIsIdempotentAndHandlesReset(t *testing.T) {
 	}
 }
 
+func TestRuleTrafficQuotaStopsAndResetRestoresDeployments(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now},
+		{ID: "out", Name: "出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.3", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "quota-rule", Mode: domain.ForwardModeDualManaged, Name: "额度测试", Protocol: "tcp", IngressNodeID: "in", EgressNodeID: "out", ListenAddress: "0.0.0.0", ListenPort: 12000, RelayPort: 32000, TargetHost: "192.0.2.10", TargetPort: 443, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	first := domain.TrafficDelta{RuleID: "quota-rule", CapturedAt: now, Cumulative: true, UploadBytes: 1000, DownloadBytes: 2000}
+	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{first}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateRuleTrafficQuota(ctx, "quota-rule", true, 500, "sum"); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.CapturedAt = now.Add(time.Second)
+	second.UploadBytes = 1400
+	second.DownloadBytes = 2100
+	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{second}); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := st.RuleTrafficSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || !summaries[0].QuotaExhausted || summaries[0].QuotaUsedBytes != 500 || summaries[0].QuotaRemainingBytes != 0 {
+		t.Fatalf("unexpected exhausted quota summary: %+v", summaries)
+	}
+	for _, nodeID := range []string{"in", "out"} {
+		deployments, err := st.DeploymentsForNode(ctx, nodeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(deployments) != 0 {
+			t.Fatalf("quota-exhausted rule still deployed to %s: %+v", nodeID, deployments)
+		}
+	}
+	if _, err := st.ResetRuleTrafficQuota(ctx, "quota-rule"); err != nil {
+		t.Fatal(err)
+	}
+	deployments, err := st.DeploymentsForNode(ctx, "in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deployments) != 1 || deployments[0].Rule.ID != "quota-rule" {
+		t.Fatalf("reset did not restore deployment: %+v", deployments)
+	}
+}
+
+func TestResetNodeTrafficKeepsHistoryAndClearsCurrentUsage(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	if err := st.CreateNode(ctx, domain.Node{ID: "node", Name: "出口", Role: domain.NodeRoleEgress, PublicInterface: "eth0", TrafficQuotaEnabled: true, TrafficQuotaBytes: 10000, TrafficQuotaMode: "sum", TrafficQuotaInterface: "eth0", CreatedAt: now}, "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddNodeTraffic(ctx, "node", domain.NodeTrafficSample{Interface: "eth0", CapturedAt: now.Add(-time.Second), Cumulative: true, RXBytes: 1000, TXBytes: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddNodeTraffic(ctx, "node", domain.NodeTrafficSample{Interface: "eth0", CapturedAt: now, Cumulative: true, RXBytes: 1500, TXBytes: 2600}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ResetNodeTrafficQuota(ctx, "node", now); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := st.NodeTrafficSummaries(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].BillableBytes != 0 || summaries[0].RemainingBytes != 10000 {
+		t.Fatalf("unexpected node quota after reset: %+v", summaries)
+	}
+	var historical int64
+	if err := st.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(rx_bytes+tx_bytes),0) FROM node_traffic_daily WHERE node_id='node'`).Scan(&historical); err != nil {
+		t.Fatal(err)
+	}
+	if historical != 1100 {
+		t.Fatalf("reset deleted historical traffic: %d", historical)
+	}
+}
+
 func TestRuleTrafficSummaryUsesLatestAgentSampleRate(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))

@@ -74,6 +74,9 @@ type Rule = {
   upload_mbps: number;
   download_mbps: number;
   burst_kbytes: number;
+  traffic_quota_enabled?: boolean;
+  traffic_quota_bytes?: number;
+  traffic_quota_mode?: "sum" | "upload" | "download";
   access_policy: AccessPolicy;
   enabled: boolean;
 };
@@ -102,6 +105,13 @@ type RuleTraffic = {
   quarter_download_bytes: number;
   upload_bytes_per_second: number;
   download_bytes_per_second: number;
+  quota_enabled?: boolean;
+  quota_bytes?: number;
+  quota_mode?: "sum" | "upload" | "download";
+  quota_used_bytes?: number;
+  quota_remaining_bytes?: number;
+  quota_used_percent?: number;
+  quota_exhausted?: boolean;
   rate_limits?: RateLimitStatus[];
 };
 type NodeTraffic = {
@@ -806,6 +816,7 @@ export default function Home() {
     [editingRule, setEditingRule] = useState<Rule | null>(null),
     [preferredLine, setPreferredLine] = useState("");
   const [accessRule, setAccessRule] = useState<Rule | null>(null);
+  const [quotaRule, setQuotaRule] = useState<Rule | null>(null);
   const [updateNode, setUpdateNode] = useState<Node | null>(null);
   const [credential, setCredential] = useState<{
     nodeId: string;
@@ -1126,6 +1137,29 @@ export default function Home() {
               setNodeModal(true);
             }}
             onUpdate={setUpdateNode}
+            onReset={async (node) => {
+              if (!node.traffic_quota_enabled) {
+                setError("请先在服务器配置中启用整机流量包。");
+                return;
+              }
+              if (!confirm(`确认重置 ${node.name} 当前周期的已用流量？历史趋势不会删除。`)) return;
+              if (demo) {
+                setNodeTraffic((current) =>
+                  current.map((item) =>
+                    item.node_id === node.id
+                      ? { ...item, rx_bytes: 0, tx_bytes: 0, billable_bytes: 0, remaining_bytes: item.quota_bytes, used_percent: 0, exhausted: false }
+                      : item,
+                  ),
+                );
+                return;
+              }
+              try {
+                await api(`/api/v1/nodes/${node.id}/traffic-reset`, { method: "POST" });
+                await refresh();
+              } catch (error) {
+                setError((error as Error).message);
+              }
+            }}
             onMove={reorderNodes}
             onDelete={async (id) => {
               if (demo) {
@@ -1185,6 +1219,30 @@ export default function Home() {
             connections={connections}
             onTraffic={setTrafficRule}
             onAccess={setAccessRule}
+            onQuota={setQuotaRule}
+            onReset={async (rule) => {
+              if (!rule.traffic_quota_enabled) {
+                setError("请先为这条规则启用流量控制。");
+                return;
+              }
+              if (!confirm(`确认重置 ${rule.name} 的已用流量？历史趋势不会删除。`)) return;
+              if (demo) {
+                setRuleTraffic((current) =>
+                  current.map((item) =>
+                    item.rule_id === rule.id
+                      ? { ...item, quota_used_bytes: 0, quota_remaining_bytes: item.quota_bytes || rule.traffic_quota_bytes || 0, quota_used_percent: 0, quota_exhausted: false }
+                      : item,
+                  ),
+                );
+                return;
+              }
+              try {
+                await api(`/api/v1/rules/${rule.id}/traffic-reset`, { method: "POST" });
+                await refresh();
+              } catch (error) {
+                setError((error as Error).message);
+              }
+            }}
             onAdd={openRule}
             onBatch={(lineID) => {
               setPreferredLine(lineID);
@@ -1529,6 +1587,36 @@ export default function Home() {
           }}
         />
       )}
+      {quotaRule && (
+        <RuleQuotaModal
+          rule={quotaRule}
+          stats={ruleTraffic.find((item) => item.rule_id === quotaRule.id)}
+          onClose={() => setQuotaRule(null)}
+          onSave={async (value) => {
+            if (demo) {
+              setRules((current) =>
+                current.map((item) =>
+                  item.id === quotaRule.id
+                    ? {
+                        ...item,
+                        traffic_quota_enabled: value.enabled,
+                        traffic_quota_bytes: value.quota_bytes,
+                        traffic_quota_mode: value.mode,
+                      }
+                    : item,
+                ),
+              );
+            } else {
+              await api(`/api/v1/rules/${quotaRule.id}/traffic-quota`, {
+                method: "PUT",
+                body: JSON.stringify(value),
+              });
+              await refresh();
+            }
+            setQuotaRule(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1650,6 +1738,21 @@ function AccessIcon() {
         strokeWidth="1.5"
         strokeLinecap="round"
       />
+    </svg>
+  );
+}
+function QuotaIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="4" y="5" width="16" height="14" rx="3" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M8 15V12m4 3V9m4 6v-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+function ResetTrafficIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M19 8V4m0 0h-4m4 0-3 3a7 7 0 1 0 1.2 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -2158,6 +2261,7 @@ function Nodes({
   onAdd,
   onEdit,
   onUpdate,
+  onReset,
   onMove,
   onDelete,
 }: {
@@ -2167,6 +2271,7 @@ function Nodes({
   onAdd: () => void;
   onEdit: (n: Node) => void;
   onUpdate: (n: Node) => void;
+  onReset: (n: Node) => void;
   onMove: (id: string, direction: MoveDirection) => void;
   onDelete: (id: string) => void;
 }) {
@@ -2298,6 +2403,9 @@ function Nodes({
                   </span>
                   <button className="outline" onClick={() => onEdit(n)}>
                     配置
+                  </button>
+                  <button className="outline reset-traffic-button" onClick={() => onReset(n)}>
+                    ↻ 重置流量
                   </button>
                   <button className="outline" onClick={() => onUpdate(n)}>
                     更新 Agent
@@ -2494,6 +2602,8 @@ function Rules({
   connections,
   onTraffic,
   onAccess,
+  onQuota,
+  onReset,
   onAdd,
   onBatch,
   onEdit,
@@ -2509,6 +2619,8 @@ function Rules({
   connections: ConnectionsResponse;
   onTraffic: (r: Rule) => void;
   onAccess: (r: Rule) => void;
+  onQuota: (r: Rule) => void;
+  onReset: (r: Rule) => void;
   onAdd: (id?: string) => void;
   onBatch: (id: string) => void;
   onEdit: (r: Rule) => void;
@@ -2573,6 +2685,8 @@ function Rules({
               connections={connections}
               onTraffic={onTraffic}
               onAccess={onAccess}
+              onQuota={onQuota}
+              onReset={onReset}
               onEdit={onEdit}
               onMove={onMove}
               onToggle={onToggle}
@@ -2600,6 +2714,8 @@ function Rules({
             connections={connections}
             onTraffic={onTraffic}
             onAccess={onAccess}
+            onQuota={onQuota}
+            onReset={onReset}
             onEdit={onEdit}
             onMove={onMove}
             onToggle={onToggle}
@@ -2625,6 +2741,8 @@ function RuleTable({
   connections,
   onTraffic,
   onAccess,
+  onQuota,
+  onReset,
   onEdit,
   onMove,
   onToggle,
@@ -2637,6 +2755,8 @@ function RuleTable({
   connections: ConnectionsResponse;
   onTraffic: (r: Rule) => void;
   onAccess: (r: Rule) => void;
+  onQuota: (r: Rule) => void;
+  onReset: (r: Rule) => void;
   onEdit: (r: Rule) => void;
   onMove: (r: Rule, direction: MoveDirection) => void;
   onToggle: (r: Rule) => void;
@@ -2773,6 +2893,11 @@ function RuleTable({
                 实时 ↓ {speed(t?.download_bytes_per_second || 0)} · ↑{" "}
                 {speed(t?.upload_bytes_per_second || 0)}
               </small>
+              {t?.quota_enabled && (
+                <small className={t.quota_exhausted ? "quota-bad" : "quota-ok"}>
+                  额度 {bytes(t.quota_remaining_bytes || 0)} / {bytes(t.quota_bytes || 0)}
+                </small>
+              )}
             </span>
             <span
               className={
@@ -2802,7 +2927,9 @@ function RuleTable({
               >
                 <i />
               </button>
-              <small>{r.enabled ? "运行中" : "已暂停"}</small>
+              <small>
+                {t?.quota_exhausted ? "额度已用尽" : r.enabled ? "运行中" : "已暂停"}
+              </small>
             </span>
             <span className="row-actions">
               <button
@@ -2846,6 +2973,22 @@ function RuleTable({
                 onClick={() => onAccess(r)}
               >
                 <AccessIcon />
+              </button>
+              <button
+                className="icon-button quota-icon-button"
+                title="流量控制"
+                aria-label="配置规则流量控制"
+                onClick={() => onQuota(r)}
+              >
+                <QuotaIcon />
+              </button>
+              <button
+                className="icon-button reset-traffic-icon-button"
+                title="重置已用流量"
+                aria-label="重置规则已用流量"
+                onClick={() => onReset(r)}
+              >
+                <ResetTrafficIcon />
               </button>
               <button
                 className="icon-button danger"
@@ -5268,6 +5411,101 @@ function RuleModal({
           <button className="primary" disabled={busy || !line}>
             {busy ? "保存中…" : initial ? "保存并重新下发" : "创建并下发"}
           </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function RuleQuotaModal({
+  rule,
+  stats,
+  onClose,
+  onSave,
+}: {
+  rule: Rule;
+  stats?: RuleTraffic;
+  onClose: () => void;
+  onSave: (value: {
+    enabled: boolean;
+    quota_bytes: number;
+    mode: "sum" | "upload" | "download";
+  }) => Promise<void>;
+}) {
+  const [enabled, setEnabled] = useState(Boolean(rule.traffic_quota_enabled));
+  const [quotaGB, setQuotaGB] = useState(
+    (rule.traffic_quota_bytes || 0) / 1024 ** 3,
+  );
+  const [mode, setMode] = useState<"sum" | "upload" | "download">(
+    rule.traffic_quota_mode || "sum",
+  );
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const quotaBytes = Math.round(quotaGB * 1024 ** 3);
+    if (enabled && quotaBytes <= 0) {
+      setFormError("启用流量控制时，请填写大于 0 GB 的额度。");
+      return;
+    }
+    setSaving(true);
+    setFormError("");
+    try {
+      await onSave({
+        enabled,
+        quota_bytes: Math.max(0, quotaBytes),
+        mode,
+      });
+    } catch (error) {
+      setFormError((error as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal title={`流量控制 · ${rule.name}`} kicker="规则额度" onClose={onClose}>
+      <form className="form-grid quota-form" onSubmit={submit}>
+        <label className="check-row full">
+          <input
+            type="checkbox"
+            aria-label="启用规则流量控制"
+            checked={enabled}
+            onChange={(event) => setEnabled(event.target.checked)}
+          />
+          <span>
+            <b>启用规则流量控制</b>
+            <small>额度用尽后，入口和出口都会停止下发该规则；重置流量后自动恢复。</small>
+          </span>
+        </label>
+        <label>
+          总额度（GB）
+          <input
+            type="number"
+            min="0"
+            step="0.1"
+            value={quotaGB}
+            onChange={(event) => setQuotaGB(Number(event.target.value))}
+          />
+          <small>这是当前规则累计可使用的流量额度。</small>
+        </label>
+        <label>
+          计费方向
+          <select value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
+            <option value="sum">上传 + 下载</option>
+            <option value="download">仅下载</option>
+            <option value="upload">仅上传</option>
+          </select>
+          <small>修改计费方向会从当前流量重新开始计算。</small>
+        </label>
+        <div className="quota-summary full">
+          <span><small>已用额度</small><b>{bytes(stats?.quota_used_bytes || 0)}</b></span>
+          <span><small>剩余额度</small><b>{bytes(stats?.quota_remaining_bytes || rule.traffic_quota_bytes || 0)}</b></span>
+          <span><small>当前状态</small><b className={stats?.quota_exhausted ? "quota-bad" : "quota-ok"}>{stats?.quota_exhausted ? "额度已用尽" : enabled ? "正常" : "未启用"}</b></span>
+        </div>
+        {formError && <div className="form-error full">{formError}</div>}
+        <div className="modal-actions full">
+          <button type="button" className="outline" onClick={onClose}>取消</button>
+          <button className="primary" disabled={saving}>{saving ? "保存中…" : "保存流量控制"}</button>
         </div>
       </form>
     </Modal>

@@ -98,6 +98,12 @@ type reorderRequest struct {
 	IDs []string `json:"ids"`
 }
 
+type ruleTrafficQuotaRequest struct {
+	Enabled    bool   `json:"enabled"`
+	QuotaBytes int64  `json:"quota_bytes"`
+	Mode       string `json:"mode"`
+}
+
 func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -178,6 +184,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/nodes", s.requireAdmin(s.createNode))
 	mux.HandleFunc("PUT /api/v1/nodes/order", s.requireAdmin(s.reorderNodes))
 	mux.HandleFunc("PUT /api/v1/nodes/{id}", s.requireAdmin(s.updateNode))
+	mux.HandleFunc("POST /api/v1/nodes/{id}/traffic-reset", s.requireAdmin(s.resetNodeTraffic))
 	mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.requireAdmin(s.deleteNode))
 	mux.HandleFunc("GET /api/v1/lines", s.requireAdmin(s.listLines))
 	mux.HandleFunc("POST /api/v1/lines", s.requireAdmin(s.saveLine))
@@ -189,6 +196,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/rules/import-text", s.requireAdmin(s.importTextRules))
 	mux.HandleFunc("PUT /api/v1/rules/order", s.requireAdmin(s.reorderRules))
 	mux.HandleFunc("PUT /api/v1/rules/{id}/access-policy", s.requireAdmin(s.saveRuleAccessPolicy))
+	mux.HandleFunc("PUT /api/v1/rules/{id}/traffic-quota", s.requireAdmin(s.saveRuleTrafficQuota))
+	mux.HandleFunc("POST /api/v1/rules/{id}/traffic-reset", s.requireAdmin(s.resetRuleTraffic))
 	mux.HandleFunc("PUT /api/v1/rules/{id}", s.requireAdmin(s.saveRule))
 	mux.HandleFunc("DELETE /api/v1/rules/{id}", s.requireAdmin(s.deleteRule))
 	mux.HandleFunc("GET /api/v1/traffic", s.requireAdmin(s.traffic))
@@ -631,6 +640,19 @@ func (s *Server) updateNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, updated)
 }
 
+func (s *Server) resetNodeTraffic(w http.ResponseWriter, r *http.Request) {
+	err := s.store.ResetNodeTrafficQuota(r.Context(), r.PathValue("id"), time.Now().UTC())
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) deleteNode(w http.ResponseWriter, r *http.Request) {
 	err := s.store.DeleteNode(r.Context(), r.PathValue("id"))
 	if errors.Is(err, store.ErrNotFound) {
@@ -916,6 +938,12 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		if len(rule.RelayPorts) == 0 {
 			rule.RelayPorts = existing.RelayPorts
 		}
+		// Quota state is managed by dedicated endpoints so a normal topology
+		// edit cannot silently reset consumed allowance or disable enforcement.
+		rule.TrafficQuotaEnabled = existing.TrafficQuotaEnabled
+		rule.TrafficQuotaBytes = existing.TrafficQuotaBytes
+		rule.TrafficQuotaMode = existing.TrafficQuotaMode
+		rule.TrafficQuotaBaselineBytes = existing.TrafficQuotaBaselineBytes
 		rule.CreatedAt = existing.CreatedAt
 	} else {
 		rule.ID = randomID("rule")
@@ -1012,6 +1040,52 @@ func (s *Server) saveRuleAccessPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	saved, err := s.store.SaveRule(r.Context(), rule)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (s *Server) saveRuleTrafficQuota(w http.ResponseWriter, r *http.Request) {
+	var request ruleTrafficQuotaRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.Mode == "" {
+		request.Mode = "sum"
+	}
+	if request.Mode != "sum" && request.Mode != "upload" && request.Mode != "download" {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("规则流量统计方向无效"))
+		return
+	}
+	if request.QuotaBytes < 0 || request.QuotaBytes > 1<<50 {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("规则流量额度必须在 0–1 PB 之间"))
+		return
+	}
+	if request.Enabled && request.QuotaBytes <= 0 {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("启用流量控制时额度必须大于 0"))
+		return
+	}
+	saved, err := s.store.UpdateRuleTrafficQuota(r.Context(), r.PathValue("id"), request.Enabled, request.QuotaBytes, request.Mode)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (s *Server) resetRuleTraffic(w http.ResponseWriter, r *http.Request) {
+	saved, err := s.store.ResetRuleTrafficQuota(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
@@ -1898,6 +1972,15 @@ func validateRule(r domain.ForwardRule) error {
 	}
 	if r.UploadMbps < 0 || r.DownloadMbps < 0 {
 		return errors.New("限速不能为负数")
+	}
+	if r.TrafficQuotaBytes < 0 || r.TrafficQuotaBytes > 1<<50 {
+		return errors.New("规则流量额度必须在 0–1 PB 之间")
+	}
+	if r.TrafficQuotaMode != "" && r.TrafficQuotaMode != "sum" && r.TrafficQuotaMode != "upload" && r.TrafficQuotaMode != "download" {
+		return errors.New("规则流量统计方向无效")
+	}
+	if r.TrafficQuotaEnabled && r.TrafficQuotaBytes <= 0 {
+		return errors.New("启用流量控制时额度必须大于 0")
 	}
 	if len(r.AccessPolicy.AllowCIDRs) > 500 || len(r.AccessPolicy.DenyCIDRs) > 500 {
 		return errors.New("每条规则的 IP/CIDR 白名单或黑名单不能超过 500 条")
