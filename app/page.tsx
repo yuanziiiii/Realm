@@ -1571,7 +1571,6 @@ function Login({
         <Logo />
         <div>
           <b>Relay Panel</b>
-          <span>专线端口转发</span>
         </div>
       </div>
       <div className="login-theme">
@@ -1583,7 +1582,6 @@ function Login({
         </div>
         <p className="eyebrow">安全管理入口</p>
         <h1>欢迎回来</h1>
-        <p>登录以管理服务器、线路与转发规则。</p>
         {notice && <div className="success-notice">{notice}</div>}
         <form onSubmit={submit}>
           <label>
@@ -3610,34 +3608,60 @@ function RegionSelector({
   disabled?: boolean;
   onChange: (values: string[]) => void;
 }) {
+  const [province, setProvince] = useState("");
+  const [city, setCity] = useState("");
+  const selectedRegion = regions.find((region) => region.province === province);
   const add = (value: string) => {
-    if (value && !values.includes(value)) onChange([...values, value]);
+    if (!value) return;
+    const selectedProvince = value.split("/", 1)[0];
+    if (value.includes("/") && values.includes(selectedProvince)) return;
+    const next = value.includes("/")
+      ? values
+      : values.filter((item) => !item.startsWith(`${value}/`));
+    if (!next.includes(value)) onChange([...next, value]);
+  };
+  const addSelection = () => {
+    if (!province) return;
+    add(city ? `${province}/${city}` : province);
+    setCity("");
   };
   return (
     <div className="region-selector">
-      <label>
-        {label}
+      <span className="region-selector-label">{label}</span>
+      <div className="region-picker-row">
         <select
           disabled={disabled}
-          value=""
-          onChange={(event) => add(event.target.value)}
+          aria-label={`${label}：省份`}
+          value={province}
+          onChange={(event) => {
+            setProvince(event.target.value);
+            setCity("");
+          }}
         >
-          <option value="">选择省份或城市…</option>
+          <option value="">选择省份…</option>
           {regions.map((region) => (
-            <optgroup key={region.province} label={region.province}>
-              <option value={region.province}>整个{region.province}</option>
-              {region.cities.map((city) => (
-                <option
-                  key={`${region.province}/${city}`}
-                  value={`${region.province}/${city}`}
-                >
-                  {city}
-                </option>
-              ))}
-            </optgroup>
+            <option key={region.province} value={region.province}>
+              {region.province}
+            </option>
           ))}
         </select>
-      </label>
+        <select
+          disabled={disabled || !province}
+          aria-label={`${label}：城市`}
+          value={city}
+          onChange={(event) => setCity(event.target.value)}
+        >
+          <option value="">{province ? `整个${province}` : "先选择省份"}</option>
+          {selectedRegion?.cities.map((item) => (
+            <option key={`${province}/${item}`} value={item}>
+              {item}
+            </option>
+          ))}
+        </select>
+        <button type="button" disabled={disabled || !province} onClick={addSelection}>
+          添加
+        </button>
+      </div>
       <div className="region-chips">
         {values.map((value) => (
           <button
