@@ -3616,11 +3616,54 @@ button {
   color: #1b2638;
 }
 
-@media (min-width: 721px) {
+/* Rules must remain fully visible without a horizontal table scrollbar. */
+@media (min-width: 1401px) {
+  .rule-group .data-table {
+    overflow: visible;
+  }
   .rule-group .table-row {
-    min-width: 1540px !important;
-    grid-template-columns: 1.05fr 0.58fr 0.92fr 1.08fr 1.05fr 0.58fr 0.72fr 0.42fr 276px !important;
-    gap: 14px;
+    min-width: 0 !important;
+    grid-template-columns: 1.05fr 0.58fr 0.92fr 1.08fr 0.92fr 0.58fr 0.72fr 0.42fr 130px !important;
+    gap: 12px;
+  }
+  .rule-group .row-actions {
+    display: grid;
+    grid-template-columns: repeat(3, 38px);
+    justify-content: end;
+    gap: 7px;
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1400px) {
+  .rule-group .data-table {
+    overflow: visible;
+  }
+  .rule-group .table-labels {
+    display: none;
+  }
+  .rule-group .table-row:not(.table-labels) {
+    min-width: 0 !important;
+    grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+    gap: 16px;
+    margin: 10px 0;
+    padding: 16px;
+    border: 1px solid #273243;
+    border-radius: 12px;
+    background: #0d131c;
+  }
+  .rule-group .table-row > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .rule-group .table-row .row-actions {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+  :root[data-theme="light"] .rule-group .table-row:not(.table-labels) {
+    border-color: #dbe1ea;
+    background: #fff;
   }
 }
 
