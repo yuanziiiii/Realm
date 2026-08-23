@@ -52,7 +52,11 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 		markOwners[mark] = deployment.Rule.ID
 	}
 	var b strings.Builder
-	b.WriteString("flush table inet relay_panel\n")
+	// The executor guarantees the table exists before checking/applying this
+	// script. Delete it instead of flushing it: `flush table` can leave named
+	// set objects and their elements in place, causing removed access-control
+	// addresses to survive and be merged into the next declaration.
+	b.WriteString("delete table inet relay_panel\n")
 	b.WriteString("table inet relay_panel {\n")
 	for _, d := range deployments {
 		if ownsTrafficCounters(d) {

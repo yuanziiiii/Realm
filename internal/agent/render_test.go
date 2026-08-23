@@ -17,6 +17,9 @@ func TestRenderPlanBuildsTwoHopNATCountersAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.HasPrefix(plan.NFTScript, "delete table inet relay_panel\n") || strings.Contains(plan.NFTScript, "flush table inet relay_panel") {
+		t.Fatalf("plan must replace the complete nftables table so stale set elements cannot survive:\n%s", plan.NFTScript)
+	}
 	plan, err = FinalizePlan(plan, deployments, map[string]domain.Node{"node_out": {ID: "node_out", Name: "出口", PrivateAddress: "10.24.0.3"}})
 	if err != nil {
 		t.Fatal(err)
