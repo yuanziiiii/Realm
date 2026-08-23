@@ -3461,16 +3461,10 @@ button {
   align-items: center;
   gap: 8px;
 }
-.row-actions .icon-button svg,
-.quota-icon-button svg,
-.reset-traffic-icon-button svg {
+.row-actions .icon-button svg {
   width: 19px;
   height: 19px;
 }
-.quota-icon-button {
-  color: #b5a9ff;
-}
-.reset-traffic-icon-button,
 .reset-traffic-button {
   color: #55dca8;
 }
@@ -3480,54 +3474,163 @@ button {
 .quota-bad {
   color: #ef899c !important;
 }
-.quota-form {
-  max-width: 760px;
-}
-.quota-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  padding: 14px;
+.rule-quota-panel {
+  margin-bottom: 16px;
+  padding: 16px;
   border: 1px solid #2b3544;
   border-radius: 12px;
   background: #0d131c;
 }
-.quota-summary span {
-  min-width: 0;
+.rule-quota-panel .section-head {
+  margin-bottom: 12px;
 }
-.quota-summary small,
-.quota-summary b {
+.rule-quota-panel .section-head h3 {
+  font-size: 16px;
+}
+.quota-state {
+  padding: 6px 10px;
+  border: 1px solid #3a4556;
+  border-radius: 999px;
+  color: #8d99aa;
+  font-size: 11px;
+  font-weight: 700;
+}
+.quota-state.good {
+  border-color: #275749;
+  background: #10251f;
+  color: #65ddb0;
+}
+.quota-state.bad {
+  border-color: #6b3540;
+  background: #2b151b;
+  color: #ef899c;
+}
+.rule-quota-usage {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: stretch;
+  margin-bottom: 12px;
+}
+.rule-quota-usage > span {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  min-height: 66px;
+  padding: 11px 13px;
+  border: 1px solid #273242;
+  border-radius: 9px;
+  background: #101721;
+}
+.rule-quota-usage small,
+.rule-quota-usage b,
+.rule-quota-usage em {
   display: block;
 }
-.quota-summary small {
-  margin-bottom: 5px;
+.rule-quota-usage small {
+  margin-bottom: 4px;
   color: #7f8b9e;
   font-size: 11px;
 }
-.quota-summary b {
+.rule-quota-usage b {
   color: #e8ecf4;
   font-size: 14px;
   overflow-wrap: anywhere;
 }
-:root[data-theme="light"] .quota-summary {
+.rule-quota-usage em {
+  margin-top: 2px;
+  color: #738196;
+  font-size: 10px;
+  font-style: normal;
+}
+.rule-quota-usage > button {
+  align-self: stretch;
+  min-width: 132px;
+}
+.rule-quota-settings {
+  display: grid;
+  grid-template-columns: 0.9fr 1fr 1fr 1fr 0.72fr auto;
+  gap: 10px;
+  align-items: end;
+  padding-top: 12px;
+  border-top: 1px solid #263141;
+}
+.rule-quota-settings label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #8c98aa;
+  font-size: 11px;
+  font-weight: 650;
+}
+.rule-quota-settings input,
+.rule-quota-settings select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #303b4b;
+  border-radius: 8px;
+  background: #090e15;
+  color: #e8ecf4;
+  padding: 8px 10px;
+}
+.rule-quota-settings .quota-enable {
+  display: flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid #303b4b;
+  border-radius: 8px;
+  background: #101721;
+}
+.rule-quota-settings .quota-enable input {
+  width: 16px;
+  min-height: 16px;
+}
+.rule-quota-settings .is-disabled {
+  opacity: 0.45;
+}
+.rule-quota-settings > button {
+  min-height: 38px;
+  white-space: nowrap;
+}
+.rule-quota-note {
+  margin: 10px 0 0;
+  color: #728095;
+  font-size: 10px;
+  line-height: 1.5;
+}
+:root[data-theme="light"] .rule-quota-panel,
+:root[data-theme="light"] .rule-quota-usage > span,
+:root[data-theme="light"] .rule-quota-settings .quota-enable {
   border-color: #d8e0ec;
   background: #f7f9fc;
 }
-:root[data-theme="light"] .quota-summary b {
+:root[data-theme="light"] .rule-quota-usage b {
+  color: #1b2638;
+}
+:root[data-theme="light"] .rule-quota-settings input,
+:root[data-theme="light"] .rule-quota-settings select {
+  border-color: #ced7e4;
+  background: #fff;
   color: #1b2638;
 }
 
 @media (min-width: 721px) {
   .rule-group .table-row {
-    min-width: 1600px !important;
-    grid-template-columns: 1.05fr 0.58fr 0.92fr 1.08fr 0.84fr 0.58fr 0.72fr 0.42fr 360px !important;
+    min-width: 1540px !important;
+    grid-template-columns: 1.05fr 0.58fr 0.92fr 1.08fr 1.05fr 0.58fr 0.72fr 0.42fr 276px !important;
     gap: 14px;
   }
 }
 
 @media (max-width: 720px) {
-  .quota-summary {
+  .rule-quota-usage,
+  .rule-quota-settings {
     grid-template-columns: 1fr;
+  }
+  .rule-quota-usage > button {
+    min-height: 42px;
   }
   .row-actions {
     justify-content: flex-start;

@@ -102,6 +102,8 @@ type ruleTrafficQuotaRequest struct {
 	Enabled    bool   `json:"enabled"`
 	QuotaBytes int64  `json:"quota_bytes"`
 	Mode       string `json:"mode"`
+	ResetMode  string `json:"reset_mode"`
+	ResetDay   int    `json:"reset_day"`
 }
 
 func New(ctx context.Context, st *store.Store, opts Options) (*Server, error) {
@@ -944,6 +946,9 @@ func (s *Server) saveRule(w http.ResponseWriter, r *http.Request) {
 		rule.TrafficQuotaBytes = existing.TrafficQuotaBytes
 		rule.TrafficQuotaMode = existing.TrafficQuotaMode
 		rule.TrafficQuotaBaselineBytes = existing.TrafficQuotaBaselineBytes
+		rule.TrafficResetMode = existing.TrafficResetMode
+		rule.TrafficResetDay = existing.TrafficResetDay
+		rule.TrafficQuotaResetAt = existing.TrafficQuotaResetAt
 		rule.CreatedAt = existing.CreatedAt
 	} else {
 		rule.ID = randomID("rule")
@@ -1068,7 +1073,21 @@ func (s *Server) saveRuleTrafficQuota(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, errors.New("启用流量控制时额度必须大于 0"))
 		return
 	}
-	saved, err := s.store.UpdateRuleTrafficQuota(r.Context(), r.PathValue("id"), request.Enabled, request.QuotaBytes, request.Mode)
+	if request.ResetMode == "" {
+		request.ResetMode = "manual"
+	}
+	if request.ResetMode != "manual" && request.ResetMode != "monthly" {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("规则流量重置方式无效"))
+		return
+	}
+	if request.ResetDay == 0 {
+		request.ResetDay = 1
+	}
+	if request.ResetDay < 1 || request.ResetDay > 28 {
+		writeError(w, http.StatusUnprocessableEntity, errors.New("每月自动重置日期必须在 1–28 日之间"))
+		return
+	}
+	saved, err := s.store.UpdateRuleTrafficQuota(r.Context(), r.PathValue("id"), request.Enabled, request.QuotaBytes, request.Mode, request.ResetMode, request.ResetDay)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, err)
 		return

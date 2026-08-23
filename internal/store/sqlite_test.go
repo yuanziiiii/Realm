@@ -266,7 +266,7 @@ func TestRuleTrafficQuotaStopsAndResetRestoresDeployments(t *testing.T) {
 	if err := st.AddTraffic(ctx, "in", []domain.TrafficDelta{first}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.UpdateRuleTrafficQuota(ctx, "quota-rule", true, 500, "sum"); err != nil {
+	if _, err := st.UpdateRuleTrafficQuota(ctx, "quota-rule", true, 500, "sum", "manual", 1); err != nil {
 		t.Fatal(err)
 	}
 	second := first
@@ -301,6 +301,66 @@ func TestRuleTrafficQuotaStopsAndResetRestoresDeployments(t *testing.T) {
 	}
 	if len(deployments) != 1 || deployments[0].Rule.ID != "quota-rule" {
 		t.Fatalf("reset did not restore deployment: %+v", deployments)
+	}
+}
+
+func TestRuleMonthlyTrafficQuotaResetsOnBeijingCycle(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	for _, node := range []domain.Node{
+		{ID: "monthly-in", Name: "入口", Role: domain.NodeRoleIngress, CreatedAt: now},
+		{ID: "monthly-out", Name: "出口", Role: domain.NodeRoleEgress, PrivateAddress: "10.0.0.8", CreatedAt: now},
+	} {
+		if err := st.CreateNode(ctx, node, "hash"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.SaveRule(ctx, domain.ForwardRule{ID: "monthly-rule", Mode: domain.ForwardModeDualManaged, Name: "按月额度", Protocol: "tcp", IngressNodeID: "monthly-in", EgressNodeID: "monthly-out", ListenAddress: "0.0.0.0", ListenPort: 13000, RelayPort: 33000, TargetHost: "192.0.2.20", TargetPort: 443, Engine: "nftables", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	first := domain.TrafficDelta{RuleID: "monthly-rule", CapturedAt: now, Cumulative: true, UploadBytes: 100, DownloadBytes: 200}
+	if err := st.AddTraffic(ctx, "monthly-in", []domain.TrafficDelta{first}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateRuleTrafficQuota(ctx, "monthly-rule", true, 500, "sum", "monthly", 1); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.CapturedAt = now.Add(time.Second)
+	second.UploadBytes = 400
+	second.DownloadBytes = 400
+	if err := st.AddTraffic(ctx, "monthly-in", []domain.TrafficDelta{second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_reset_at=0 WHERE id='monthly-rule'`); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := st.RuleTrafficSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].QuotaUsedBytes != 0 || summaries[0].QuotaExhausted {
+		t.Fatalf("monthly reset did not start a fresh allowance: %+v", summaries)
+	}
+	rule, err := st.GetRule(ctx, "monthly-rule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycleStart, _ := trafficCycle(now, 1)
+	if rule.TrafficQuotaResetAt.Before(cycleStart) {
+		t.Fatalf("monthly reset timestamp was not advanced: %s", rule.TrafficQuotaResetAt)
+	}
+	deployments, err := st.DeploymentsForNode(ctx, "monthly-in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deployments) != 1 {
+		t.Fatalf("monthly reset did not restore deployment: %+v", deployments)
 	}
 }
 

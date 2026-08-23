@@ -66,6 +66,9 @@ type ForwardRule struct {
 	TrafficQuotaBytes         int64        `json:"traffic_quota_bytes"`
 	TrafficQuotaMode          string       `json:"traffic_quota_mode"`
 	TrafficQuotaBaselineBytes int64        `json:"-"`
+	TrafficResetMode          string       `json:"traffic_reset_mode"`
+	TrafficResetDay           int          `json:"traffic_reset_day"`
+	TrafficQuotaResetAt       time.Time    `json:"traffic_quota_reset_at,omitempty"`
 	AccessPolicy              AccessPolicy `json:"access_policy"`
 	Enabled                   bool         `json:"enabled"`
 	Revision                  int64        `json:"revision"`

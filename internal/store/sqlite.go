@@ -92,6 +92,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			download_mbps INTEGER NOT NULL DEFAULT 0, burst_kbytes INTEGER NOT NULL DEFAULT 512,
 			traffic_quota_enabled INTEGER NOT NULL DEFAULT 0, traffic_quota_bytes INTEGER NOT NULL DEFAULT 0,
 			traffic_quota_mode TEXT NOT NULL DEFAULT 'sum', traffic_quota_baseline_bytes INTEGER NOT NULL DEFAULT 0,
+			traffic_reset_mode TEXT NOT NULL DEFAULT 'manual', traffic_reset_day INTEGER NOT NULL DEFAULT 1,
+			traffic_quota_reset_at INTEGER NOT NULL DEFAULT 0,
 			access_policy TEXT NOT NULL DEFAULT '{}',
 			enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL,
 			sort_order INTEGER NOT NULL DEFAULT 0,
@@ -242,6 +244,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		"traffic_quota_bytes":          `ALTER TABLE forward_rules ADD COLUMN traffic_quota_bytes INTEGER NOT NULL DEFAULT 0`,
 		"traffic_quota_mode":           `ALTER TABLE forward_rules ADD COLUMN traffic_quota_mode TEXT NOT NULL DEFAULT 'sum'`,
 		"traffic_quota_baseline_bytes": `ALTER TABLE forward_rules ADD COLUMN traffic_quota_baseline_bytes INTEGER NOT NULL DEFAULT 0`,
+		"traffic_reset_mode":           `ALTER TABLE forward_rules ADD COLUMN traffic_reset_mode TEXT NOT NULL DEFAULT 'manual'`,
+		"traffic_reset_day":            `ALTER TABLE forward_rules ADD COLUMN traffic_reset_day INTEGER NOT NULL DEFAULT 1`,
+		"traffic_quota_reset_at":       `ALTER TABLE forward_rules ADD COLUMN traffic_quota_reset_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if err := s.ensureColumn(ctx, "forward_rules", column, alter); err != nil {
 			return err
@@ -823,8 +828,8 @@ func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, erro
 	var r domain.ForwardRule
 	var relayPortsJSON, accessPolicyJSON string
 	var enabled, quotaEnabled int
-	var created, updated int64
-	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &relayPortsJSON, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &quotaEnabled, &r.TrafficQuotaBytes, &r.TrafficQuotaMode, &r.TrafficQuotaBaselineBytes, &accessPolicyJSON, &enabled, &r.Revision, &created, &updated)
+	var created, updated, quotaResetAt int64
+	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &relayPortsJSON, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &quotaEnabled, &r.TrafficQuotaBytes, &r.TrafficQuotaMode, &r.TrafficQuotaBaselineBytes, &r.TrafficResetMode, &r.TrafficResetDay, &quotaResetAt, &accessPolicyJSON, &enabled, &r.Revision, &created, &updated)
 	if err == nil && relayPortsJSON != "" {
 		_ = json.Unmarshal([]byte(relayPortsJSON), &r.RelayPorts)
 	}
@@ -840,10 +845,13 @@ func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, erro
 	}
 	r.CreatedAt = fromUnix(created)
 	r.UpdatedAt = fromUnix(updated)
+	r.TrafficQuotaResetAt = fromUnix(quotaResetAt)
 	return r, err
 }
 
-const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,relay_ports,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode,traffic_quota_baseline_bytes,access_policy,enabled,revision,created_at,updated_at`
+const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,relay_ports,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,traffic_quota_enabled,traffic_quota_bytes,traffic_quota_mode,traffic_quota_baseline_bytes,traffic_reset_mode,traffic_reset_day,traffic_quota_reset_at,access_policy,enabled,revision,created_at,updated_at`
+
+var rulePlaceholders = strings.TrimSuffix(strings.Repeat("?,", 31), ",")
 
 func ruleArgs(r domain.ForwardRule) []any {
 	r.NormalizeEngines()
@@ -853,7 +861,13 @@ func ruleArgs(r domain.ForwardRule) []any {
 	if r.TrafficQuotaMode == "" {
 		r.TrafficQuotaMode = "sum"
 	}
-	return []any{r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, string(relayPortsJSON), r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.TrafficQuotaEnabled), r.TrafficQuotaBytes, r.TrafficQuotaMode, r.TrafficQuotaBaselineBytes, string(accessPolicyJSON), boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt)}
+	if r.TrafficResetMode != "monthly" {
+		r.TrafficResetMode = "manual"
+	}
+	if r.TrafficResetDay < 1 || r.TrafficResetDay > 28 {
+		r.TrafficResetDay = 1
+	}
+	return []any{r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, string(relayPortsJSON), r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.TrafficQuotaEnabled), r.TrafficQuotaBytes, r.TrafficQuotaMode, r.TrafficQuotaBaselineBytes, r.TrafficResetMode, r.TrafficResetDay, unix(r.TrafficQuotaResetAt), string(accessPolicyJSON), boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt)}
 }
 
 func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
@@ -952,7 +966,7 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 		r.CreatedAt = now
 	}
 	r.NormalizeEngines()
-	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,traffic_quota_enabled=excluded.traffic_quota_enabled,traffic_quota_bytes=excluded.traffic_quota_bytes,traffic_quota_mode=excluded.traffic_quota_mode,traffic_quota_baseline_bytes=excluded.traffic_quota_baseline_bytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
+	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(`+rulePlaceholders+`) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,traffic_quota_enabled=excluded.traffic_quota_enabled,traffic_quota_bytes=excluded.traffic_quota_bytes,traffic_quota_mode=excluded.traffic_quota_mode,traffic_quota_baseline_bytes=excluded.traffic_quota_baseline_bytes,traffic_reset_mode=excluded.traffic_reset_mode,traffic_reset_day=excluded.traffic_reset_day,traffic_quota_reset_at=excluded.traffic_quota_reset_at,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
 	if err != nil {
 		return r, err
 	}
@@ -996,16 +1010,17 @@ func ruleTrafficTotals(ctx context.Context, tx *sql.Tx, ruleID string) (upload, 
 // UpdateRuleTrafficQuota changes only quota state, preserving the forwarding
 // topology and every other rule field. Resetting starts a fresh allowance from
 // the current lifetime counters without deleting traffic history.
-func (s *Store) UpdateRuleTrafficQuota(ctx context.Context, id string, enabled bool, quotaBytes int64, mode string) (domain.ForwardRule, error) {
+func (s *Store) UpdateRuleTrafficQuota(ctx context.Context, id string, enabled bool, quotaBytes int64, mode, resetMode string, resetDay int) (domain.ForwardRule, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.ForwardRule{}, err
 	}
 	defer tx.Rollback()
 	var currentEnabled int
-	var currentMode string
+	var currentMode, currentResetMode string
+	var currentResetDay int
 	var baseline int64
-	if err := tx.QueryRowContext(ctx, `SELECT traffic_quota_enabled,traffic_quota_mode,traffic_quota_baseline_bytes FROM forward_rules WHERE id=?`, id).Scan(&currentEnabled, &currentMode, &baseline); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT traffic_quota_enabled,traffic_quota_mode,traffic_quota_baseline_bytes,traffic_reset_mode,traffic_reset_day FROM forward_rules WHERE id=?`, id).Scan(&currentEnabled, &currentMode, &baseline, &currentResetMode, &currentResetDay); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.ForwardRule{}, ErrNotFound
 		}
@@ -1014,7 +1029,14 @@ func (s *Store) UpdateRuleTrafficQuota(ctx context.Context, id string, enabled b
 	if mode == "" {
 		mode = "sum"
 	}
-	if (enabled && currentEnabled == 0) || mode != currentMode {
+	if resetMode != "monthly" {
+		resetMode = "manual"
+	}
+	if resetDay < 1 || resetDay > 28 {
+		resetDay = 1
+	}
+	resetAt := time.Now().UTC()
+	if (enabled && currentEnabled == 0) || mode != currentMode || resetMode != currentResetMode || resetDay != currentResetDay {
 		upload, download, err := ruleTrafficTotals(ctx, tx, id)
 		if err != nil {
 			return domain.ForwardRule{}, err
@@ -1025,13 +1047,13 @@ func (s *Store) UpdateRuleTrafficQuota(ctx context.Context, id string, enabled b
 	if err != nil {
 		return domain.ForwardRule{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_enabled=?,traffic_quota_bytes=?,traffic_quota_mode=?,traffic_quota_baseline_bytes=?,revision=?,updated_at=? WHERE id=?`, boolInt(enabled), quotaBytes, mode, baseline, revision, time.Now().UTC().Unix(), id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_enabled=?,traffic_quota_bytes=?,traffic_quota_mode=?,traffic_quota_baseline_bytes=?,traffic_reset_mode=?,traffic_reset_day=?,traffic_quota_reset_at=?,revision=?,updated_at=? WHERE id=?`, boolInt(enabled), quotaBytes, mode, baseline, resetMode, resetDay, resetAt.Unix(), revision, resetAt.Unix(), id); err != nil {
 		return domain.ForwardRule{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.ForwardRule{}, err
 	}
-	s.audit(ctx, "update", "rule_quota", id, fmt.Sprintf("enabled=%t quota=%d mode=%s", enabled, quotaBytes, mode))
+	s.audit(ctx, "update", "rule_quota", id, fmt.Sprintf("enabled=%t quota=%d mode=%s reset=%s/%d", enabled, quotaBytes, mode, resetMode, resetDay))
 	return s.GetRule(ctx, id)
 }
 
@@ -1068,7 +1090,8 @@ func (s *Store) ResetRuleTrafficQuota(ctx context.Context, id string) (domain.Fo
 	if err != nil {
 		return domain.ForwardRule{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_baseline_bytes=?,revision=?,updated_at=? WHERE id=?`, baseline, revision, time.Now().UTC().Unix(), id); err != nil {
+	now := time.Now().UTC().Unix()
+	if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_baseline_bytes=?,traffic_quota_reset_at=?,revision=?,updated_at=? WHERE id=?`, baseline, now, revision, now, id); err != nil {
 		return domain.ForwardRule{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1076,6 +1099,77 @@ func (s *Store) ResetRuleTrafficQuota(ctx context.Context, id string) (domain.Fo
 	}
 	s.audit(ctx, "reset", "rule_quota", id, "usage baseline reset")
 	return s.GetRule(ctx, id)
+}
+
+// ensureRuleQuotaCycles performs the monthly reset lazily during normal panel
+// and Agent polling. Since Agents sync every few seconds, an exhausted rule is
+// restored shortly after midnight without a separate scheduler process.
+func (s *Store) ensureRuleQuotaCycles(ctx context.Context, now time.Time) error {
+	type dueRule struct {
+		id    string
+		mode  string
+		start time.Time
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,traffic_quota_mode,traffic_reset_day,traffic_quota_reset_at FROM forward_rules WHERE traffic_quota_enabled=1 AND traffic_reset_mode='monthly'`)
+	if err != nil {
+		return err
+	}
+	var due []dueRule
+	for rows.Next() {
+		var id, mode string
+		var day int
+		var resetAt int64
+		if err := rows.Scan(&id, &mode, &day, &resetAt); err != nil {
+			rows.Close()
+			return err
+		}
+		start, _ := trafficCycle(now, day)
+		if resetAt < start.Unix() {
+			due = append(due, dueRule{id: id, mode: mode, start: start})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(due) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	revision, err := s.bumpRevision(ctx, tx)
+	if err != nil {
+		return err
+	}
+	changed := 0
+	for _, item := range due {
+		var resetAt int64
+		if err := tx.QueryRowContext(ctx, `SELECT traffic_quota_reset_at FROM forward_rules WHERE id=?`, item.id).Scan(&resetAt); err != nil {
+			return err
+		}
+		if resetAt >= item.start.Unix() {
+			continue
+		}
+		upload, download, err := ruleTrafficTotals(ctx, tx, item.id)
+		if err != nil {
+			return err
+		}
+		baseline := ruleBillableTraffic(item.mode, upload, download)
+		if _, err := tx.ExecContext(ctx, `UPDATE forward_rules SET traffic_quota_baseline_bytes=?,traffic_quota_reset_at=?,revision=?,updated_at=? WHERE id=?`, baseline, item.start.Unix(), revision, now.UTC().Unix(), item.id); err != nil {
+			return err
+		}
+		changed++
+	}
+	if changed == 0 {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.audit(ctx, "reset", "rule_quota", "monthly", fmt.Sprintf("%d rules", changed))
+	return nil
 }
 
 // ImportRules creates a validated batch under one revision and one
@@ -1103,7 +1197,7 @@ func (s *Store) ImportRules(ctx context.Context, rules []domain.ForwardRule) (in
 		if rule.CreatedAt.IsZero() {
 			rule.CreatedAt = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(`+rulePlaceholders+`)`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
 		}
@@ -1159,7 +1253,7 @@ func (s *Store) ImportTopology(ctx context.Context, lines []domain.Line, rules [
 		if rule.CreatedAt.IsZero() {
 			rule.CreatedAt = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,traffic_quota_enabled=excluded.traffic_quota_enabled,traffic_quota_bytes=excluded.traffic_quota_bytes,traffic_quota_mode=excluded.traffic_quota_mode,traffic_quota_baseline_bytes=excluded.traffic_quota_baseline_bytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(`+rulePlaceholders+`) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,traffic_quota_enabled=excluded.traffic_quota_enabled,traffic_quota_bytes=excluded.traffic_quota_bytes,traffic_quota_mode=excluded.traffic_quota_mode,traffic_quota_baseline_bytes=excluded.traffic_quota_baseline_bytes,traffic_reset_mode=excluded.traffic_reset_mode,traffic_reset_day=excluded.traffic_reset_day,traffic_quota_reset_at=excluded.traffic_quota_reset_at,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
 		}
@@ -1238,6 +1332,9 @@ func (s *Store) exhaustedRuleQuotas(ctx context.Context) (map[string]bool, error
 }
 
 func (s *Store) DeploymentsForNode(ctx context.Context, nodeID string) ([]domain.Deployment, error) {
+	if err := s.ensureRuleQuotaCycles(ctx, time.Now().UTC()); err != nil {
+		return nil, err
+	}
 	rules, err := s.ListRules(ctx)
 	if err != nil {
 		return nil, err
@@ -1931,6 +2028,9 @@ func trafficDayStart(t time.Time) time.Time {
 
 func (s *Store) RuleTrafficSummaries(ctx context.Context) ([]domain.RuleTrafficSummary, error) {
 	now := time.Now().UTC()
+	if err := s.ensureRuleQuotaCycles(ctx, now); err != nil {
+		return nil, err
+	}
 	today, week, month, quarter := trafficPeriodStarts(now)
 	rateCutoff := now.Add(-45 * time.Second).Unix()
 	rows, err := s.db.QueryContext(ctx, `
