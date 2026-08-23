@@ -233,6 +233,67 @@ agent_environment() {
     || { printf '%b✗%b Agent 服务 未运行\n' "${red}" "${reset}"; failed=1; }
   return "${failed}"
 }
+agent_access_check() {
+  local port="${1:-}" chain matches set_names set_name set_json count sample label
+  if [[ -z "${port}" && -t 0 ]]; then
+    printf '请输入要检查的入口端口：' > /dev/tty
+    IFS= read -r port < /dev/tty || return 0
+  fi
+  if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    warn '端口必须是 1-65535 之间的数字，例如：zf access 31259'
+    return 2
+  fi
+  command -v nft >/dev/null 2>&1 || { warn '本机没有安装 nft，无法检查访问控制'; return 1; }
+  if ! chain="$(nft -a list chain inet relay_panel access_control 2>/dev/null)"; then
+    warn '没有找到 relay_panel/access_control；请确认 Agent 正常运行并已收到规则'
+    return 1
+  fi
+  matches="$(printf '%s\n' "${chain}" | awk -v port="${port}" '$0 ~ ("dport " port "([^0-9]|$)")')"
+  printf '%b端口 %s · 访问控制检查%b\n' "${cyan}" "${port}" "${reset}"
+  if [[ -r /var/lib/relay-agent/state.json ]] && command -v jq >/dev/null 2>&1; then
+    printf 'Agent 修订：%s · 应用状态：%s\n' \
+      "$(jq -r '.applied_revision // 0' /var/lib/relay-agent/state.json 2>/dev/null)" \
+      "$(jq -r '.apply_status // "未知"' /var/lib/relay-agent/state.json 2>/dev/null)"
+  fi
+  if [[ -z "${matches}" ]]; then
+    printf '%b-%b 当前端口没有 IP、地区或连接限制规则\n' "${yellow}" "${reset}"
+    warn '如果面板已经启用策略，请等待约 10 秒后重试，并检查 Agent 日志。'
+    return 0
+  fi
+  printf '\n判定顺序（由上到下，命中 accept/drop 后停止）：\n'
+  printf '%s\n' "${matches}" | sed 's/^[[:space:]]*/  /'
+  set_names="$(printf '%s\n' "${matches}" | grep -oE '@[[:alnum:]_]+' | tr -d '@' | sort -u || true)"
+  printf '\n内核集合：\n'
+  while IFS= read -r set_name; do
+    [[ -n "${set_name}" ]] || continue
+    case "${set_name}" in
+      *_manual_allow) label='IP/CIDR 优先放行' ;;
+      *_deny) label='IP/地区禁止' ;;
+      *_geo_allow) label='允许省市网段' ;;
+      *_tcp_conn) label='TCP 并发限制状态' ;;
+      *_tcp_rate) label='TCP 新建频率状态' ;;
+      *_udp_rate) label='UDP 新建频率状态' ;;
+      *) label='访问控制集合' ;;
+    esac
+    if command -v jq >/dev/null 2>&1 && set_json="$(nft -j list set inet relay_panel "${set_name}" 2>/dev/null)"; then
+      count="$(printf '%s' "${set_json}" | jq -r '[.nftables[] | select(.set != null) | (.set.elem // [])[]] | length' 2>/dev/null || printf '?')"
+      sample="$(printf '%s' "${set_json}" | jq -c '[.nftables[] | select(.set != null) | (.set.elem // [])[]][0:8]' 2>/dev/null || true)"
+      printf '  %b✓%b %s：%s 个元素' "${green}" "${reset}" "${label}" "${count}"
+      [[ -n "${sample}" && "${sample}" != '[]' ]] && printf ' · 示例 %s' "${sample}"
+      printf '\n'
+    elif nft list set inet relay_panel "${set_name}" >/dev/null 2>&1; then
+      printf '  %b✓%b %s：已安装\n' "${green}" "${reset}" "${label}"
+    else
+      printf '  %b✗%b %s：规则引用但集合不存在\n' "${red}" "${reset}" "${label}"
+    fi
+  done <<< "${set_names}"
+  if printf '%s' "${matches}" | grep -q '_deny' \
+    && printf '%s' "${matches}" | grep -q '_geo_allow' \
+    && nft list set inet relay_panel "$(printf '%s\n' "${set_names}" | grep '_deny$' | head -n 1)" 2>/dev/null | grep -q '0\.0\.0\.0/0'; then
+    warn '检测到黑名单 0.0.0.0/0 与城市白名单同时启用：/0 会先拦截，城市白名单不会获得放行机会。'
+  fi
+  printf '\n说明：drop 行的 packets/bytes 增长，表示拦截正在生效；tcpdump 仍能看到到达网卡但已被丢弃的数据包。\n'
+}
 agent_uninstall() {
   warn '卸载 Agent 会停止同步并清理本面板创建的转发；卸载脚本将要求输入大写 YES。'
   run_release_script uninstall.sh --agent && exit 0
@@ -266,22 +327,22 @@ agent_menu() {
   local choice
   while true; do
     clear_screen; print_header 'Agent 被控端'
-    printf ' %b1.%b 查看 Agent 状态\n %b2.%b 在线更新 Agent\n %b3.%b 重启 Agent\n %b4.%b 启动 Agent\n %b5.%b 停止 Agent\n %b6.%b 查看 Agent 日志\n %b7.%b 测试主控连通性\n %b8.%b 显示节点信息\n %b9.%b 检查转发环境\n %b10.%b 安全卸载 Agent\n %b0.%b 退出\n\n请选择：' \
+    printf ' %b1.%b 查看 Agent 状态\n %b2.%b 在线更新 Agent\n %b3.%b 重启 Agent\n %b4.%b 启动 Agent\n %b5.%b 停止 Agent\n %b6.%b 查看 Agent 日志\n %b7.%b 测试主控连通性\n %b8.%b 显示节点信息\n %b9.%b 检查转发环境\n %b10.%b 检查规则访问控制\n %b11.%b 安全卸载 Agent\n %b0.%b 退出\n\n请选择：' \
       "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" \
-      "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${red}" "${reset}" "${cyan}" "${reset}" > /dev/tty
+      "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${green}" "${reset}" "${red}" "${reset}" "${cyan}" "${reset}" > /dev/tty
     IFS= read -r choice < /dev/tty || break
     printf '\n'
     case "${choice}" in
       1) agent_status ;; 2) agent_update ;; 3) agent_restart ;; 4) agent_start ;; 5) agent_stop ;;
-      6) agent_logs ;; 7) agent_connectivity ;; 8) agent_info ;; 9) agent_environment ;; 10) agent_uninstall ;; 0) break ;;
-      *) warn '请输入 0-10' ;;
+      6) agent_logs ;; 7) agent_connectivity ;; 8) agent_info ;; 9) agent_environment ;; 10) agent_access_check ;; 11) agent_uninstall ;; 0) break ;;
+      *) warn '请输入 0-11' ;;
     esac
     [[ "${choice}" == '0' ]] || pause_menu
   done
 }
 
 run_command() {
-  local role="$1" command_name="$2"
+  local role="$1" command_name="$2" command_arg="${3:-}"
   case "${role}:${command_name}" in
     control:status) control_status ;; control:update) control_update ;; control:restart) control_restart ;;
     control:start) control_start ;; control:stop) control_stop ;; control:logs) control_logs ;;
@@ -290,6 +351,7 @@ run_command() {
     agent:status) agent_status ;; agent:update) agent_update ;; agent:restart) agent_restart ;;
     agent:start) agent_start ;; agent:stop) agent_stop ;; agent:logs) agent_logs ;;
     agent:doctor) agent_connectivity; agent_environment ;; agent:info) agent_info ;;
+    agent:access) agent_access_check "${command_arg}" ;;
     agent:uninstall) agent_uninstall ;;
     *) warn "未知命令：${command_name}"; return 2 ;;
   esac
@@ -306,10 +368,12 @@ fi
 
 if [[ $# -ge 1 ]]; then
   selected_role="${2:-}"
+  command_arg="${3:-}"
   if [[ "${selected_role}" != 'control' && "${selected_role}" != 'agent' ]]; then
+    [[ "$1" == 'access' ]] && command_arg="${2:-}"
     if [[ "${agent_installed}" == true ]]; then selected_role='agent'; else selected_role='control'; fi
   fi
-  run_command "${selected_role}" "$1"
+  run_command "${selected_role}" "$1" "${command_arg}"
   exit $?
 fi
 
