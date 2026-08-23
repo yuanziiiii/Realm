@@ -20,14 +20,17 @@ import (
 var version = "dev"
 
 type state struct {
-	AppliedRevision int64                     `json:"applied_revision"`
-	ApplyStatus     string                    `json:"apply_status"`
-	ApplyError      string                    `json:"apply_error"`
-	IngressRuleIDs  []string                  `json:"ingress_rule_ids"`
-	Probes          []domain.LinkProbe        `json:"probes,omitempty"`
-	TargetProbes    []domain.TargetProbe      `json:"target_probes,omitempty"`
-	RateLimits      []domain.RateLimitStatus  `json:"rate_limits,omitempty"`
-	NodeTraffic     *domain.NodeTrafficSample `json:"node_traffic,omitempty"`
+	AppliedRevision     int64                     `json:"applied_revision"`
+	ApplyStatus         string                    `json:"apply_status"`
+	ApplyError          string                    `json:"apply_error"`
+	IngressRuleIDs      []string                  `json:"ingress_rule_ids"`
+	Probes              []domain.LinkProbe        `json:"probes,omitempty"`
+	TargetProbes        []domain.TargetProbe      `json:"target_probes,omitempty"`
+	TargetProbesPending bool                      `json:"target_probes_pending,omitempty"`
+	TargetProbedAt      time.Time                 `json:"target_probed_at,omitempty"`
+	RateLimits          []domain.RateLimitStatus  `json:"rate_limits,omitempty"`
+	NodeTraffic         *domain.NodeTrafficSample `json:"node_traffic,omitempty"`
+	Connections         *domain.ConnectionReport  `json:"connections,omitempty"`
 }
 
 func main() {
@@ -79,12 +82,18 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 			}
 		}
 	}
-	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes, TargetProbes: st.TargetProbes, RateLimits: st.RateLimits, NodeTraffic: st.NodeTraffic})
+	var pendingTargetProbes []domain.TargetProbe
+	if st.TargetProbesPending {
+		pendingTargetProbes = st.TargetProbes
+	}
+	resp, err := client.Sync(ctx, domain.SyncRequest{AgentVersion: version, AppliedRevision: st.AppliedRevision, ApplyStatus: st.ApplyStatus, ApplyError: st.ApplyError, Network: network, Traffic: traffic, Probes: st.Probes, TargetProbes: pendingTargetProbes, RateLimits: st.RateLimits, NodeTraffic: st.NodeTraffic, Connections: st.Connections})
 	if err != nil {
 		return err
 	}
+	st.TargetProbesPending = false
 	var linkProbes []domain.LinkProbe
 	var targetProbes []domain.TargetProbe
+	var connections domain.ConnectionReport
 	var probeWG sync.WaitGroup
 	probeWG.Add(2)
 	go func() {
@@ -93,11 +102,24 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	}()
 	go func() {
 		defer probeWG.Done()
-		targetProbes = agent.ProbeRuleTargets(ctx, resp.Node, resp.Deployments)
+		connections = agent.CollectConnections(ctx, resp.Node, resp.Deployments)
 	}()
+	probeTargets := targetProbeDue(st.TargetProbedAt, cfg.TargetProbeInterval, time.Now())
+	if probeTargets {
+		probeWG.Add(1)
+		go func() {
+			defer probeWG.Done()
+			targetProbes = agent.ProbeRuleTargets(ctx, resp.Node, resp.Deployments)
+		}()
+	}
 	probeWG.Wait()
 	st.Probes = linkProbes
-	st.TargetProbes = targetProbes
+	st.Connections = &connections
+	if probeTargets {
+		st.TargetProbes = targetProbes
+		st.TargetProbesPending = len(targetProbes) > 0
+		st.TargetProbedAt = time.Now().UTC()
+	}
 	trafficInterface := resp.Node.TrafficQuotaInterface
 	if trafficInterface == "" {
 		trafficInterface = resp.Node.PublicInterface
@@ -133,6 +155,10 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	st.IngressRuleIDs = plan.IngressRuleIDs
 	st.RateLimits = executor.RateLimitStatuses(ctx, resp.Node.ID)
 	return nil
+}
+
+func targetProbeDue(last time.Time, interval time.Duration, now time.Time) bool {
+	return last.IsZero() || interval <= 0 || !now.Before(last.Add(interval))
 }
 
 func loadState(path string) state {

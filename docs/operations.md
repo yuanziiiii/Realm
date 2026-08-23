@@ -112,6 +112,15 @@ curl -v --connect-timeout 8 https://你的面板域名/healthz
 - nftables 下发前执行语法检查，后续步骤失败时恢复旧表。
 - 其他防火墙使用 drop 策略时，仍需自行放行监听端口、中继端口和已建立连接。
 
+## 来源连接与地区库
+
+- Agent 每 10 秒读取一次 conntrack，只上报来源 IPv4 和 TCP/UDP 数量，不抓取、不保存业务内容。
+- 双端托管只在入口统计真实客户端来源；仅出口接管如果上游已经 NAT，只能看到上游入口 IP。
+- `/proc/net/nf_conntrack` 和 `/proc/net/ip_conntrack` 均不可读时，Agent 会尝试使用系统已有的 `conntrack` 命令；采集不可用不会影响 nftables 或 Realm 转发。
+- 来源 IP 保留 7 天；超过 45 秒没有新样本时，页面当前连接数显示为 0。
+- 地区库在主控原子替换，导入上限 64 MB、100 万网段；更新后会自动提高配置 revision 并重新下发受影响规则。
+- Realm 规则只有开启地域/IP 控制或连接限制时，才会在入口增加 nftables 过滤链。该链位于 Realm 监听端口之前，不改变 Realm 的出口连接方式。
+
 ## 手工启动与本地开发
 
 准备主控环境变量：

@@ -7,15 +7,17 @@ import (
 )
 
 type Config struct {
-	ControllerURL     string        `json:"controller_url"`
-	NodeID            string        `json:"node_id"`
-	Token             string        `json:"token"`
-	Apply             bool          `json:"apply"`
-	AllowQdiscReplace bool          `json:"allow_qdisc_replace"`
-	SyncInterval      time.Duration `json:"-"`
-	SyncIntervalText  string        `json:"sync_interval"`
-	StateDir          string        `json:"state_dir"`
-	RealmBinary       string        `json:"realm_binary"`
+	ControllerURL           string        `json:"controller_url"`
+	NodeID                  string        `json:"node_id"`
+	Token                   string        `json:"token"`
+	Apply                   bool          `json:"apply"`
+	AllowQdiscReplace       bool          `json:"allow_qdisc_replace"`
+	SyncInterval            time.Duration `json:"-"`
+	SyncIntervalText        string        `json:"sync_interval"`
+	TargetProbeInterval     time.Duration `json:"-"`
+	TargetProbeIntervalText string        `json:"target_probe_interval"`
+	StateDir                string        `json:"state_dir"`
+	RealmBinary             string        `json:"realm_binary"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -31,6 +33,13 @@ func LoadConfig(path string) (Config, error) {
 		c.SyncIntervalText = "10s"
 	}
 	c.SyncInterval, err = time.ParseDuration(c.SyncIntervalText)
+	if err != nil {
+		return c, err
+	}
+	if c.TargetProbeIntervalText == "" {
+		c.TargetProbeIntervalText = "60s"
+	}
+	c.TargetProbeInterval, err = time.ParseDuration(c.TargetProbeIntervalText)
 	if err != nil {
 		return c, err
 	}

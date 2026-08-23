@@ -56,16 +56,33 @@ type ForwardRule struct {
 	TargetPort int            `json:"target_port"`
 	// Engine is retained as a compatibility field for older Agents and API
 	// clients. The controller rewrites it to the engine for each deployment.
-	Engine        string    `json:"engine"`
-	IngressEngine string    `json:"ingress_engine"`
-	EgressEngine  string    `json:"egress_engine"`
-	UploadMbps    int       `json:"upload_mbps"`
-	DownloadMbps  int       `json:"download_mbps"`
-	BurstKBytes   int       `json:"burst_kbytes"`
-	Enabled       bool      `json:"enabled"`
-	Revision      int64     `json:"revision"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Engine        string       `json:"engine"`
+	IngressEngine string       `json:"ingress_engine"`
+	EgressEngine  string       `json:"egress_engine"`
+	UploadMbps    int          `json:"upload_mbps"`
+	DownloadMbps  int          `json:"download_mbps"`
+	BurstKBytes   int          `json:"burst_kbytes"`
+	AccessPolicy  AccessPolicy `json:"access_policy"`
+	Enabled       bool         `json:"enabled"`
+	Revision      int64        `json:"revision"`
+	CreatedAt     time.Time    `json:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
+}
+
+// AccessPolicy is enforced on the client-facing side of a rule. Manual IP
+// ranges are stored with the rule; region selections are expanded by the
+// controller before a deployment is sent to an Agent.
+type AccessPolicy struct {
+	Enabled                    bool     `json:"enabled"`
+	AllowCIDRs                 []string `json:"allow_cidrs,omitempty"`
+	DenyCIDRs                  []string `json:"deny_cidrs,omitempty"`
+	AllowRegions               []string `json:"allow_regions,omitempty"`
+	DenyRegions                []string `json:"deny_regions,omitempty"`
+	MaxTCPConnectionsPerIP     int      `json:"max_tcp_connections_per_ip,omitempty"`
+	MaxTCPNewConnectionsMinute int      `json:"max_tcp_new_connections_per_minute,omitempty"`
+	MaxUDPNewFlowsMinute       int      `json:"max_udp_new_flows_per_minute,omitempty"`
+	ResolvedAllowRanges        []string `json:"resolved_allow_ranges,omitempty"`
+	ResolvedDenyRanges         []string `json:"resolved_deny_ranges,omitempty"`
 }
 
 // Line keeps the stable network topology separate from individual port rules.
@@ -239,6 +256,72 @@ type NodeTrafficSummary struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+// ConnectionEntry is one source-IP aggregate from the client-facing side of
+// a forwarding rule. UDP is deliberately named a session because UDP has no
+// connection handshake; the value represents a live conntrack tuple.
+type ConnectionEntry struct {
+	RuleID         string    `json:"rule_id"`
+	NodeID         string    `json:"node_id"`
+	SourceIP       string    `json:"source_ip"`
+	TCPConnections int       `json:"tcp_connections"`
+	UDPSessions    int       `json:"udp_sessions"`
+	CapturedAt     time.Time `json:"captured_at"`
+}
+
+type ConnectionReport struct {
+	Available           bool              `json:"available"`
+	Error               string            `json:"error,omitempty"`
+	CapturedAt          time.Time         `json:"captured_at"`
+	TotalTCPConnections int               `json:"total_tcp_connections"`
+	TotalUDPSessions    int               `json:"total_udp_sessions"`
+	RuleIDs             []string          `json:"rule_ids"`
+	Entries             []ConnectionEntry `json:"entries"`
+}
+
+type ConnectionSource struct {
+	ConnectionEntry
+	Country    string    `json:"country,omitempty"`
+	Province   string    `json:"province,omitempty"`
+	City       string    `json:"city,omitempty"`
+	ISP        string    `json:"isp,omitempty"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+}
+
+type ConnectionStatus struct {
+	NodeID              string    `json:"node_id"`
+	Available           bool      `json:"available"`
+	Error               string    `json:"error,omitempty"`
+	CapturedAt          time.Time `json:"captured_at"`
+	TotalTCPConnections int       `json:"total_tcp_connections"`
+	TotalUDPSessions    int       `json:"total_udp_sessions"`
+}
+
+type ConnectionsResponse struct {
+	Sources  []ConnectionSource `json:"sources"`
+	Statuses []ConnectionStatus `json:"statuses"`
+}
+
+type GeoRange struct {
+	StartIP  string `json:"start_ip"`
+	EndIP    string `json:"end_ip"`
+	Country  string `json:"country,omitempty"`
+	Province string `json:"province,omitempty"`
+	City     string `json:"city,omitempty"`
+	ISP      string `json:"isp,omitempty"`
+}
+
+type GeoRegion struct {
+	Province string   `json:"province"`
+	Cities   []string `json:"cities"`
+}
+
+type GeoStatus struct {
+	Ready     bool        `json:"ready"`
+	Ranges    int64       `json:"ranges"`
+	UpdatedAt time.Time   `json:"updated_at,omitempty"`
+	Regions   []GeoRegion `json:"regions"`
+}
+
 type RuleTrafficSummary struct {
 	RuleID                 string            `json:"rule_id"`
 	TotalUploadBytes       int64             `json:"total_upload_bytes"`
@@ -324,6 +407,7 @@ type SyncRequest struct {
 	TargetProbes    []TargetProbe      `json:"target_probes,omitempty"`
 	RateLimits      []RateLimitStatus  `json:"rate_limits,omitempty"`
 	NodeTraffic     *NodeTrafficSample `json:"node_traffic,omitempty"`
+	Connections     *ConnectionReport  `json:"connections,omitempty"`
 }
 
 type SyncResponse struct {

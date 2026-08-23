@@ -64,6 +64,18 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 			p.ForwardMarks = append(p.ForwardMarks, uploadMark(d.Rule.ID))
 		}
 	}
+	for _, d := range deployments {
+		if err := renderAccessSets(&b, d); err != nil {
+			return p, err
+		}
+	}
+	b.WriteString("  chain access_control { type filter hook prerouting priority -110; policy accept;\n")
+	for _, d := range deployments {
+		if err := renderAccessRules(&b, node, d); err != nil {
+			return p, err
+		}
+	}
+	b.WriteString("  }\n")
 	b.WriteString("  chain prerouting { type nat hook prerouting priority dstnat; policy accept;\n")
 	for _, d := range deployments {
 		if d.Rule.Engine == "nftables" {
@@ -129,6 +141,152 @@ func RenderPlan(node domain.Node, deployments []domain.Deployment, allowQdiscRep
 	}
 	p.RealmConfig = renderRealm(node, deployments)
 	return p, nil
+}
+
+func nftObjectName(ruleID, suffix string) string {
+	name := strings.TrimPrefix(ruleID, "rule_")
+	name = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
+			return r
+		}
+		return '_'
+	}, name)
+	return "ac_" + name + "_" + suffix
+}
+
+func accessEnabled(policy domain.AccessPolicy) bool {
+	return policy.Enabled || policy.MaxTCPConnectionsPerIP > 0 || policy.MaxTCPNewConnectionsMinute > 0 || policy.MaxUDPNewFlowsMinute > 0
+}
+
+func accessDeployment(deployment domain.Deployment) bool {
+	return deployment.Role == domain.NodeRoleIngress || deployment.Role == domain.NodeRoleBoth || (deployment.Rule.Mode == domain.ForwardModeExitOnly && deployment.Role == domain.NodeRoleEgress)
+}
+
+func normalizeNFTElements(values []string) ([]string, error) {
+	seen := map[string]bool{}
+	var result []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		if strings.Contains(value, "-") {
+			parts := strings.SplitN(value, "-", 2)
+			start, end := net.ParseIP(parts[0]), net.ParseIP(parts[1])
+			if start == nil || start.To4() == nil || end == nil || end.To4() == nil {
+				return nil, fmt.Errorf("invalid IPv4 range %q", value)
+			}
+			value = start.String() + "-" + end.String()
+		} else if strings.Contains(value, "/") {
+			ip, network, err := net.ParseCIDR(value)
+			if err != nil || ip.To4() == nil {
+				return nil, fmt.Errorf("invalid IPv4 CIDR %q", value)
+			}
+			value = network.String()
+		} else {
+			ip := net.ParseIP(value)
+			if ip == nil || ip.To4() == nil {
+				return nil, fmt.Errorf("invalid IPv4 address %q", value)
+			}
+			value = ip.String()
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func writeIntervalSet(builder *strings.Builder, name string, values []string) {
+	fmt.Fprintf(builder, "  set %s { type ipv4_addr; flags interval; elements = { %s }; }\n", name, strings.Join(values, ", "))
+}
+
+func renderAccessSets(builder *strings.Builder, deployment domain.Deployment) error {
+	if !accessDeployment(deployment) || !accessEnabled(deployment.Rule.AccessPolicy) {
+		return nil
+	}
+	policy := deployment.Rule.AccessPolicy
+	if policy.Enabled {
+		manualAllow, err := normalizeNFTElements(policy.AllowCIDRs)
+		if err != nil {
+			return err
+		}
+		denied, err := normalizeNFTElements(append(append([]string{}, policy.DenyCIDRs...), policy.ResolvedDenyRanges...))
+		if err != nil {
+			return err
+		}
+		geoAllow, err := normalizeNFTElements(policy.ResolvedAllowRanges)
+		if err != nil {
+			return err
+		}
+		if len(manualAllow) > 0 {
+			writeIntervalSet(builder, nftObjectName(deployment.Rule.ID, "manual_allow"), manualAllow)
+		}
+		if len(denied) > 0 {
+			writeIntervalSet(builder, nftObjectName(deployment.Rule.ID, "deny"), denied)
+		}
+		if len(geoAllow) > 0 {
+			writeIntervalSet(builder, nftObjectName(deployment.Rule.ID, "geo_allow"), geoAllow)
+		}
+	}
+	if policy.MaxTCPConnectionsPerIP > 0 {
+		fmt.Fprintf(builder, "  set %s { type ipv4_addr; flags dynamic; size 65535; }\n", nftObjectName(deployment.Rule.ID, "tcp_conn"))
+	}
+	if policy.MaxTCPNewConnectionsMinute > 0 {
+		fmt.Fprintf(builder, "  set %s { type ipv4_addr; flags dynamic,timeout; timeout 1m; size 65535; }\n", nftObjectName(deployment.Rule.ID, "tcp_rate"))
+	}
+	if policy.MaxUDPNewFlowsMinute > 0 {
+		fmt.Fprintf(builder, "  set %s { type ipv4_addr; flags dynamic,timeout; timeout 1m; size 65535; }\n", nftObjectName(deployment.Rule.ID, "udp_rate"))
+	}
+	return nil
+}
+
+func accessMatch(node domain.Node, deployment domain.Deployment, protocol string) string {
+	if deployment.Rule.Mode == domain.ForwardModeExitOnly {
+		return fmt.Sprintf("iifname \"%s\" %s dport %d", safeInterface(node.PrivateInterface), protocol, realmListenPort(deployment.Rule))
+	}
+	return fmt.Sprintf("iifname \"%s\" %s dport %d", safeInterface(node.PublicInterface), protocol, deployment.Rule.ListenPort)
+}
+
+func renderAccessRules(builder *strings.Builder, node domain.Node, deployment domain.Deployment) error {
+	if !accessDeployment(deployment) || !accessEnabled(deployment.Rule.AccessPolicy) {
+		return nil
+	}
+	policy := deployment.Rule.AccessPolicy
+	manualAllow, err := normalizeNFTElements(policy.AllowCIDRs)
+	if err != nil {
+		return err
+	}
+	denied, err := normalizeNFTElements(append(append([]string{}, policy.DenyCIDRs...), policy.ResolvedDenyRanges...))
+	if err != nil {
+		return err
+	}
+	geoAllow, err := normalizeNFTElements(policy.ResolvedAllowRanges)
+	if err != nil {
+		return err
+	}
+	for _, protocol := range protocols(deployment.Rule.Protocol) {
+		match := accessMatch(node, deployment, protocol)
+		if policy.Enabled && len(manualAllow) > 0 {
+			fmt.Fprintf(builder, "    %s ip saddr @%s accept\n", match, nftObjectName(deployment.Rule.ID, "manual_allow"))
+		}
+		if policy.Enabled && len(denied) > 0 {
+			fmt.Fprintf(builder, "    %s ip saddr @%s counter drop\n", match, nftObjectName(deployment.Rule.ID, "deny"))
+		}
+		if policy.Enabled && len(policy.AllowRegions) > 0 && len(geoAllow) > 0 {
+			fmt.Fprintf(builder, "    %s ip saddr != @%s counter drop\n", match, nftObjectName(deployment.Rule.ID, "geo_allow"))
+		}
+		if protocol == "tcp" && policy.MaxTCPConnectionsPerIP > 0 {
+			fmt.Fprintf(builder, "    %s ct state new update @%s { ip saddr ct count over %d } counter drop\n", match, nftObjectName(deployment.Rule.ID, "tcp_conn"), policy.MaxTCPConnectionsPerIP)
+		}
+		if protocol == "tcp" && policy.MaxTCPNewConnectionsMinute > 0 {
+			fmt.Fprintf(builder, "    %s ct state new update @%s { ip saddr timeout 1m limit rate over %d/minute } counter drop\n", match, nftObjectName(deployment.Rule.ID, "tcp_rate"), policy.MaxTCPNewConnectionsMinute)
+		}
+		if protocol == "udp" && policy.MaxUDPNewFlowsMinute > 0 {
+			fmt.Fprintf(builder, "    %s ct state new update @%s { ip saddr timeout 1m limit rate over %d/minute } counter drop\n", match, nftObjectName(deployment.Rule.ID, "udp_rate"), policy.MaxUDPNewFlowsMinute)
+		}
+	}
+	return nil
 }
 
 func renderPrerouting(b *strings.Builder, node domain.Node, d domain.Deployment) error {

@@ -282,6 +282,38 @@ func TestRenderPlanWithoutLimitsHasNoTCCommands(t *testing.T) {
 	}
 }
 
+func TestRenderPlanAddsAccessPolicyAndConnectionLimitsBeforeForwarding(t *testing.T) {
+	node := domain.Node{ID: "in", Role: domain.NodeRoleIngress, PublicInterface: "eth0", PrivateInterface: "eth1"}
+	rule := domain.ForwardRule{
+		ID: "rule_access", Mode: domain.ForwardModeDualManaged, Name: "访问控制", Protocol: "both",
+		IngressNodeID: "in", EgressNodeID: "out", ListenPort: 24444, RelayPort: 32444,
+		TargetHost: "192.0.2.8", TargetPort: 443, Engine: "realm", Enabled: true,
+		AccessPolicy: domain.AccessPolicy{
+			Enabled: true, AllowCIDRs: []string{"203.0.113.8"}, DenyCIDRs: []string{"198.51.100.0/24"},
+			ResolvedAllowRanges: []string{"1.0.0.0-1.0.0.255"}, ResolvedDenyRanges: []string{"2.0.0.0-2.0.0.255"},
+			AllowRegions: []string{"广东省"}, MaxTCPConnectionsPerIP: 20,
+			MaxTCPNewConnectionsMinute: 60, MaxUDPNewFlowsMinute: 120,
+		},
+	}
+	plan, err := RenderPlan(node, []domain.Deployment{{Rule: rule, Role: domain.NodeRoleIngress}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"chain access_control { type filter hook prerouting priority -110; policy accept;",
+		`iifname "eth0" tcp dport 24444 ip saddr @ac_access_manual_allow accept`,
+		`iifname "eth0" tcp dport 24444 ip saddr @ac_access_deny counter drop`,
+		`iifname "eth0" tcp dport 24444 ip saddr != @ac_access_geo_allow counter drop`,
+		"ct count over 20",
+		"limit rate over 60/minute",
+		"limit rate over 120/minute",
+	} {
+		if !strings.Contains(plan.NFTScript, expected) {
+			t.Fatalf("access plan missing %q:\n%s", expected, plan.NFTScript)
+		}
+	}
+}
+
 func TestCounterSnapshotsAreCumulative(t *testing.T) {
 	snapshots := CounterSnapshots([]string{"rule_demo"}, map[string][2]int64{"rp_demo_up": {1000, 10}, "rp_demo_down": {2000, 20}})
 	if len(snapshots) != 1 {

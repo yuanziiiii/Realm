@@ -169,7 +169,7 @@ func TestConfigurationExportDryRunAndImportRestoreTopology(t *testing.T) {
 	if err := json.Unmarshal(exportResponse.Body.Bytes(), &backup); err != nil {
 		t.Fatal(err)
 	}
-	if backup.SchemaVersion != 2 {
+	if backup.SchemaVersion != 3 {
 		t.Fatalf("unexpected configuration schema version: %d", backup.SchemaVersion)
 	}
 	if len(backup.Lines) != 1 || len(backup.Rules) != 1 || len(backup.Nodes) != 2 {

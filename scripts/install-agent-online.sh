@@ -153,7 +153,7 @@ jq -n \
   --arg controller_url "${controller_url%/}" \
   --arg node_id "${node_id}" \
   --arg token "${token}" \
-  '{controller_url:$controller_url,node_id:$node_id,token:$token,apply:true,allow_qdisc_replace:false,sync_interval:"10s",state_dir:"/var/lib/relay-agent",realm_binary:"/usr/local/bin/realm"}' \
+  '{controller_url:$controller_url,node_id:$node_id,token:$token,apply:true,allow_qdisc_replace:false,sync_interval:"10s",target_probe_interval:"60s",state_dir:"/var/lib/relay-agent",realm_binary:"/usr/local/bin/realm"}' \
   > /etc/relay-agent/config.json
 chmod 0600 /etc/relay-agent/config.json
 

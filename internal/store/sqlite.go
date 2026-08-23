@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,8 @@ var trafficLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
 type Store struct {
 	db               *sql.DB
 	lastTrafficPrune atomic.Int64
+	accessMu         sync.RWMutex
+	accessCache      map[string]domain.AccessPolicy
 }
 
 func Open(path string) (*Store, error) {
@@ -30,7 +33,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, accessCache: map[string]domain.AccessPolicy{}}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -87,6 +90,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			engine TEXT NOT NULL DEFAULT 'nftables', ingress_engine TEXT NOT NULL DEFAULT '',
 			egress_engine TEXT NOT NULL DEFAULT '', upload_mbps INTEGER NOT NULL DEFAULT 0,
 			download_mbps INTEGER NOT NULL DEFAULT 0, burst_kbytes INTEGER NOT NULL DEFAULT 512,
+			access_policy TEXT NOT NULL DEFAULT '{}',
 			enabled INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL,
 			sort_order INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -144,6 +148,28 @@ func (s *Store) migrate(ctx context.Context) error {
 			error TEXT NOT NULL DEFAULT '', checked_at INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(rule_id, node_id, direction)
 		)`,
+		`CREATE TABLE IF NOT EXISTS connection_status (
+			node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+			available INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+			captured_at INTEGER NOT NULL DEFAULT 0,
+			total_tcp_connections INTEGER NOT NULL DEFAULT 0,
+			total_udp_sessions INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS connection_sources (
+			rule_id TEXT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
+			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+			source_ip TEXT NOT NULL, source_ip_number INTEGER NOT NULL DEFAULT 0,
+			tcp_connections INTEGER NOT NULL DEFAULT 0,
+			udp_sessions INTEGER NOT NULL DEFAULT 0, captured_at INTEGER NOT NULL DEFAULT 0,
+			last_seen_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(rule_id,node_id,source_ip)
+		)`,
+		`CREATE TABLE IF NOT EXISTS geo_ip_ranges (
+			start_ip INTEGER NOT NULL, end_ip INTEGER NOT NULL,
+			country TEXT NOT NULL DEFAULT '', province TEXT NOT NULL DEFAULT '',
+			city TEXT NOT NULL DEFAULT '', isp TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(start_ip,end_ip,province,city,isp)
+		)`,
 		`CREATE TABLE IF NOT EXISTS node_traffic_daily (
 			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
 			interface TEXT NOT NULL, bucket INTEGER NOT NULL,
@@ -176,6 +202,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic_minute(bucket)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_daily_bucket ON traffic_daily(bucket)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_rates_captured ON traffic_rates(captured_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_connections_last_seen ON connection_sources(last_seen_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_connections_rule ON connection_sources(rule_id,captured_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_geo_lookup ON geo_ip_ranges(start_ip,end_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_geo_region ON geo_ip_ranges(province,city)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -192,6 +222,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "egress_engine", `ALTER TABLE forward_rules ADD COLUMN egress_engine TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "forward_rules", "access_policy", `ALTER TABLE forward_rules ADD COLUMN access_policy TEXT NOT NULL DEFAULT '{}'`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "connection_status", "total_tcp_connections", `ALTER TABLE connection_status ADD COLUMN total_tcp_connections INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "connection_status", "total_udp_sessions", `ALTER TABLE connection_status ADD COLUMN total_udp_sessions INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "connection_sources", "source_ip_number", `ALTER TABLE connection_sources ADD COLUMN source_ip_number INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "traffic_baselines", "captured_at", `ALTER TABLE traffic_baselines ADD COLUMN captured_at INTEGER NOT NULL DEFAULT 0`); err != nil {
@@ -732,12 +774,15 @@ func (s *Store) DeleteLine(ctx context.Context, id string) error {
 
 func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, error) {
 	var r domain.ForwardRule
-	var relayPortsJSON string
+	var relayPortsJSON, accessPolicyJSON string
 	var enabled int
 	var created, updated int64
-	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &relayPortsJSON, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &enabled, &r.Revision, &created, &updated)
+	err := scanner.Scan(&r.ID, &r.LineID, &r.Mode, &r.Name, &r.Protocol, &r.IngressNodeID, &r.EgressNodeID, &r.ListenAddress, &r.ListenPort, &r.RelayPort, &relayPortsJSON, &r.TargetHost, &r.TargetPort, &r.Engine, &r.IngressEngine, &r.EgressEngine, &r.UploadMbps, &r.DownloadMbps, &r.BurstKBytes, &accessPolicyJSON, &enabled, &r.Revision, &created, &updated)
 	if err == nil && relayPortsJSON != "" {
 		_ = json.Unmarshal([]byte(relayPortsJSON), &r.RelayPorts)
+	}
+	if err == nil && accessPolicyJSON != "" {
+		_ = json.Unmarshal([]byte(accessPolicyJSON), &r.AccessPolicy)
 	}
 	r.NormalizeEngines()
 	r.NormalizeRelayPorts()
@@ -747,13 +792,14 @@ func scanRule(scanner interface{ Scan(...any) error }) (domain.ForwardRule, erro
 	return r, err
 }
 
-const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,relay_ports,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,enabled,revision,created_at,updated_at`
+const ruleColumns = `id,line_id,mode,name,protocol,ingress_node_id,egress_node_id,listen_address,listen_port,relay_port,relay_ports,target_host,target_port,engine,ingress_engine,egress_engine,upload_mbps,download_mbps,burst_kbytes,access_policy,enabled,revision,created_at,updated_at`
 
 func ruleArgs(r domain.ForwardRule) []any {
 	r.NormalizeEngines()
 	r.NormalizeRelayPorts()
 	relayPortsJSON, _ := json.Marshal(r.RelayPorts)
-	return []any{r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, string(relayPortsJSON), r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt)}
+	accessPolicyJSON, _ := json.Marshal(r.AccessPolicy)
+	return []any{r.ID, r.LineID, r.Mode, r.Name, r.Protocol, r.IngressNodeID, r.EgressNodeID, r.ListenAddress, r.ListenPort, r.RelayPort, string(relayPortsJSON), r.TargetHost, r.TargetPort, r.Engine, r.IngressEngine, r.EgressEngine, r.UploadMbps, r.DownloadMbps, r.BurstKBytes, string(accessPolicyJSON), boolInt(r.Enabled), r.Revision, unix(r.CreatedAt), unix(r.UpdatedAt)}
 }
 
 func (s *Store) ListRules(ctx context.Context) ([]domain.ForwardRule, error) {
@@ -852,7 +898,7 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 		r.CreatedAt = now
 	}
 	r.NormalizeEngines()
-	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
+	_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(r)...)
 	if err != nil {
 		return r, err
 	}
@@ -873,6 +919,7 @@ func (s *Store) SaveRule(ctx context.Context, r domain.ForwardRule) (domain.Forw
 		return r, err
 	}
 	s.audit(ctx, "save", "rule", r.ID, r.Name)
+	s.invalidateAccessCache()
 	return r, nil
 }
 
@@ -901,7 +948,7 @@ func (s *Store) ImportRules(ctx context.Context, rules []domain.ForwardRule) (in
 		if rule.CreatedAt.IsZero() {
 			rule.CreatedAt = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
 		}
@@ -957,7 +1004,7 @@ func (s *Store) ImportTopology(ctx context.Context, lines []domain.Line, rules [
 		if rule.CreatedAt.IsZero() {
 			rule.CreatedAt = now
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO forward_rules(`+ruleColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET line_id=excluded.line_id,mode=excluded.mode,name=excluded.name,protocol=excluded.protocol,ingress_node_id=excluded.ingress_node_id,egress_node_id=excluded.egress_node_id,listen_address=excluded.listen_address,listen_port=excluded.listen_port,relay_port=excluded.relay_port,relay_ports=excluded.relay_ports,target_host=excluded.target_host,target_port=excluded.target_port,engine=excluded.engine,ingress_engine=excluded.ingress_engine,egress_engine=excluded.egress_engine,upload_mbps=excluded.upload_mbps,download_mbps=excluded.download_mbps,burst_kbytes=excluded.burst_kbytes,access_policy=excluded.access_policy,enabled=excluded.enabled,revision=excluded.revision,updated_at=excluded.updated_at`, ruleArgs(rule)...)
 		if err != nil {
 			return 0, err
 		}
@@ -1027,6 +1074,10 @@ func (s *Store) DeploymentsForNode(ctx context.Context, nodeID string) ([]domain
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
+		}
+		rule.AccessPolicy, err = s.resolveAccessPolicy(ctx, rule)
+		if err != nil {
+			return nil, err
 		}
 		line, managedFailover := lineByID[rule.LineID]
 		managedFailover = managedFailover && line.Mode == domain.ForwardModeDualManaged && line.FailoverEnabled && len(line.EgressNodeIDs) > 1
@@ -1195,9 +1246,13 @@ func (s *Store) UpsertTargetProbes(ctx context.Context, nodeID string, probes []
 			}
 		}
 		var failures, successes, hasSucceeded int
-		err = tx.QueryRowContext(ctx, `SELECT failure_count,success_count,has_succeeded FROM target_probes WHERE rule_id=? AND node_id=?`, probe.RuleID, nodeID).Scan(&failures, &successes, &hasSucceeded)
+		var previousCheckedAt int64
+		err = tx.QueryRowContext(ctx, `SELECT failure_count,success_count,has_succeeded,checked_at FROM target_probes WHERE rule_id=? AND node_id=?`, probe.RuleID, nodeID).Scan(&failures, &successes, &hasSucceeded, &previousCheckedAt)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		if !probe.CheckedAt.IsZero() && probe.CheckedAt.Unix() <= previousCheckedAt {
+			continue
 		}
 		if probe.Success && probe.PacketLoss < 100 {
 			failures = 0

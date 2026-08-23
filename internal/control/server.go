@@ -194,6 +194,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/traffic/nodes", s.requireAdmin(s.nodeTraffic))
 	mux.HandleFunc("GET /api/v1/probes", s.requireAdmin(s.listProbes))
 	mux.HandleFunc("GET /api/v1/target-probes", s.requireAdmin(s.listTargetProbes))
+	mux.HandleFunc("GET /api/v1/connections", s.requireAdmin(s.listConnections))
+	mux.HandleFunc("GET /api/v1/geo/status", s.requireAdmin(s.geoStatus))
+	mux.HandleFunc("POST /api/v1/geo/import", s.requireAdmin(s.importGeoDatabase))
 	mux.HandleFunc("GET /api/v1/config/export", s.requireAdmin(s.exportConfiguration))
 	mux.HandleFunc("POST /api/v1/config/import", s.requireAdmin(s.importConfiguration))
 	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)
@@ -258,7 +261,7 @@ func (s *Server) exportConfiguration(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
-	backup := configurationBackup{Format: "relay-panel-configuration", SchemaVersion: 2, ExportedAt: now, Nodes: references, Lines: nonNil(lines), Rules: nonNil(rules)}
+	backup := configurationBackup{Format: "relay-panel-configuration", SchemaVersion: 3, ExportedAt: now, Nodes: references, Lines: nonNil(lines), Rules: nonNil(rules)}
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="relay-panel-config-%s.json"`, now.Format("20060102-150405")))
 	writeJSON(w, http.StatusOK, backup)
 }
@@ -287,7 +290,7 @@ func (s *Server) importConfiguration(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) prepareConfigurationImport(ctx context.Context, backup configurationBackup) ([]domain.Line, []domain.ForwardRule, error) {
-	if backup.Format != "relay-panel-configuration" || (backup.SchemaVersion != 1 && backup.SchemaVersion != 2) {
+	if backup.Format != "relay-panel-configuration" || (backup.SchemaVersion != 1 && backup.SchemaVersion != 2 && backup.SchemaVersion != 3) {
 		return nil, nil, errors.New("配置文件格式或版本不受支持")
 	}
 	if len(backup.Lines) > 200 || len(backup.Rules) > 2000 {
@@ -1640,6 +1643,12 @@ func (s *Server) agentSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Connections != nil {
+		if err := s.store.UpsertConnectionReport(r.Context(), req.NodeID, *req.Connections); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
 	if _, err := s.store.ReconcileFailover(r.Context(), time.Now().UTC()); err != nil {
 		writeError(w, 500, err)
 		return
@@ -1820,6 +1829,28 @@ func validateRule(r domain.ForwardRule) error {
 	}
 	if r.UploadMbps < 0 || r.DownloadMbps < 0 {
 		return errors.New("限速不能为负数")
+	}
+	if len(r.AccessPolicy.AllowCIDRs) > 500 || len(r.AccessPolicy.DenyCIDRs) > 500 {
+		return errors.New("每条规则的 IP/CIDR 白名单或黑名单不能超过 500 条")
+	}
+	for _, value := range append(append([]string{}, r.AccessPolicy.AllowCIDRs...), r.AccessPolicy.DenyCIDRs...) {
+		value = strings.TrimSpace(value)
+		ip := net.ParseIP(value)
+		if ip != nil && ip.To4() != nil {
+			continue
+		}
+		parsed, _, err := net.ParseCIDR(value)
+		if err != nil || parsed.To4() == nil {
+			return fmt.Errorf("访问控制地址 %q 不是有效的 IPv4 或 CIDR", value)
+		}
+	}
+	if len(r.AccessPolicy.AllowRegions) > 100 || len(r.AccessPolicy.DenyRegions) > 100 {
+		return errors.New("每条规则最多选择 100 个省市区域")
+	}
+	for _, value := range []int{r.AccessPolicy.MaxTCPConnectionsPerIP, r.AccessPolicy.MaxTCPNewConnectionsMinute, r.AccessPolicy.MaxUDPNewFlowsMinute} {
+		if value < 0 || value > 100000 {
+			return errors.New("连接限制必须位于 0–100000，0 表示不限制")
+		}
 	}
 	return nil
 }

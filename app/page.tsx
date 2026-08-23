@@ -5,6 +5,16 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 type NodeRole = "ingress" | "egress" | "both";
 type Mode = "dual_managed" | "exit_only";
 type Engine = "nftables" | "realm";
+type AccessPolicy = {
+  enabled: boolean;
+  allow_cidrs?: string[];
+  deny_cidrs?: string[];
+  allow_regions?: string[];
+  deny_regions?: string[];
+  max_tcp_connections_per_ip?: number;
+  max_tcp_new_connections_per_minute?: number;
+  max_udp_new_flows_per_minute?: number;
+};
 type Node = {
   id: string;
   name: string;
@@ -64,6 +74,7 @@ type Rule = {
   upload_mbps: number;
   download_mbps: number;
   burst_kbytes: number;
+  access_policy: AccessPolicy;
   enabled: boolean;
 };
 type Point = { bucket: string; upload_bytes: number; download_bytes: number };
@@ -159,6 +170,38 @@ type TargetProbe = {
   tcp_latency_ms: number;
   tcp_error?: string;
   checked_at: string;
+};
+type ConnectionSource = {
+  rule_id: string;
+  node_id: string;
+  source_ip: string;
+  tcp_connections: number;
+  udp_sessions: number;
+  captured_at: string;
+  last_seen_at: string;
+  country?: string;
+  province?: string;
+  city?: string;
+  isp?: string;
+};
+type ConnectionStatus = {
+  node_id: string;
+  available: boolean;
+  error?: string;
+  captured_at: string;
+  total_tcp_connections: number;
+  total_udp_sessions: number;
+};
+type ConnectionsResponse = {
+  sources: ConnectionSource[];
+  statuses: ConnectionStatus[];
+};
+type GeoRegion = { province: string; cities: string[] };
+type GeoStatus = {
+  ready: boolean;
+  ranges: number;
+  updated_at?: string;
+  regions: GeoRegion[];
 };
 type ConfigBackup = {
   format: string;
@@ -301,6 +344,16 @@ const demoRules: Rule[] = [
     upload_mbps: 30,
     download_mbps: 100,
     burst_kbytes: 512,
+    access_policy: {
+      enabled: true,
+      allow_cidrs: ["203.0.113.8"],
+      deny_cidrs: [],
+      allow_regions: ["广东省"],
+      deny_regions: [],
+      max_tcp_connections_per_ip: 20,
+      max_tcp_new_connections_per_minute: 60,
+      max_udp_new_flows_per_minute: 120,
+    },
     enabled: true,
   },
   {
@@ -323,9 +376,67 @@ const demoRules: Rule[] = [
     upload_mbps: 10,
     download_mbps: 40,
     burst_kbytes: 256,
+    access_policy: { enabled: false },
     enabled: true,
   },
 ];
+const demoConnections: ConnectionsResponse = {
+  statuses: demoNodes.map((node) => ({
+    node_id: node.id,
+    available: node.status === "online",
+    captured_at: new Date().toISOString(),
+    total_tcp_connections: node.id === "in-gz" ? 31 : 18,
+    total_udp_sessions: node.id === "in-gz" ? 8 : 4,
+  })),
+  sources: [
+    {
+      rule_id: "r1",
+      node_id: "in-gz",
+      source_ip: "203.0.113.8",
+      tcp_connections: 12,
+      udp_sessions: 5,
+      country: "中国",
+      province: "广东省",
+      city: "深圳市",
+      isp: "电信",
+      captured_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+    },
+    {
+      rule_id: "r1",
+      node_id: "in-gz",
+      source_ip: "203.0.113.9",
+      tcp_connections: 3,
+      udp_sessions: 1,
+      country: "中国",
+      province: "广东省",
+      city: "广州市",
+      isp: "联通",
+      captured_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+    },
+    {
+      rule_id: "r2",
+      node_id: "out-hkg",
+      source_ip: "10.24.0.2",
+      tcp_connections: 2,
+      udp_sessions: 0,
+      captured_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+    },
+  ],
+};
+const demoGeoStatus: GeoStatus = {
+  ready: true,
+  ranges: 486321,
+  updated_at: new Date().toISOString(),
+  regions: [
+    { province: "广东省", cities: ["广州市", "深圳市", "东莞市"] },
+    { province: "北京市", cities: ["北京市"] },
+    { province: "上海市", cities: ["上海市"] },
+    { province: "浙江省", cities: ["杭州市", "宁波市"] },
+  ],
+};
 const demoTargetProbes: TargetProbe[] = [
   {
     rule_id: "r1",
@@ -445,6 +556,16 @@ const blankLine = {
   ingress_engine: "nftables" as Engine,
   egress_engine: "nftables" as Engine,
   enabled: true,
+};
+const blankAccessPolicy: AccessPolicy = {
+  enabled: false,
+  allow_cidrs: [],
+  deny_cidrs: [],
+  allow_regions: [],
+  deny_regions: [],
+  max_tcp_connections_per_ip: 0,
+  max_tcp_new_connections_per_minute: 0,
+  max_udp_new_flows_per_minute: 0,
 };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -665,6 +786,15 @@ export default function Home() {
   const [nodeTraffic, setNodeTraffic] = useState<NodeTraffic[]>([]);
   const [probes, setProbes] = useState<LinkProbe[]>([]);
   const [targetProbes, setTargetProbes] = useState<TargetProbe[]>([]);
+  const [connections, setConnections] = useState<ConnectionsResponse>({
+    sources: [],
+    statuses: [],
+  });
+  const [geoStatus, setGeoStatus] = useState<GeoStatus>({
+    ready: false,
+    ranges: 0,
+    regions: [],
+  });
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
   const [nodeModal, setNodeModal] = useState(false),
@@ -675,6 +805,7 @@ export default function Home() {
     [editingLine, setEditingLine] = useState<Line | null>(null),
     [editingRule, setEditingRule] = useState<Rule | null>(null),
     [preferredLine, setPreferredLine] = useState("");
+  const [accessRule, setAccessRule] = useState<Rule | null>(null);
   const [updateNode, setUpdateNode] = useState<Node | null>(null);
   const [credential, setCredential] = useState<{
     nodeId: string;
@@ -709,7 +840,7 @@ export default function Home() {
     setAuthenticated(true);
     setDemo(false);
     try {
-      const [n, l, r, s, t, rt, nt, p, tp] = await Promise.all([
+      const [n, l, r, s, t, rt, nt, p, tp, cn, geo] = await Promise.all([
         api<Node[]>("/api/v1/nodes"),
         api<Line[]>("/api/v1/lines"),
         api<Rule[]>("/api/v1/rules"),
@@ -719,6 +850,8 @@ export default function Home() {
         api<NodeTraffic[]>("/api/v1/traffic/nodes"),
         api<LinkProbe[]>("/api/v1/probes"),
         api<TargetProbe[]>("/api/v1/target-probes"),
+        api<ConnectionsResponse>("/api/v1/connections"),
+        api<GeoStatus>("/api/v1/geo/status"),
       ]);
       setNodes(asArray(n));
       setLines(asArray(l));
@@ -729,6 +862,11 @@ export default function Home() {
       setNodeTraffic(asArray(nt));
       setProbes(asArray(p));
       setTargetProbes(asArray(tp));
+      setConnections({
+        sources: asArray(cn.sources),
+        statuses: asArray(cn.statuses),
+      });
+      setGeoStatus({ ...geo, regions: asArray(geo.regions) });
       setError("");
     } catch (e) {
       setError(`控制台数据加载失败：${(e as Error).message}`);
@@ -771,8 +909,17 @@ export default function Home() {
   useEffect(() => {
     if (!authenticated || demo || view !== "nodes") return;
     const update = () =>
-      void api<Node[]>("/api/v1/nodes")
-        .then((value) => setNodes(asArray(value)))
+      void Promise.all([
+        api<Node[]>("/api/v1/nodes"),
+        api<ConnectionsResponse>("/api/v1/connections"),
+      ])
+        .then(([value, connectionValue]) => {
+          setNodes(asArray(value));
+          setConnections({
+            sources: asArray(connectionValue.sources),
+            statuses: asArray(connectionValue.statuses),
+          });
+        })
         .catch(() => {});
     update();
     const timer = window.setInterval(update, 5000);
@@ -802,10 +949,15 @@ export default function Home() {
       void Promise.all([
         api<RuleTraffic[]>("/api/v1/traffic/rules"),
         api<TargetProbe[]>("/api/v1/target-probes"),
+        api<ConnectionsResponse>("/api/v1/connections"),
       ])
-        .then(([rt, tp]) => {
+        .then(([rt, tp, cn]) => {
           setRuleTraffic(asArray(rt));
           setTargetProbes(asArray(tp));
+          setConnections({
+            sources: asArray(cn.sources),
+            statuses: asArray(cn.statuses),
+          });
         })
         .catch(() => {});
     update();
@@ -821,6 +973,8 @@ export default function Home() {
     setRuleTraffic(demoRuleTraffic);
     setProbes(demoProbes);
     setTargetProbes(demoTargetProbes);
+    setConnections(demoConnections);
+    setGeoStatus(demoGeoStatus);
     setAuthenticated(true);
     setDemo(true);
   };
@@ -967,6 +1121,7 @@ export default function Home() {
           <Nodes
             nodes={nodes}
             traffic={nodeTraffic}
+            connections={connections}
             onAdd={() => {
               setEditingNode(null);
               setNodeModal(true);
@@ -1032,7 +1187,9 @@ export default function Home() {
             rules={rules}
             traffic={ruleTraffic}
             targetProbes={targetProbes}
+            connections={connections}
             onTraffic={setTrafficRule}
+            onAccess={setAccessRule}
             onAdd={openRule}
             onBatch={(lineID) => {
               setPreferredLine(lineID);
@@ -1087,6 +1244,8 @@ export default function Home() {
         {view === "settings" && (
           <Settings
             demo={demo}
+            geoStatus={geoStatus}
+            onGeoUpdated={setGeoStatus}
             onConfigImported={refresh}
             onPasswordChanged={() => {
               setLoginNotice("管理员密码已修改，请使用新密码重新登录。");
@@ -1338,6 +1497,43 @@ export default function Home() {
           onClose={() => setTrafficRule(null)}
         />
       )}
+      {accessRule && (
+        <RuleAccessModal
+          rule={accessRule}
+          sources={connections.sources.filter(
+            (source) => source.rule_id === accessRule.id,
+          )}
+          status={connections.statuses.find(
+            (item) =>
+              item.node_id ===
+              (accessRule.mode === "exit_only"
+                ? accessRule.egress_node_id
+                : accessRule.ingress_node_id),
+          )}
+          geoStatus={geoStatus}
+          demo={demo}
+          onClose={() => setAccessRule(null)}
+          onSave={async (policy) => {
+            if (demo) {
+              setRules((current) =>
+                current.map((item) =>
+                  item.id === accessRule.id
+                    ? { ...item, access_policy: policy }
+                    : item,
+                ),
+              );
+              setAccessRule({ ...accessRule, access_policy: policy });
+              return;
+            }
+            await api(`/api/v1/rules/${accessRule.id}`, {
+              method: "PUT",
+              body: JSON.stringify({ ...accessRule, access_policy: policy }),
+            });
+            await refresh();
+            setAccessRule(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1435,6 +1631,27 @@ function BarChartIcon() {
       />
       <path
         d="M3 20h18"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+function AccessIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M12 3 5.5 5.7v5.5c0 4.2 2.6 7.7 6.5 9.8 3.9-2.1 6.5-5.6 6.5-9.8V5.7L12 3Z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="10" r="2.2" fill="currentColor" />
+      <path
+        d="M8.8 16c.6-1.7 1.7-2.6 3.2-2.6s2.6.9 3.2 2.6"
         fill="none"
         stroke="currentColor"
         strokeWidth="1.5"
@@ -1944,6 +2161,7 @@ function TrafficChart({ points }: { points: Point[] | null | undefined }) {
 function Nodes({
   nodes,
   traffic,
+  connections,
   onAdd,
   onEdit,
   onUpdate,
@@ -1952,6 +2170,7 @@ function Nodes({
 }: {
   nodes: Node[];
   traffic: NodeTraffic[];
+  connections: ConnectionsResponse;
   onAdd: () => void;
   onEdit: (n: Node) => void;
   onUpdate: (n: Node) => void;
@@ -1990,7 +2209,11 @@ function Nodes({
           </button>
         </div>
         <div className="node-cards">
-          {nodes.map((n, index) => (
+          {nodes.map((n, index) => {
+            const connectionStatus = connections.statuses.find(
+                (status) => status.node_id === n.id,
+              );
+            return (
             <article
               key={n.id}
               className={n.apply_status === "failed" ? "apply-failed" : ""}
@@ -2045,6 +2268,14 @@ function Nodes({
                     <dd>{n.default_relay_port_range || "不限制"}</dd>
                   </div>
                 )}
+                <div>
+                  <dt>整机连接</dt>
+                  <dd>
+                    {connectionStatus?.available
+                      ? `TCP ${connectionStatus.total_tcp_connections || 0} · UDP ${connectionStatus.total_udp_sessions || 0}`
+                      : "等待连接采集"}
+                  </dd>
+                </div>
               </dl>
               <NodeQuota
                 node={n}
@@ -2084,7 +2315,8 @@ function Nodes({
                 </button>
               </div>
             </article>
-          ))}
+            );
+          })}
         </div>
         {!nodes.length && (
           <Empty
@@ -2266,7 +2498,9 @@ function Rules({
   rules,
   traffic,
   targetProbes,
+  connections,
   onTraffic,
+  onAccess,
   onAdd,
   onBatch,
   onEdit,
@@ -2279,7 +2513,9 @@ function Rules({
   rules: Rule[];
   traffic: RuleTraffic[];
   targetProbes: TargetProbe[];
+  connections: ConnectionsResponse;
   onTraffic: (r: Rule) => void;
+  onAccess: (r: Rule) => void;
   onAdd: (id?: string) => void;
   onBatch: (id: string) => void;
   onEdit: (r: Rule) => void;
@@ -2341,7 +2577,9 @@ function Rules({
               lines={lines}
               traffic={traffic}
               targetProbes={targetProbes}
+              connections={connections}
               onTraffic={onTraffic}
+              onAccess={onAccess}
               onEdit={onEdit}
               onMove={onMove}
               onToggle={onToggle}
@@ -2366,7 +2604,9 @@ function Rules({
             lines={lines}
             traffic={traffic}
             targetProbes={targetProbes}
+            connections={connections}
             onTraffic={onTraffic}
+            onAccess={onAccess}
             onEdit={onEdit}
             onMove={onMove}
             onToggle={onToggle}
@@ -2389,7 +2629,9 @@ function RuleTable({
   lines,
   traffic,
   targetProbes,
+  connections,
   onTraffic,
+  onAccess,
   onEdit,
   onMove,
   onToggle,
@@ -2399,7 +2641,9 @@ function RuleTable({
   lines: Line[];
   traffic: RuleTraffic[];
   targetProbes: TargetProbe[];
+  connections: ConnectionsResponse;
   onTraffic: (r: Rule) => void;
+  onAccess: (r: Rule) => void;
   onEdit: (r: Rule) => void;
   onMove: (r: Rule, direction: MoveDirection) => void;
   onToggle: (r: Rule) => void;
@@ -2414,11 +2658,28 @@ function RuleTable({
         <span>业务健康</span>
         <span>规则流量</span>
         <span>限速</span>
+        <span>实时连接</span>
         <span>状态</span>
         <span />
       </div>
       {rules.map((r, index) => {
         const t = traffic.find((item) => item.rule_id === r.id);
+        const ruleSources = connections.sources.filter(
+          (source) => source.rule_id === r.id,
+        );
+        const tcpConnections = ruleSources.reduce(
+          (sum, source) => sum + source.tcp_connections,
+          0,
+        );
+        const udpSessions = ruleSources.reduce(
+          (sum, source) => sum + source.udp_sessions,
+          0,
+        );
+        const connectionNodeID =
+          r.mode === "exit_only" ? r.egress_node_id : r.ingress_node_id;
+        const connectionStatus = connections.statuses.find(
+          (status) => status.node_id === connectionNodeID,
+        );
         const limits = t?.rate_limits || [];
         const expectsLimit = r.upload_mbps > 0 || r.download_mbps > 0;
         const limitFailed = limits.some((item) => !item.installed);
@@ -2507,7 +2768,7 @@ function RuleTable({
               <small>
                 {p
                   ? `检查于 ${probeCheckedTime(p.checked_at)}（北京时间）`
-                  : "通常 10–20 秒内上报"}
+                  : "出口默认每 60 秒探测一次"}
               </small>
             </span>
             <span className="rule-traffic">
@@ -2528,6 +2789,17 @@ function RuleTable({
               <b>↓ {r.download_mbps || "∞"} Mbps</b>
               <small>↑ {r.upload_mbps || "∞"} Mbps</small>
               <small>{limitNote}</small>
+            </span>
+            <span className="connection-summary">
+              <button type="button" onClick={() => onAccess(r)}>
+                <b>TCP {tcpConnections}</b>
+                <small>UDP {udpSessions} · {ruleSources.length} 个来源</small>
+                <em>
+                  {connectionStatus?.available
+                    ? "查看访问详情"
+                    : connectionStatus?.error || "等待 Agent 采集"}
+                </em>
+              </button>
             </span>
             <span>
               <button
@@ -2567,12 +2839,20 @@ function RuleTable({
                 ✎
               </button>
               <button
-                className="icon-button"
+                className="icon-button traffic-icon-button"
                 title="查看流量详情"
                 aria-label="查看流量详情"
                 onClick={() => onTraffic(r)}
               >
-                ▥
+                <BarChartIcon />
+              </button>
+              <button
+                className="icon-button access-icon-button"
+                title="查看访问 IP 与连接限制"
+                aria-label="查看访问 IP 与连接限制"
+                onClick={() => onAccess(r)}
+              >
+                <AccessIcon />
               </button>
               <button
                 className="icon-button danger"
@@ -2829,8 +3109,7 @@ function NodeTrafficPanel({
         <span className="tag">每 10 秒刷新</span>
       </div>
       <p className="traffic-explain">
-        这里统计指定网卡的 RX /
-        TX，包含该服务器上的其他网络流量；它用于流量包阈值和出口自动切换，不与单条转发规则流量合并。
+        这里统计指定网卡的下载与上传，包含该服务器上的其他网络流量；它用于流量包阈值和出口自动切换，不与单条转发规则流量合并。
       </p>
       <div className="node-traffic-grid">
         {nodes.map((node) => {
@@ -2860,7 +3139,7 @@ function NodeTrafficPanel({
               <div className="quota-meter">
                 <i style={{ width: `${enabled ? percent : 0}%` }} />
               </div>
-              <dl>
+              <dl className="node-traffic-metrics">
                 <div>
                   <dt>本周期计费量</dt>
                   <dd>{bytes(item?.billable_bytes || 0)}</dd>
@@ -2869,17 +3148,34 @@ function NodeTrafficPanel({
                   <dt>剩余</dt>
                   <dd>{enabled ? bytes(item?.remaining_bytes || 0) : "—"}</dd>
                 </div>
-                <div>
-                  <dt>RX / TX</dt>
-                  <dd>
-                    {bytes(item?.rx_bytes || 0)} / {bytes(item?.tx_bytes || 0)}
+                <div className="node-traffic-pair">
+                  <dt>本周期流量</dt>
+                  <dd className="direction-values">
+                    <span className="download">
+                      <i aria-hidden="true">↓</i>
+                      <em>下载</em>
+                      <b>{bytes(item?.rx_bytes || 0)}</b>
+                    </span>
+                    <span className="upload">
+                      <i aria-hidden="true">↑</i>
+                      <em>上传</em>
+                      <b>{bytes(item?.tx_bytes || 0)}</b>
+                    </span>
                   </dd>
                 </div>
-                <div>
-                  <dt>实时 RX / TX</dt>
-                  <dd>
-                    {speed(item?.rx_bytes_per_second || 0)} /{" "}
-                    {speed(item?.tx_bytes_per_second || 0)}
+                <div className="node-traffic-pair">
+                  <dt>当前速率</dt>
+                  <dd className="direction-values">
+                    <span className="download">
+                      <i aria-hidden="true">↓</i>
+                      <em>下载</em>
+                      <b>{speed(item?.rx_bytes_per_second || 0)}</b>
+                    </span>
+                    <span className="upload">
+                      <i aria-hidden="true">↑</i>
+                      <em>上传</em>
+                      <b>{speed(item?.tx_bytes_per_second || 0)}</b>
+                    </span>
                   </dd>
                 </div>
               </dl>
@@ -2898,10 +3194,14 @@ function NodeTrafficPanel({
 
 function Settings({
   demo,
+  geoStatus,
+  onGeoUpdated,
   onPasswordChanged,
   onConfigImported,
 }: {
   demo: boolean;
+  geoStatus: GeoStatus;
+  onGeoUpdated: (status: GeoStatus) => void;
   onPasswordChanged: () => void;
   onConfigImported: () => Promise<void>;
 }) {
@@ -2912,8 +3212,12 @@ function Settings({
     [busy, setBusy] = useState(false),
     [configBusy, setConfigBusy] = useState(false),
     [configNotice, setConfigNotice] = useState(""),
-    [configError, setConfigError] = useState("");
+    [configError, setConfigError] = useState(""),
+    [geoBusy, setGeoBusy] = useState(false),
+    [geoNotice, setGeoNotice] = useState(""),
+    [geoError, setGeoError] = useState("");
   const configInput = useRef<HTMLInputElement>(null);
+  const geoInput = useRef<HTMLInputElement>(null);
   const updateCommand =
     "curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh | sudo bash";
   async function changePassword(e: FormEvent) {
@@ -2967,7 +3271,7 @@ function Settings({
         ]);
         const backup: ConfigBackup = {
           format: "relay-panel-configuration",
-          schema_version: 2,
+          schema_version: 3,
           exported_at: new Date().toISOString(),
           required_nodes: demoNodes
             .filter((node) => ids.has(node.id))
@@ -3056,6 +3360,43 @@ function Settings({
     } finally {
       setConfigBusy(false);
       if (configInput.current) configInput.current.value = "";
+    }
+  }
+  async function importGeo(file: File) {
+    setGeoBusy(true);
+    setGeoNotice("");
+    setGeoError("");
+    try {
+      if (file.size > 64 * 1024 * 1024)
+        throw new Error("IP 地区库不能超过 64 MB");
+      if (demo) {
+        setGeoNotice(`预览模式已读取 ${file.name}，不会写入数据库。`);
+        return;
+      }
+      const response = await fetch("/api/v1/geo/import", {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+        body: await file.text(),
+      });
+      if (!response.ok) {
+        let message = `导入失败 (${response.status})`;
+        try {
+          message = (await response.json()).error || message;
+        } catch {
+          /* non-JSON */
+        }
+        throw new Error(message);
+      }
+      const status = (await response.json()) as GeoStatus;
+      onGeoUpdated({ ...status, regions: asArray(status.regions) });
+      setGeoNotice(`地区库更新完成，共导入 ${status.ranges.toLocaleString()} 个网段。`);
+    } catch (importError) {
+      setGeoError((importError as Error).message);
+    } finally {
+      setGeoBusy(false);
+      if (geoInput.current) geoInput.current.value = "";
     }
   }
   return (
@@ -3197,7 +3538,427 @@ function Settings({
           的服务器必须仍在面板中；缺失服务器或端口冲突会在写入前拦截。
         </small>
       </section>
+      <section className="settings-card geo-card">
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">访问来源识别</p>
+            <h3>IP 省市数据库</h3>
+          </div>
+          <span className={`settings-icon ${geoStatus.ready ? "ready" : ""}`}>◎</span>
+        </div>
+        <p>
+          用于来源 IP 的省市、运营商展示和规则地域限制。原始数据库只保存在主控，不会完整下发到被控机。
+        </p>
+        <div className="geo-status-grid">
+          <span>
+            <small>状态</small>
+            <b>{geoStatus.ready ? "可用" : "未导入"}</b>
+          </span>
+          <span>
+            <small>IPv4 网段</small>
+            <b>{geoStatus.ranges.toLocaleString()}</b>
+          </span>
+          <span>
+            <small>省级区域</small>
+            <b>{geoStatus.regions.length}</b>
+          </span>
+          <span>
+            <small>更新时间</small>
+            <b>{geoStatus.updated_at ? probeCheckedTime(geoStatus.updated_at) : "—"}</b>
+          </span>
+        </div>
+        <div className="update-points">
+          <span>✓ 支持 ip2region 的 ip.merge.txt</span>
+          <span>✓ 支持 CIDR,start/end 的 CSV、Tab 或竖线分隔文本</span>
+          <span>✓ 新数据库原子替换，并自动重新下发地区策略</span>
+        </div>
+        {geoNotice && <div className="success-notice">{geoNotice}</div>}
+        {geoError && <div className="form-error">{geoError}</div>}
+        <div className="config-actions">
+          <button
+            type="button"
+            className="primary"
+            disabled={geoBusy}
+            onClick={() => geoInput.current?.click()}
+          >
+            {geoBusy ? "正在导入…" : geoStatus.ready ? "更新地区库" : "导入地区库"}
+          </button>
+          <input
+            ref={geoInput}
+            className="config-input"
+            type="file"
+            accept=".txt,.csv,text/plain,text/csv"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void importGeo(file);
+            }}
+          />
+        </div>
+        <small className="settings-hint">
+          建议按月更新。数据库不准确时，应优先使用手工 IP/CIDR 白名单避免误封。
+        </small>
+      </section>
     </div>
+  );
+}
+function RegionSelector({
+  label,
+  values,
+  regions,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  values: string[];
+  regions: GeoRegion[];
+  disabled?: boolean;
+  onChange: (values: string[]) => void;
+}) {
+  const add = (value: string) => {
+    if (value && !values.includes(value)) onChange([...values, value]);
+  };
+  return (
+    <div className="region-selector">
+      <label>
+        {label}
+        <select
+          disabled={disabled}
+          value=""
+          onChange={(event) => add(event.target.value)}
+        >
+          <option value="">选择省份或城市…</option>
+          {regions.map((region) => (
+            <optgroup key={region.province} label={region.province}>
+              <option value={region.province}>整个{region.province}</option>
+              {region.cities.map((city) => (
+                <option
+                  key={`${region.province}/${city}`}
+                  value={`${region.province}/${city}`}
+                >
+                  {city}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+      </label>
+      <div className="region-chips">
+        {values.map((value) => (
+          <button
+            type="button"
+            key={value}
+            onClick={() => onChange(values.filter((item) => item !== value))}
+            title={`移除 ${value}`}
+          >
+            {value.replace("/", " · ")} <span>×</span>
+          </button>
+        ))}
+        {!values.length && <small>未选择</small>}
+      </div>
+    </div>
+  );
+}
+
+function RuleAccessModal({
+  rule,
+  sources,
+  status,
+  geoStatus,
+  demo,
+  onClose,
+  onSave,
+}: {
+  rule: Rule;
+  sources: ConnectionSource[];
+  status?: ConnectionStatus;
+  geoStatus: GeoStatus;
+  demo: boolean;
+  onClose: () => void;
+  onSave: (policy: AccessPolicy) => Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
+  const [policy, setPolicy] = useState<AccessPolicy>({
+    ...blankAccessPolicy,
+    ...(rule.access_policy || {}),
+    allow_cidrs: [...(rule.access_policy?.allow_cidrs || [])],
+    deny_cidrs: [...(rule.access_policy?.deny_cidrs || [])],
+    allow_regions: [...(rule.access_policy?.allow_regions || [])],
+    deny_regions: [...(rule.access_policy?.deny_regions || [])],
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const activeTCP = sources.reduce(
+      (sum, source) => sum + source.tcp_connections,
+      0,
+    ),
+    activeUDP = sources.reduce((sum, source) => sum + source.udp_sessions, 0),
+    activeSources = sources.filter(
+      (source) => source.tcp_connections > 0 || source.udp_sessions > 0,
+    ).length,
+    limitsEnabled = Boolean(
+      policy.max_tcp_connections_per_ip ||
+        policy.max_tcp_new_connections_per_minute ||
+        policy.max_udp_new_flows_per_minute,
+    );
+  const visibleSources = sources.filter((source) => {
+    const location = [
+      source.source_ip,
+      source.country,
+      source.province,
+      source.city,
+      source.isp,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return !query || location.includes(query.toLowerCase());
+  });
+  const setList = (
+    key: "allow_cidrs" | "deny_cidrs",
+    value: string,
+  ) =>
+    setPolicy((current) => ({
+      ...current,
+      [key]: value
+        .split(/[\n,]/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    }));
+  return (
+    <Modal title={`访问详情 · ${rule.name}`} kicker="来源 IP 与连接保护" onClose={onClose}>
+      <div className="access-modal">
+        <div className="access-summary-grid">
+          <article>
+            <span>TCP 当前连接</span>
+            <b>{activeTCP}</b>
+          </article>
+          <article>
+            <span>UDP 当前会话</span>
+            <b>{activeUDP}</b>
+          </article>
+          <article>
+            <span>活动来源 IP</span>
+            <b>{activeSources}</b>
+          </article>
+        </div>
+        <div className={`collector-state ${status?.available ? "ready" : "warn"}`}>
+          <span />
+          <div>
+            <b>{status?.available ? "入口连接采集正常" : "连接数据暂不可用"}</b>
+            <small>
+              {status?.available
+                ? `更新于 ${probeCheckedTime(status.captured_at)}（北京时间）`
+                : status?.error || "等待新版 Agent 上报连接跟踪信息"}
+            </small>
+          </div>
+        </div>
+        {rule.mode === "exit_only" && (
+          <div className="access-note">
+            仅出口接管只能看到上游入口 IP；如果上游执行了 NAT，无法还原真实客户端来源。
+          </div>
+        )}
+        <section className="access-section">
+          <div className="access-section-head">
+            <div>
+              <p className="eyebrow">最近 7 天见过的来源</p>
+              <h3>访问 IP</h3>
+            </div>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索 IP、省市或运营商"
+            />
+          </div>
+          <div className="source-table">
+            <div className="source-row labels">
+              <span>来源 IP</span>
+              <span>位置与运营商</span>
+              <span>TCP</span>
+              <span>UDP 会话</span>
+              <span>最后活动</span>
+            </div>
+            {visibleSources.map((source) => (
+              <div className="source-row" key={`${source.node_id}-${source.source_ip}`}>
+                <span data-label="来源 IP"><b>{source.source_ip}</b></span>
+                <span data-label="位置与运营商">
+                  <b>
+                    {[source.province, source.city].filter(Boolean).join(" · ") ||
+                      "地区未知"}
+                  </b>
+                  <small>{source.isp || source.country || "—"}</small>
+                </span>
+                <span data-label="TCP"><b>{source.tcp_connections}</b></span>
+                <span data-label="UDP 会话"><b>{source.udp_sessions}</b></span>
+                <span data-label="最后活动">
+                  <small>{probeCheckedTime(source.last_seen_at)}</small>
+                </span>
+              </div>
+            ))}
+            {!visibleSources.length && (
+              <div className="source-empty">当前筛选条件下没有来源 IP</div>
+            )}
+          </div>
+        </section>
+        <details className="access-policy-panel" open>
+          <summary>
+            <span>
+              <b>访问控制与连接限制</b>
+              <small>默认关闭；保存后只下发到该规则的客户端接入端</small>
+            </span>
+            <em>
+              {policy.enabled
+                ? limitsEnabled
+                  ? "访问控制与连接限制已启用"
+                  : "地域/IP 已启用"
+                : limitsEnabled
+                  ? "仅连接限制已启用"
+                  : "尚未启用"}
+            </em>
+          </summary>
+          <div className="access-policy-body">
+            <div className="access-toggle">
+              <input
+                id={`access-enabled-${rule.id}`}
+                type="checkbox"
+                checked={Boolean(policy.enabled)}
+                onChange={(event) =>
+                  setPolicy({ ...policy, enabled: event.target.checked })
+                }
+              />
+              <label htmlFor={`access-enabled-${rule.id}`}>
+                <b>启用 IP 与地区访问控制</b>
+                <small>
+                  {rule.ingress_engine === "realm"
+                    ? "开启后由 nftables 先过滤，再交给 Realm；关闭后恢复纯 Realm 接入。"
+                    : "直接在现有 nftables 转发链前完成过滤。"}
+                </small>
+              </label>
+            </div>
+            <div className="access-policy-grid">
+              <label>
+                IP/CIDR 白名单
+                <textarea
+                  value={(policy.allow_cidrs || []).join("\n")}
+                  onChange={(event) => setList("allow_cidrs", event.target.value)}
+                  placeholder={"每行一个，例如：\n203.0.113.8\n198.51.100.0/24"}
+                />
+                <small>白名单优先，会绕过地区、黑名单和连接限制。</small>
+              </label>
+              <label>
+                IP/CIDR 黑名单
+                <textarea
+                  value={(policy.deny_cidrs || []).join("\n")}
+                  onChange={(event) => setList("deny_cidrs", event.target.value)}
+                  placeholder={"每行一个，例如：\n192.0.2.9\n203.0.113.0/28"}
+                />
+                <small>匹配后直接在入口内核丢弃。</small>
+              </label>
+            </div>
+            {!geoStatus.ready && (
+              <div className="access-note warn">
+                主控尚未导入 IP 地区库。可先使用 IP/CIDR 策略，省市选项会在导入后开放。
+              </div>
+            )}
+            <div className="access-policy-grid">
+              <RegionSelector
+                label="只允许这些省市"
+                values={policy.allow_regions || []}
+                regions={geoStatus.regions}
+                disabled={!geoStatus.ready}
+                onChange={(values) =>
+                  setPolicy({ ...policy, allow_regions: values })
+                }
+              />
+              <RegionSelector
+                label="禁止这些省市"
+                values={policy.deny_regions || []}
+                regions={geoStatus.regions}
+                disabled={!geoStatus.ready}
+                onChange={(values) =>
+                  setPolicy({ ...policy, deny_regions: values })
+                }
+              />
+            </div>
+            <div className="connection-limit-grid">
+              <label>
+                单 IP 最大 TCP 并发
+                <input
+                  type="number"
+                  min="0"
+                  max="100000"
+                  value={policy.max_tcp_connections_per_ip || 0}
+                  onChange={(event) =>
+                    setPolicy({
+                      ...policy,
+                      max_tcp_connections_per_ip: Number(event.target.value),
+                    })
+                  }
+                />
+                <small>0 表示不限</small>
+              </label>
+              <label>
+                单 IP 每分钟新建 TCP
+                <input
+                  type="number"
+                  min="0"
+                  max="100000"
+                  value={policy.max_tcp_new_connections_per_minute || 0}
+                  onChange={(event) =>
+                    setPolicy({
+                      ...policy,
+                      max_tcp_new_connections_per_minute: Number(
+                        event.target.value,
+                      ),
+                    })
+                  }
+                />
+                <small>0 表示不限</small>
+              </label>
+              <label>
+                单 IP 每分钟新建 UDP 会话
+                <input
+                  type="number"
+                  min="0"
+                  max="100000"
+                  value={policy.max_udp_new_flows_per_minute || 0}
+                  onChange={(event) =>
+                    setPolicy({
+                      ...policy,
+                      max_udp_new_flows_per_minute: Number(event.target.value),
+                    })
+                  }
+                />
+                <small>UDP 为 conntrack 会话，0 表示不限</small>
+              </label>
+            </div>
+            {error && <div className="form-error">{error}</div>}
+            <div className="access-save-row">
+              <small>
+                地区库只保存在主控；Agent 仅接收当前规则需要的压缩网段集合。
+              </small>
+              <button
+                type="button"
+                className="primary"
+                disabled={saving}
+                onClick={async () => {
+                  setSaving(true);
+                  setError("");
+                  try {
+                    await onSave(policy);
+                  } catch (saveError) {
+                    setError((saveError as Error).message);
+                  } finally {
+                    setSaving(false);
+                  }
+                }}
+              >
+                {saving ? "保存并下发中…" : demo ? "应用预览配置" : "保存并重新下发"}
+              </button>
+            </div>
+          </div>
+        </details>
+      </div>
+    </Modal>
   );
 }
 function RuleTrafficModal({
@@ -3500,9 +4261,9 @@ function NodeModal({
                 value={n.traffic_quota_mode}
                 onChange={field("traffic_quota_mode")}
               >
-                <option value="sum">双向合计（RX + TX）</option>
-                <option value="rx">仅 RX</option>
-                <option value="tx">仅 TX</option>
+                <option value="sum">上传与下载合计</option>
+                <option value="rx">仅计算下载</option>
+                <option value="tx">仅计算上传</option>
               </select>
             </label>
             <label>
@@ -4070,6 +4831,7 @@ type RuleDraft = {
   upload_mbps: number;
   download_mbps: number;
   burst_kbytes: number;
+  access_policy: AccessPolicy;
   enabled: boolean;
 };
 function RuleBatchModal({
@@ -4288,6 +5050,7 @@ function RuleModal({
           upload_mbps: initial.upload_mbps,
           download_mbps: initial.download_mbps,
           burst_kbytes: initial.burst_kbytes,
+          access_policy: initial.access_policy || { ...blankAccessPolicy },
           enabled: initial.enabled,
         }
       : {
@@ -4300,6 +5063,7 @@ function RuleModal({
           upload_mbps: 0,
           download_mbps: 0,
           burst_kbytes: 512,
+          access_policy: { ...blankAccessPolicy },
           enabled: true,
         },
   );

@@ -198,10 +198,12 @@ read_agent_value() {
   fi
 }
 agent_info() {
-  local token_state
+  local token_state target_probe_interval
   [[ -n "$(read_agent_value token)" ]] && token_state='已配置（不会显示明文）' || token_state='缺失'
-  printf 'Node ID：%s\n主控地址：%s\n同步周期：%s\nAgent Token：%s\n配置文件：%s\n' \
-    "$(read_agent_value node_id)" "$(read_agent_value controller_url)" "$(read_agent_value sync_interval)" "${token_state}" "${agent_config}"
+  target_probe_interval="$(read_agent_value target_probe_interval)"
+  [[ -n "${target_probe_interval}" ]] || target_probe_interval='60s（默认）'
+  printf 'Node ID：%s\n主控地址：%s\n同步周期：%s\n落地探测周期：%s\nAgent Token：%s\n配置文件：%s\n' \
+    "$(read_agent_value node_id)" "$(read_agent_value controller_url)" "$(read_agent_value sync_interval)" "${target_probe_interval}" "${token_state}" "${agent_config}"
 }
 agent_environment() {
   local failed=0
@@ -217,6 +219,11 @@ agent_environment() {
     printf '%b✓%b Realm      %s\n' "${green}" "${reset}" "$(command -v realm)"
   else
     printf '%b-%b Realm      未安装（只使用 nftables 时正常）\n' "${yellow}" "${reset}"
+  fi
+  if [[ -r /proc/net/nf_conntrack || -r /proc/net/ip_conntrack ]] || command -v conntrack >/dev/null 2>&1; then
+    printf '%b✓%b 连接采集   可读取 conntrack\n' "${green}" "${reset}"
+  else
+    printf '%b-%b 连接采集   当前不可用（不影响转发）\n' "${yellow}" "${reset}"
   fi
   [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)" == '1' ]] \
     && printf '%b✓%b IPv4 转发 已开启\n' "${green}" "${reset}" \

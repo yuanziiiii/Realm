@@ -5,6 +5,7 @@
   "apply": true,
   "allow_qdisc_replace": false,
   "sync_interval": "10s",
+  "target_probe_interval": "60s",
   "state_dir": "/var/lib/relay-agent",
   "realm_binary": "/usr/local/bin/realm"
 }
