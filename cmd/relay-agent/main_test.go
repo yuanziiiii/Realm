@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,5 +38,32 @@ func TestAppliedConfigurationMatchesRevisionAndFingerprint(t *testing.T) {
 	}
 	if appliedConfigurationMatches(domain.SyncResponse{Revision: 12, ConfigHash: "new"}, &state{AppliedRevision: 12}) {
 		t.Fatal("an upgraded agent skipped the first fingerprinted configuration")
+	}
+}
+
+func TestSummarizeAccessRulesKeepsReadablePolicyWithoutExpandedRanges(t *testing.T) {
+	policy := domain.AccessPolicy{
+		Enabled: true, AllowCIDRs: []string{"203.0.113.8"}, DenyCIDRs: []string{"198.51.100.0/24"},
+		AllowRegions: []string{"广东省/广州市"}, DenyRegions: []string{"浙江省/杭州市"},
+		ResolvedAllowRanges: []string{"11.0.0.0/8"}, ResolvedDenyRanges: []string{"12.0.0.0/8"},
+		MaxTCPConnectionsPerIP: 8,
+	}
+	deployments := []domain.Deployment{
+		{Rule: domain.ForwardRule{ID: "rule_demo", Name: "游戏", ListenPort: 31259, Protocol: "both", AccessPolicy: policy}, Role: domain.NodeRoleIngress},
+		{Rule: domain.ForwardRule{ID: "rule_exit", Name: "非客户端出口", AccessPolicy: policy}, Role: domain.NodeRoleEgress},
+	}
+	got := summarizeAccessRules(deployments)
+	if len(got) != 1 {
+		t.Fatalf("expected one client-facing access summary, got %#v", got)
+	}
+	if got[0].RuleID != "rule_demo" || got[0].AllowRegions[0] != "广东省/广州市" || got[0].MaxTCPConnectionsPerIP != 8 {
+		t.Fatalf("unexpected access summary: %#v", got[0])
+	}
+	encoded, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "11.0.0.0/8") || strings.Contains(string(encoded), "12.0.0.0/8") {
+		t.Fatalf("expanded ranges leaked into the readable Agent state: %s", encoded)
 	}
 }

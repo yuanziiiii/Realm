@@ -32,6 +32,26 @@ type state struct {
 	RateLimits          []domain.RateLimitStatus  `json:"rate_limits,omitempty"`
 	NodeTraffic         *domain.NodeTrafficSample `json:"node_traffic,omitempty"`
 	Connections         *domain.ConnectionReport  `json:"connections,omitempty"`
+	AccessRules         []accessRuleSummary       `json:"access_rules,omitempty"`
+}
+
+// accessRuleSummary keeps the human-readable policy choices next to the
+// applied Agent state. Expanded region ranges deliberately stay out of this
+// structure: nftables already owns those ranges and zf only needs the original
+// province/city selections for a readable diagnostic summary.
+type accessRuleSummary struct {
+	RuleID                        string   `json:"rule_id"`
+	Name                          string   `json:"name"`
+	ListenPort                    int      `json:"listen_port"`
+	Protocol                      string   `json:"protocol"`
+	PolicyEnabled                 bool     `json:"policy_enabled"`
+	AllowCIDRs                    []string `json:"allow_cidrs,omitempty"`
+	DenyCIDRs                     []string `json:"deny_cidrs,omitempty"`
+	AllowRegions                  []string `json:"allow_regions,omitempty"`
+	DenyRegions                   []string `json:"deny_regions,omitempty"`
+	MaxTCPConnectionsPerIP        int      `json:"max_tcp_connections_per_ip,omitempty"`
+	MaxTCPNewConnectionsPerMinute int      `json:"max_tcp_new_connections_per_minute,omitempty"`
+	MaxUDPNewFlowsPerMinute       int      `json:"max_udp_new_flows_per_minute,omitempty"`
 }
 
 func main() {
@@ -91,6 +111,7 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	if err != nil {
 		return err
 	}
+	st.AccessRules = summarizeAccessRules(resp.Deployments)
 	st.TargetProbesPending = false
 	var linkProbes []domain.LinkProbe
 	var targetProbes []domain.TargetProbe
@@ -157,6 +178,29 @@ func cycle(ctx context.Context, cfg agent.Config, client *agent.Client, executor
 	st.IngressRuleIDs = plan.IngressRuleIDs
 	st.RateLimits = executor.RateLimitStatuses(ctx, resp.Node.ID)
 	return nil
+}
+
+func summarizeAccessRules(deployments []domain.Deployment) []accessRuleSummary {
+	result := make([]accessRuleSummary, 0, len(deployments))
+	for _, deployment := range deployments {
+		policy := deployment.Rule.AccessPolicy
+		clientFacing := deployment.Role == domain.NodeRoleIngress || deployment.Role == domain.NodeRoleBoth ||
+			(deployment.Rule.Mode == domain.ForwardModeExitOnly && deployment.Role == domain.NodeRoleEgress)
+		enabled := policy.Enabled || policy.MaxTCPConnectionsPerIP > 0 || policy.MaxTCPNewConnectionsMinute > 0 || policy.MaxUDPNewFlowsMinute > 0
+		if !clientFacing || !enabled {
+			continue
+		}
+		result = append(result, accessRuleSummary{
+			RuleID: deployment.Rule.ID, Name: deployment.Rule.Name, ListenPort: deployment.Rule.ListenPort,
+			Protocol: deployment.Rule.Protocol, PolicyEnabled: policy.Enabled,
+			AllowCIDRs: append([]string(nil), policy.AllowCIDRs...), DenyCIDRs: append([]string(nil), policy.DenyCIDRs...),
+			AllowRegions: append([]string(nil), policy.AllowRegions...), DenyRegions: append([]string(nil), policy.DenyRegions...),
+			MaxTCPConnectionsPerIP:        policy.MaxTCPConnectionsPerIP,
+			MaxTCPNewConnectionsPerMinute: policy.MaxTCPNewConnectionsMinute,
+			MaxUDPNewFlowsPerMinute:       policy.MaxUDPNewFlowsMinute,
+		})
+	}
+	return result
 }
 
 func appliedConfigurationMatches(resp domain.SyncResponse, st *state) bool {

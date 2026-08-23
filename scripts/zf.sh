@@ -247,6 +247,34 @@ agent_access_rule_name() {
   name="${name% upload}"
   [[ -n "${name}" ]] && printf '%s' "${name}" || printf '规则 %s' "${suffix}"
 }
+agent_access_policy_summary() {
+  local suffix="$1" state_file='/var/lib/relay-agent/state.json' summary value limit
+  [[ -r "${state_file}" ]] && command -v jq >/dev/null 2>&1 || return 1
+  summary="$(jq -c --arg rule_id "rule_${suffix}" \
+    '.access_rules[]? | select(.rule_id == $rule_id)' "${state_file}" 2>/dev/null | head -n 1)"
+  [[ -n "${summary}" ]] || return 1
+  printf '\n%b面板配置（便于阅读）%b\n' "${cyan}" "${reset}"
+  value="$(printf '%s' "${summary}" | jq -r '(.allow_regions // []) | if length == 0 then "未设置" else join("、") end')"
+  printf '  允许省市：%s\n' "${value}"
+  value="$(printf '%s' "${summary}" | jq -r '(.deny_regions // []) | if length == 0 then "未设置" else join("、") end')"
+  printf '  禁止省市：%s\n' "${value}"
+  value="$(printf '%s' "${summary}" | jq -r '(.allow_cidrs // []) | if length == 0 then "未设置" else join("、") end')"
+  printf '  IP/CIDR 白名单：%s\n' "${value}"
+  value="$(printf '%s' "${summary}" | jq -r '(.deny_cidrs // []) | if length == 0 then "未设置" else join("、") end')"
+  printf '  IP/CIDR 黑名单：%s\n' "${value}"
+  limit="$(printf '%s' "${summary}" | jq -r '.max_tcp_connections_per_ip // 0')"
+  [[ "${limit}" == '0' ]] && value='不限制' || value="每个 IP ${limit} 个"
+  printf '  TCP 同时连接：%s\n' "${value}"
+  limit="$(printf '%s' "${summary}" | jq -r '.max_tcp_new_connections_per_minute // 0')"
+  [[ "${limit}" == '0' ]] && value='不限制' || value="每个 IP 每分钟 ${limit} 个"
+  printf '  TCP 新建连接：%s\n' "${value}"
+  limit="$(printf '%s' "${summary}" | jq -r '.max_udp_new_flows_per_minute // 0')"
+  [[ "${limit}" == '0' ]] && value='不限制' || value="每个 IP 每分钟 ${limit} 个"
+  printf '  UDP 新建会话：%s\n' "${value}"
+  if [[ "$(printf '%s' "${summary}" | jq -r '(.allow_regions // []) | length')" -gt 0 ]]; then
+    printf '  %b说明：仅允许上述省市，其余地区会被拦截。%b\n' "${yellow}" "${reset}"
+  fi
+}
 agent_access_select() {
   local chain line port proto set_name raw_set suffix kind key choice index name protocol_text
   local -a keys=()
@@ -304,7 +332,7 @@ agent_access_select() {
   agent_access_check "${key##*|}" "${key%%|*}"
 }
 agent_access_check() {
-  local port="${1:-}" rule_suffix="${2:-}" chain matches set_names set_name set_json count sample label rule_name
+  local port="${1:-}" rule_suffix="${2:-}" chain matches suffixes set_names set_name set_json count label rule_name
   if [[ -z "${port}" && -t 0 ]]; then
     printf '请输入要检查的入口端口：' > /dev/tty
     IFS= read -r port < /dev/tty || return 0
@@ -319,12 +347,22 @@ agent_access_check() {
     return 1
   fi
   matches="$(printf '%s\n' "${chain}" | awk -v port="${port}" '$0 ~ ("dport " port "([^0-9]|$)")')"
+  if [[ -z "${rule_suffix}" && -n "${matches}" ]]; then
+    suffixes="$(printf '%s\n' "${matches}" | grep -oE '@ac_[[:alnum:]_]+' | sed -E \
+      's/^@ac_//; s/_(manual_allow|geo_allow|tcp_conn|tcp_rate|udp_rate|deny)$//' | sort -u || true)"
+    if [[ -n "${suffixes}" && "${suffixes}" != *$'\n'* ]]; then
+      rule_suffix="${suffixes}"
+    fi
+  fi
   if [[ -n "${rule_suffix}" ]]; then
     matches="$(printf '%s\n' "${matches}" | grep -F "@ac_${rule_suffix}_" || true)"
     rule_name="$(agent_access_rule_name "${rule_suffix}")"
     printf '%b%s · 端口 %s · 访问控制检查%b\n' "${cyan}" "${rule_name}" "${port}" "${reset}"
   else
     printf '%b端口 %s · 访问控制检查%b\n' "${cyan}" "${port}" "${reset}"
+  fi
+  if [[ -n "${rule_suffix}" ]]; then
+    agent_access_policy_summary "${rule_suffix}" || warn '未找到中文策略摘要；请将 Agent 更新到最新版本并等待一次同步。'
   fi
   if [[ -r /var/lib/relay-agent/state.json ]] && command -v jq >/dev/null 2>&1; then
     printf 'Agent 修订：%s · 应用状态：%s\n' \
@@ -339,7 +377,7 @@ agent_access_check() {
   printf '\n判定顺序（由上到下，命中 accept/drop 后停止）：\n'
   printf '%s\n' "${matches}" | sed 's/^[[:space:]]*/  /'
   set_names="$(printf '%s\n' "${matches}" | grep -oE '@[[:alnum:]_]+' | tr -d '@' | sort -u || true)"
-  printf '\n内核集合：\n'
+  printf '\n%b实际下发验证（排障信息）%b\n' "${cyan}" "${reset}"
   while IFS= read -r set_name; do
     [[ -n "${set_name}" ]] || continue
     case "${set_name}" in
@@ -353,9 +391,7 @@ agent_access_check() {
     esac
     if command -v jq >/dev/null 2>&1 && set_json="$(nft -j list set inet relay_panel "${set_name}" 2>/dev/null)"; then
       count="$(printf '%s' "${set_json}" | jq -r '[.nftables[] | select(.set != null) | (.set.elem // [])[]] | length' 2>/dev/null || printf '?')"
-      sample="$(printf '%s' "${set_json}" | jq -c '[.nftables[] | select(.set != null) | (.set.elem // [])[]][0:8]' 2>/dev/null || true)"
-      printf '  %b✓%b %s：%s 个元素' "${green}" "${reset}" "${label}" "${count}"
-      [[ -n "${sample}" && "${sample}" != '[]' ]] && printf ' · 示例 %s' "${sample}"
+      printf '  %b✓%b %s：已下发 %s 个网段/IP' "${green}" "${reset}" "${label}" "${count}"
       printf '\n'
     elif nft list set inet relay_panel "${set_name}" >/dev/null 2>&1; then
       printf '  %b✓%b %s：已安装\n' "${green}" "${reset}" "${label}"
