@@ -233,8 +233,78 @@ agent_environment() {
     || { printf '%b✗%b Agent 服务 未运行\n' "${red}" "${reset}"; failed=1; }
   return "${failed}"
 }
+agent_access_rule_name() {
+  local suffix="$1" counter_name="rp_${1}_up" counter_json name
+  if command -v jq >/dev/null 2>&1 \
+    && counter_json="$(nft -j list counter inet relay_panel "${counter_name}" 2>/dev/null)"; then
+    name="$(printf '%s' "${counter_json}" | jq -r --arg counter "${counter_name}" \
+      '.nftables[] | select(.counter.name? == $counter) | .counter.comment // empty' 2>/dev/null | head -n 1)"
+  fi
+  if [[ -z "${name:-}" ]]; then
+    name="$(nft list counter inet relay_panel "${counter_name}" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*comment "\(.*\)"[[:space:]]*$/\1/p' | head -n 1)"
+  fi
+  name="${name% upload}"
+  [[ -n "${name}" ]] && printf '%s' "${name}" || printf '规则 %s' "${suffix}"
+}
+agent_access_select() {
+  local chain line port proto set_name raw_set suffix kind key choice index name protocol_text
+  local -a keys=()
+  local -A protocols=()
+  if ! chain="$(nft -a list chain inet relay_panel access_control 2>/dev/null)"; then
+    warn '没有找到 relay_panel/access_control；请确认 Agent 正常运行并已收到规则'
+    return 1
+  fi
+  while IFS= read -r line; do
+    [[ "${line}" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+) ]] || continue
+    proto="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    set_name="$(printf '%s\n' "${line}" | grep -oE '@ac_[[:alnum:]_]+' | head -n 1 || true)"
+    [[ -n "${set_name}" ]] || continue
+    raw_set="${set_name#@ac_}"; suffix=''
+    for kind in manual_allow geo_allow tcp_conn tcp_rate udp_rate deny; do
+      if [[ "${raw_set}" == *"_${kind}" ]]; then
+        suffix="${raw_set%_${kind}}"
+        break
+      fi
+    done
+    [[ -n "${suffix}" ]] || continue
+    key="${suffix}|${port}"
+    if [[ -z "${protocols[${key}]+x}" ]]; then
+      keys+=("${key}")
+      protocols["${key}"]="${proto}"
+    elif [[ ",${protocols[${key}]}," != *",${proto},"* ]]; then
+      protocols["${key}"]+=",${proto}"
+    fi
+  done <<< "${chain}"
+  if (( ${#keys[@]} == 0 )); then
+    printf '%b-%b 当前机器没有启用访问控制或连接限制的入口规则\n' "${yellow}" "${reset}"
+    return 0
+  fi
+  printf '%b可检查的入口规则%b\n\n' "${cyan}" "${reset}"
+  index=1
+  for key in "${keys[@]}"; do
+    suffix="${key%%|*}"; port="${key##*|}"
+    name="$(agent_access_rule_name "${suffix}")"
+    case ",${protocols[${key}]}," in
+      *,tcp,*udp,*|*,udp,*tcp,*) protocol_text='TCP+UDP' ;;
+      *,tcp,*) protocol_text='TCP' ;;
+      *) protocol_text='UDP' ;;
+    esac
+    printf ' %b%d.%b %-28s 端口 %-5s %s\n' "${green}" "${index}" "${reset}" "${name}" "${port}" "${protocol_text}"
+    index=$((index + 1))
+  done
+  printf ' %b0.%b 返回\n\n请选择规则：' "${cyan}" "${reset}" > /dev/tty
+  IFS= read -r choice < /dev/tty || return 0
+  [[ "${choice}" == '0' ]] && return 0
+  if [[ ! "${choice}" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then
+    warn "请输入 0-${#keys[@]}"
+    return 2
+  fi
+  key="${keys[$((choice - 1))]}"
+  agent_access_check "${key##*|}" "${key%%|*}"
+}
 agent_access_check() {
-  local port="${1:-}" chain matches set_names set_name set_json count sample label
+  local port="${1:-}" rule_suffix="${2:-}" chain matches set_names set_name set_json count sample label rule_name
   if [[ -z "${port}" && -t 0 ]]; then
     printf '请输入要检查的入口端口：' > /dev/tty
     IFS= read -r port < /dev/tty || return 0
@@ -249,7 +319,13 @@ agent_access_check() {
     return 1
   fi
   matches="$(printf '%s\n' "${chain}" | awk -v port="${port}" '$0 ~ ("dport " port "([^0-9]|$)")')"
-  printf '%b端口 %s · 访问控制检查%b\n' "${cyan}" "${port}" "${reset}"
+  if [[ -n "${rule_suffix}" ]]; then
+    matches="$(printf '%s\n' "${matches}" | grep -F "@ac_${rule_suffix}_" || true)"
+    rule_name="$(agent_access_rule_name "${rule_suffix}")"
+    printf '%b%s · 端口 %s · 访问控制检查%b\n' "${cyan}" "${rule_name}" "${port}" "${reset}"
+  else
+    printf '%b端口 %s · 访问控制检查%b\n' "${cyan}" "${port}" "${reset}"
+  fi
   if [[ -r /var/lib/relay-agent/state.json ]] && command -v jq >/dev/null 2>&1; then
     printf 'Agent 修订：%s · 应用状态：%s\n' \
       "$(jq -r '.applied_revision // 0' /var/lib/relay-agent/state.json 2>/dev/null)" \
@@ -334,7 +410,7 @@ agent_menu() {
     printf '\n'
     case "${choice}" in
       1) agent_status ;; 2) agent_update ;; 3) agent_restart ;; 4) agent_start ;; 5) agent_stop ;;
-      6) agent_logs ;; 7) agent_connectivity ;; 8) agent_info ;; 9) agent_environment ;; 10) agent_access_check ;; 11) agent_uninstall ;; 0) break ;;
+      6) agent_logs ;; 7) agent_connectivity ;; 8) agent_info ;; 9) agent_environment ;; 10) agent_access_select ;; 11) agent_uninstall ;; 0) break ;;
       *) warn '请输入 0-11' ;;
     esac
     [[ "${choice}" == '0' ]] || pause_menu
