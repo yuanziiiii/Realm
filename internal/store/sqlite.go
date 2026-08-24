@@ -174,6 +174,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			city TEXT NOT NULL DEFAULT '', isp TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(start_ip,end_ip,province,city,isp)
 		)`,
+		`CREATE TABLE IF NOT EXISTS geo_ip2region_ranges (
+			start_ip INTEGER NOT NULL, end_ip INTEGER NOT NULL,
+			country TEXT NOT NULL DEFAULT '', province TEXT NOT NULL DEFAULT '',
+			city TEXT NOT NULL DEFAULT '', isp TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(start_ip,end_ip,province,city,isp)
+		)`,
+		`CREATE TABLE IF NOT EXISTS geo_maxmind_ranges (
+			start_ip INTEGER NOT NULL, end_ip INTEGER NOT NULL,
+			country TEXT NOT NULL DEFAULT '', province TEXT NOT NULL DEFAULT '',
+			city TEXT NOT NULL DEFAULT '', isp TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(start_ip,end_ip,province,city,isp)
+		)`,
 		`CREATE TABLE IF NOT EXISTS node_traffic_daily (
 			node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
 			interface TEXT NOT NULL, bucket INTEGER NOT NULL,
@@ -218,10 +230,36 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_geo_region ON geo_ip_ranges(province,city)`,
 		`CREATE INDEX IF NOT EXISTS idx_geo_country_lookup ON geo_ip_ranges(country,start_ip,end_ip)`,
 		`CREATE INDEX IF NOT EXISTS idx_geo_country_region ON geo_ip_ranges(country,province,city)`,
+		`CREATE INDEX IF NOT EXISTS idx_geo_ip2region_lookup ON geo_ip2region_ranges(start_ip,end_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_geo_maxmind_lookup ON geo_maxmind_ranges(start_ip,end_ip)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate: %w", err)
+		}
+	}
+	// Preserve an existing installation as the initial ip2region source exactly
+	// once. Repeating this on later starts would incorrectly promote MaxMind
+	// supplement rows from the effective table into the primary source.
+	var geoSourcesInitialized int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key='geo_sources_initialized'`).Scan(&geoSourcesInitialized); err != nil {
+		return fmt.Errorf("check geo source migration: %w", err)
+	}
+	if geoSourcesInitialized == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO geo_ip2region_ranges(start_ip,end_ip,country,province,city,isp) SELECT start_ip,end_ip,country,province,city,isp FROM geo_ip_ranges`); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate geo source: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES('geo_sources_initialized','1')`); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("mark geo source migration: %w", err)
+		}
+		if err = tx.Commit(); err != nil {
+			return err
 		}
 	}
 	if err := s.ensureColumn(ctx, "forward_rules", "mode", `ALTER TABLE forward_rules ADD COLUMN mode TEXT NOT NULL DEFAULT 'dual_managed'`); err != nil {

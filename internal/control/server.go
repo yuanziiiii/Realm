@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -30,12 +31,13 @@ import (
 )
 
 type Server struct {
-	store         *store.Store
-	log           *slog.Logger
-	sessionSecret []byte
-	secureCookies bool
-	webProxy      *httputil.ReverseProxy
-	downloadDir   string
+	store           *store.Store
+	log             *slog.Logger
+	sessionSecret   []byte
+	secureCookies   bool
+	webProxy        *httputil.ReverseProxy
+	downloadDir     string
+	maxMindUpdating atomic.Bool
 }
 
 type Options struct {
@@ -210,6 +212,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/connections", s.requireAdmin(s.listConnections))
 	mux.HandleFunc("GET /api/v1/geo/status", s.requireAdmin(s.geoStatus))
 	mux.HandleFunc("POST /api/v1/geo/import", s.requireAdmin(s.importGeoDatabase))
+	mux.HandleFunc("GET /api/v1/geo/maxmind", s.requireAdmin(s.getMaxMindSettings))
+	mux.HandleFunc("PUT /api/v1/geo/maxmind", s.requireAdmin(s.saveMaxMindSettings))
+	mux.HandleFunc("POST /api/v1/geo/maxmind/test", s.requireAdmin(s.testMaxMindConnection))
+	mux.HandleFunc("POST /api/v1/geo/maxmind/update", s.requireAdmin(s.triggerMaxMindUpdate))
 	mux.HandleFunc("GET /api/v1/config/export", s.requireAdmin(s.exportConfiguration))
 	mux.HandleFunc("POST /api/v1/config/import", s.requireAdmin(s.importConfiguration))
 	mux.HandleFunc("POST /agent/v1/sync", s.agentSync)

@@ -329,6 +329,19 @@ type GeoStatus struct {
 	Regions   []GeoRegion `json:"regions"`
 }
 
+type MaxMindStatus struct {
+	Configured    bool      `json:"configured"`
+	AccountID     string    `json:"account_id,omitempty"`
+	HasLicenseKey bool      `json:"has_license_key"`
+	AutoUpdate    bool      `json:"auto_update"`
+	Updating      bool      `json:"updating"`
+	Ranges        int64     `json:"ranges"`
+	Version       string    `json:"version,omitempty"`
+	CheckedAt     time.Time `json:"checked_at,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+}
+
 type RuleTrafficSummary struct {
 	RuleID                 string            `json:"rule_id"`
 	TotalUploadBytes       int64             `json:"total_upload_bytes"`

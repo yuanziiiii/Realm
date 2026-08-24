@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,43 @@ import (
 
 	"relaypanel/internal/domain"
 )
+
+func TestLegacyGeoSourceMigrationRunsOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-geo.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE geo_ip_ranges (start_ip INTEGER NOT NULL, end_ip INTEGER NOT NULL, country TEXT NOT NULL DEFAULT '', province TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', isp TEXT NOT NULL DEFAULT '', PRIMARY KEY(start_ip,end_ip,province,city,isp)); INSERT INTO geo_ip_ranges VALUES(1,255,'中国','广东省','广州市','移动')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO geo_ip_ranges VALUES(256,511,'中国','福建省','厦门市','')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var count int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM geo_ip2region_ranges`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("effective supplement rows were promoted into ip2region source: %d", count)
+	}
+}
 
 func TestSummarySupportsFreshEmptyDatabase(t *testing.T) {
 	ctx := context.Background()

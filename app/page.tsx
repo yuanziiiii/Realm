@@ -216,6 +216,18 @@ type GeoStatus = {
   updated_at?: string;
   regions: GeoRegion[];
 };
+type MaxMindStatus = {
+  configured: boolean;
+  account_id?: string;
+  has_license_key: boolean;
+  auto_update: boolean;
+  updating: boolean;
+  ranges: number;
+  version?: string;
+  checked_at?: string;
+  updated_at?: string;
+  last_error?: string;
+};
 type ConfigBackup = {
   format: string;
   schema_version: number;
@@ -3311,11 +3323,139 @@ function Settings({
     [configError, setConfigError] = useState(""),
     [geoBusy, setGeoBusy] = useState(false),
     [geoNotice, setGeoNotice] = useState(""),
-    [geoError, setGeoError] = useState("");
+    [geoError, setGeoError] = useState(""),
+    [maxMind, setMaxMind] = useState<MaxMindStatus>({
+      configured: false,
+      has_license_key: false,
+      auto_update: false,
+      updating: false,
+      ranges: 0,
+    }),
+    [maxMindAccountID, setMaxMindAccountID] = useState(""),
+    [maxMindLicenseKey, setMaxMindLicenseKey] = useState(""),
+    [maxMindAutoUpdate, setMaxMindAutoUpdate] = useState(false),
+    [maxMindBusy, setMaxMindBusy] = useState(false),
+    [maxMindNotice, setMaxMindNotice] = useState(""),
+    [maxMindError, setMaxMindError] = useState("");
   const configInput = useRef<HTMLInputElement>(null);
   const geoInput = useRef<HTMLInputElement>(null);
   const updateCommand =
     "curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/update.sh | sudo bash";
+
+  const applyMaxMindStatus = useCallback((status: MaxMindStatus) => {
+    setMaxMind(status);
+    setMaxMindAccountID(status.account_id || "");
+    setMaxMindAutoUpdate(status.auto_update);
+  }, []);
+
+  useEffect(() => {
+    if (demo) return;
+    void api<MaxMindStatus>("/api/v1/geo/maxmind")
+      .then(applyMaxMindStatus)
+      .catch((loadError) => setMaxMindError((loadError as Error).message));
+  }, [applyMaxMindStatus, demo]);
+
+  useEffect(() => {
+    if (demo || !maxMind.updating) return;
+    const timer = window.setInterval(() => {
+      void api<MaxMindStatus>("/api/v1/geo/maxmind")
+        .then((status) => {
+          applyMaxMindStatus(status);
+          if (!status.updating) {
+            if (status.last_error) setMaxMindError(status.last_error);
+            else setMaxMindNotice(`MaxMind ${status.version || "数据库"} 更新完成。`);
+          }
+        })
+        .catch((pollError) => setMaxMindError((pollError as Error).message));
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [applyMaxMindStatus, demo, maxMind.updating]);
+
+  async function persistMaxMind() {
+    if (!maxMindAccountID.trim()) throw new Error("请填写 MaxMind Account ID");
+    if (!maxMindLicenseKey.trim() && !maxMind.has_license_key)
+      throw new Error("请填写 MaxMind License Key");
+    if (demo) {
+      const status = {
+        ...maxMind,
+        configured: true,
+        account_id: maxMindAccountID.trim(),
+        has_license_key: true,
+        auto_update: maxMindAutoUpdate,
+      };
+      applyMaxMindStatus(status);
+      setMaxMindLicenseKey("");
+      return status;
+    }
+    const status = await api<MaxMindStatus>("/api/v1/geo/maxmind", {
+      method: "PUT",
+      body: JSON.stringify({
+        account_id: maxMindAccountID.trim(),
+        license_key: maxMindLicenseKey.trim(),
+        auto_update: maxMindAutoUpdate,
+      }),
+    });
+    applyMaxMindStatus(status);
+    setMaxMindLicenseKey("");
+    return status;
+  }
+
+  async function saveMaxMind(event: FormEvent) {
+    event.preventDefault();
+    setMaxMindBusy(true);
+    setMaxMindNotice("");
+    setMaxMindError("");
+    try {
+      await persistMaxMind();
+      setMaxMindNotice("MaxMind 设置已保存；License Key 不会再次明文显示。");
+    } catch (saveError) {
+      setMaxMindError((saveError as Error).message);
+    } finally {
+      setMaxMindBusy(false);
+    }
+  }
+
+  async function testMaxMind() {
+    setMaxMindBusy(true);
+    setMaxMindNotice("");
+    setMaxMindError("");
+    try {
+      await persistMaxMind();
+      if (demo) {
+        setMaxMindNotice("预览模式：MaxMind 配置格式有效，不会发起外部连接。");
+        return;
+      }
+      const result = await api<{ version?: string }>("/api/v1/geo/maxmind/test", {
+        method: "POST",
+      });
+      applyMaxMindStatus(await api<MaxMindStatus>("/api/v1/geo/maxmind"));
+      setMaxMindNotice(`连接成功，最新版本 ${result.version || "已检测"}。`);
+    } catch (testError) {
+      setMaxMindError((testError as Error).message);
+    } finally {
+      setMaxMindBusy(false);
+    }
+  }
+
+  async function updateMaxMind() {
+    setMaxMindBusy(true);
+    setMaxMindNotice("");
+    setMaxMindError("");
+    try {
+      const saved = await persistMaxMind();
+      if (demo) {
+        setMaxMindNotice("预览模式不会下载数据库。");
+        return;
+      }
+      await api("/api/v1/geo/maxmind/update", { method: "POST" });
+      setMaxMind({ ...saved, updating: true });
+      setMaxMindNotice("已开始下载和合并，可留在当前页面查看结果。");
+    } catch (updateError) {
+      setMaxMindError((updateError as Error).message);
+    } finally {
+      setMaxMindBusy(false);
+    }
+  }
   async function changePassword(e: FormEvent) {
     e.preventDefault();
     setError("");
@@ -3693,6 +3833,101 @@ function Settings({
         </div>
         <small className="settings-hint">
           建议按月更新。数据库不准确时，应优先使用手工 IP/CIDR 白名单避免误封。
+        </small>
+      </section>
+      <section className="settings-card geo-card maxmind-card">
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">地区库自动补充</p>
+            <h3>MaxMind GeoLite2 City</h3>
+          </div>
+          <span className={`settings-icon ${maxMind.ranges > 0 ? "ready" : ""}`}>M</span>
+        </div>
+        <p>
+          每周由主控检查并更新，只补充 ip2region 缺失的省市；被控端仍只接收规则最终需要的 IP/CIDR。
+        </p>
+        <div className="geo-status-grid">
+          <span>
+            <small>配置</small>
+            <b>{maxMind.configured ? "已配置" : "未配置"}</b>
+          </span>
+          <span>
+            <small>MaxMind 网段</small>
+            <b>{maxMind.ranges.toLocaleString()}</b>
+          </span>
+          <span>
+            <small>数据库版本</small>
+            <b>{maxMind.version || "—"}</b>
+          </span>
+          <span>
+            <small>最后成功更新</small>
+            <b>{maxMind.updated_at ? probeCheckedTime(maxMind.updated_at) : "—"}</b>
+          </span>
+        </div>
+        <form className="settings-form maxmind-form" onSubmit={saveMaxMind}>
+          <label>
+            Account ID
+            <input
+              required
+              inputMode="numeric"
+              autoComplete="off"
+              value={maxMindAccountID}
+              onChange={(event) => setMaxMindAccountID(event.target.value)}
+              placeholder="MaxMind Account ID"
+            />
+          </label>
+          <label>
+            License Key
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={maxMindLicenseKey}
+              onChange={(event) => setMaxMindLicenseKey(event.target.value)}
+              placeholder={maxMind.has_license_key ? "已配置；留空保持不变" : "MaxMind License Key"}
+            />
+            <small>密钥加密保存在主控，不返回网页、不写日志、也不下发 Agent。</small>
+          </label>
+          <label className="maxmind-toggle" htmlFor="maxmind-auto-update">
+            <input
+              id="maxmind-auto-update"
+              type="checkbox"
+              checked={maxMindAutoUpdate}
+              onChange={(event) => setMaxMindAutoUpdate(event.target.checked)}
+            />
+            <span>
+              每周自动检查并更新
+              <small>版本未变化时只检查，不重复下载。</small>
+            </span>
+          </label>
+          {maxMindNotice && <div className="success-notice">{maxMindNotice}</div>}
+          {(maxMindError || maxMind.last_error) && (
+            <div className="form-error">{maxMindError || maxMind.last_error}</div>
+          )}
+          <div className="config-actions">
+            <button className="primary" disabled={maxMindBusy || maxMind.updating}>
+              {maxMindBusy ? "保存中…" : "保存设置"}
+            </button>
+            <button
+              type="button"
+              className="outline"
+              disabled={maxMindBusy || maxMind.updating}
+              onClick={() => void testMaxMind()}
+            >
+              测试连接
+            </button>
+            <button
+              type="button"
+              className="outline"
+              disabled={maxMindBusy || maxMind.updating}
+              onClick={() => void updateMaxMind()}
+            >
+              {maxMind.updating ? "正在更新…" : "立即更新"}
+            </button>
+          </div>
+        </form>
+        <small className="settings-hint">
+          MaxMind 下载会重定向至 Cloudflare R2；更新失败时继续使用现有数据库和规则。
+          {maxMind.checked_at ? ` 最近检查：${probeCheckedTime(maxMind.checked_at)}` : ""}
         </small>
       </section>
     </div>

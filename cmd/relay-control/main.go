@@ -40,6 +40,9 @@ func main() {
 		logger.Error("initialize controller", "error", err)
 		os.Exit(1)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	srv.StartBackground(ctx)
 	httpServer := &http.Server{Addr: env("RELAY_LISTEN", ":8080"), Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second}
 	go func() {
 		logger.Info("controller started", "listen", httpServer.Addr)
@@ -48,8 +51,6 @@ func main() {
 			os.Exit(1)
 		}
 	}()
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	<-ctx.Done()
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

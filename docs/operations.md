@@ -71,6 +71,18 @@ curl -fsSL https://github.com/yuanziiiii/Realm/releases/latest/download/uninstal
 
 规则备份引用面板生成的服务器 ID，因此恢复前必须确保对应服务器仍然存在。完整灾难恢复还应备份 Docker volume `relay-data` 中的 SQLite 数据库。
 
+## IP 地区库更新
+
+ip2region 文本库通过“系统设置 → IP 省市数据库”手动导入。MaxMind GeoLite2 City 可在同一设置页配置 Account ID、License Key，并启用每周自动更新：
+
+- 主控先检查远端 `Last-Modified`，版本未变化时不会重复下载。
+- MaxMind 只补充 ip2region 缺失的省市，不能覆盖已知的 ip2region 结果。
+- License Key 加密保存在主控，网页只显示“已配置”。
+- 下载失败或 ZIP/CSV 解析失败时保留上一个可用版本。
+- Agent 不保存两套原始库，只接收每条规则最终需要的 IPv4 网段。
+
+中国网络访问 MaxMind 下载重定向地址不稳定时，可以关闭自动更新，现有地区库和已下发规则不会受影响。
+
 ## Agent 无法连接主控
 
 在 Agent 服务器执行：

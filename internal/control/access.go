@@ -102,7 +102,7 @@ func parseGeoRanges(reader io.Reader) ([]domain.GeoRange, error) {
 		if item.Country != "" && !isChinaCountry(item.Country) {
 			continue
 		}
-		if item.Province == "" {
+		if item.Country == "" && item.Province == "" {
 			continue
 		}
 		ranges = append(ranges, item)
@@ -202,6 +202,29 @@ func isChinaCountry(value string) bool {
 
 func normalizeChinaProvince(value string) string {
 	aliases := map[string]string{
+		"河北":       "河北省",
+		"山西":       "山西省",
+		"辽宁":       "辽宁省",
+		"吉林":       "吉林省",
+		"黑龙江":      "黑龙江省",
+		"江苏":       "江苏省",
+		"浙江":       "浙江省",
+		"安徽":       "安徽省",
+		"福建":       "福建省",
+		"江西":       "江西省",
+		"山东":       "山东省",
+		"河南":       "河南省",
+		"湖北":       "湖北省",
+		"湖南":       "湖南省",
+		"广东":       "广东省",
+		"海南":       "海南省",
+		"四川":       "四川省",
+		"贵州":       "贵州省",
+		"云南":       "云南省",
+		"陕西":       "陕西省",
+		"甘肃":       "甘肃省",
+		"青海":       "青海省",
+		"台湾":       "台湾省",
 		"北京市":      "北京",
 		"上海市":      "上海",
 		"天津市":      "天津",
@@ -281,6 +304,9 @@ func normalizeChinaCity(value string) string {
 	}
 	if normalized, ok := aliases[value]; ok {
 		return normalized
+	}
+	if value != "" && !strings.HasSuffix(value, "市") && !strings.HasSuffix(value, "州") && !strings.HasSuffix(value, "地区") && !strings.HasSuffix(value, "盟") && !strings.HasSuffix(value, "县") && !strings.HasSuffix(value, "区") && !strings.ContainsAny(value, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+		return value + "市"
 	}
 	return value
 }

@@ -28,16 +28,17 @@ func TestParseGeoRangesAcceptsIP2RegionAndCIDR(t *testing.T) {
 	}
 }
 
-func TestParseGeoRangesFiltersGlobalAndEmptyRegions(t *testing.T) {
+func TestParseGeoRangesFiltersGlobalAndRetainsChinaGaps(t *testing.T) {
 	ranges, err := parseGeoRanges(strings.NewReader(strings.Join([]string{
 		"0.0.0.0|0.255.255.255|Reserved|Reserved|Reserved|0|0",
 		"1.0.0.0|1.0.0.255|Australia|Queensland|0|0|AU",
+		"1.0.0.0|1.0.0.255|中国|0|0|移动|CN",
 		"1.0.1.0|1.0.3.255|中国|福建省|福州市|中国电信|CN",
 	}, "\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ranges) != 1 || ranges[0].Province != "福建省" || ranges[0].City != "福州市" {
+	if len(ranges) != 2 || ranges[0].Province != "" || ranges[0].ISP != "移动" || ranges[1].Province != "福建省" || ranges[1].City != "福州市" {
 		t.Fatalf("unexpected filtered rows: %#v", ranges)
 	}
 }

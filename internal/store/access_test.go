@@ -111,3 +111,45 @@ func TestGeoStatusHidesPreviouslyImportedGlobalRows(t *testing.T) {
 		t.Fatalf("global rows leaked into status: %#v", status)
 	}
 }
+
+func TestMaxMindOnlySupplementsUnknownIP2RegionSpace(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "geo-supplement.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.ReplaceGeoRanges(ctx, []domain.GeoRange{
+		{StartIP: "223.104.80.0", EndIP: "223.104.83.255", Country: "中国", Province: "广东省", City: "广州市", ISP: "移动"},
+		{StartIP: "223.104.84.0", EndIP: "223.104.87.255", Country: "中国", ISP: "移动"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReplaceMaxMindRanges(ctx, []domain.GeoRange{
+		{StartIP: "223.104.80.0", EndIP: "223.104.87.255", Country: "中国", Province: "广东省", City: "深圳市"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.db.QueryContext(ctx, `SELECT start_ip,end_ip,province,city FROM geo_ip_ranges ORDER BY start_ip`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var values []struct {
+		start, end     int64
+		province, city string
+	}
+	for rows.Next() {
+		var value struct {
+			start, end     int64
+			province, city string
+		}
+		if err := rows.Scan(&value.start, &value.end, &value.province, &value.city); err != nil {
+			t.Fatal(err)
+		}
+		values = append(values, value)
+	}
+	if len(values) != 2 || values[0].city != "广州市" || values[1].city != "深圳市" {
+		t.Fatalf("ip2region priority or MaxMind supplement is wrong: %#v", values)
+	}
+}

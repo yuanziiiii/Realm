@@ -2368,6 +2368,43 @@ button {
 .settings-card.geo-card {
   grid-column: 1/-1;
 }
+.maxmind-form {
+  grid-template-columns: minmax(180px, 0.7fr) minmax(260px, 1.3fr);
+  margin-top: 18px;
+}
+.maxmind-form .maxmind-toggle,
+.maxmind-form .success-notice,
+.maxmind-form .form-error,
+.maxmind-form .config-actions {
+  grid-column: 1/-1;
+}
+.settings-form .maxmind-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 12px;
+  border: 1px solid #303948;
+  border-radius: 9px;
+  background: #0d131b;
+  cursor: pointer;
+}
+.settings-form .maxmind-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: #7462e4;
+}
+.maxmind-toggle span {
+  display: grid;
+  gap: 4px;
+  color: #dfe5ee;
+  font-size: 10px;
+  font-weight: 700;
+}
+.maxmind-form .success-notice,
+.maxmind-form .form-error {
+  margin: 0;
+}
 .config-actions {
   display: flex;
   gap: 10px;
@@ -2450,6 +2487,14 @@ button {
 @media (max-width: 1000px) {
   .settings-grid {
     grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 700px) {
+  .maxmind-form {
+    grid-template-columns: 1fr;
+  }
+  .maxmind-form > * {
+    grid-column: 1 !important;
   }
 }
 .logout-button {
@@ -2853,6 +2898,13 @@ button {
 :root[data-theme="light"] .update-points span {
   border-color: #d8dee8;
   background: #f6f7fa;
+  color: #344054;
+}
+:root[data-theme="light"] .settings-form .maxmind-toggle {
+  border-color: #d8dee8;
+  background: #f6f7fa;
+}
+:root[data-theme="light"] .maxmind-toggle span {
   color: #344054;
 }
 :root[data-theme="light"] .mode-picker button.selected,
